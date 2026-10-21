@@ -1115,6 +1115,8 @@ export function AutomationPanel() {
   const setRiskAnnotationsEnabled = useSettingsStore((s) => s.setRiskAnnotationsEnabled);
   const subagentsEnabled = useSettingsStore((s) => s.subagentsEnabled);
   const setSubagentsEnabled = useSettingsStore((s) => s.setSubagentsEnabled);
+  const sessionCollaborationEnabled = useSettingsStore((s) => s.sessionCollaborationEnabled);
+  const setSessionCollaborationEnabled = useSettingsStore((s) => s.setSessionCollaborationEnabled);
   const skillAutoInvokeEnabled = useSettingsStore((s) => s.skillAutoInvokeEnabled);
   const setSkillAutoInvokeEnabled = useSettingsStore((s) => s.setSkillAutoInvokeEnabled);
   const maxConcurrentSubagents = useSettingsStore((s) => s.maxConcurrentSubagents);
@@ -1298,6 +1300,12 @@ export function AutomationPanel() {
             onChange={setSubagentsEnabled}
             label={t("AutomationPanel.subagentsEnabledLabel")}
             description={t("AutomationPanel.subagentsEnabledDescription")}
+          />
+          <Toggle
+            checked={sessionCollaborationEnabled}
+            onChange={setSessionCollaborationEnabled}
+            label="Allow local agent messages between my chat sessions"
+            description="Off by default. Only desktop chats attached to exactly the same workspace may send bounded, untrusted messages. Recipients see a persisted notice; this does not wake an agent or grant permissions. Not a daemon-wide or cross-device messenger."
           />
           <label className="flex items-center justify-between gap-3 border-t border-border py-2.5 text-sm">
             <span className="flex flex-col">

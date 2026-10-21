@@ -1,3 +1,4 @@
+import { desktopContextExposure } from './contextExposure';
 /**
  * The core turn-execution engine: one streaming model attempt
  * (`attemptStream`) and one tool-call dispatch (`executeToolCall`), plus the
@@ -39,13 +40,14 @@ import {
   providerModelTargetKey,
 } from './modelTargets';
 import { riskCacheKey, type RiskClassification } from './riskJudge';
-import { evaluatePreToolUseHooks, fireObservedHooks, hooksForEvent } from './userHooks';
+import { evaluatePreActionHooks, fireObservedHooks, hooksForEvent, toolLifecyclePair } from './userHooks';
 import { gatePrivacyWireMessages, type PrivacyWireCache } from './privacyWire';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { useSessionStore } from '../store/sessionStore';
 import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
+import { listCollaboratingSessions, sendSessionMessage, broadcastSessionMessage, noteSessionFileActivity } from './sessionCollaboration';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
@@ -181,7 +183,7 @@ export function describeUsageTarget(target: ResolvedTarget): string {
   return `${target.providerId} · ${target.model}`;
 }
 
-function costTargetKey(target: ResolvedTarget): string {
+export function costTargetKey(target: ResolvedTarget): string {
   if (target.kind === 'provider') {
     return providerModelTargetKey(target.providerId, target.model);
   }
@@ -801,21 +803,25 @@ export async function executeToolCall(
     }
   };
 
-  if (hooksForEvent('PreToolUse', name).length > 0) {
-    try {
-      const denial = await evaluatePreToolUseHooks(name, argsForHooks(), sessionId);
-      if (denial !== null) {
-        return stringifyToolError(new Error(`Blocked by a PreToolUse hook: ${denial.reason}`));
-      }
-    } catch (err) {
-      // The evaluator itself already proceeds past individual hook failures;
-      // this catch is defense in depth so a hook-layer bug can never leave a
-      // tool_calls entry without a result.
-      console.warn('PreToolUse hook evaluation failed — proceeding:', err);
+  const pairedLifecycle=toolLifecyclePair(name);
+  const preEvents=([
+    'PreToolUse', ...(pairedLifecycle?[pairedLifecycle.pre]:[]),
+  ] as const);
+  for(const event of preEvents){
+    if(hooksForEvent(event,name).length===0)continue;
+    try{
+      const denial=await evaluatePreActionHooks(event,name,argsForHooks(),sessionId);
+      if(denial!==null)
+        return stringifyToolError(new Error(`Blocked by a ${event} hook: ${denial.reason}`));
+    }catch(err){
+      // Keep the existing user-authored overlay failure posture. A hook that
+      // explicitly DENIES still blocks, but an unresponsive hook does not
+      // corrupt the transcript or impersonate a successful tool result.
+      console.warn(`${event} hook evaluation failed — proceeding:`,err);
     }
   }
 
-  const result = await executeToolCallInner(
+  let result = await executeToolCallInner(
     toolCall,
     checkpointId,
     turnId,
@@ -833,9 +839,47 @@ export async function executeToolCall(
     executionContext,
   );
 
+  // Detect a file version conflict only AFTER a real successful native
+  // read/write/edit. This additional observation cannot authorize tools or
+  // change the returned model result. Worktree-isolated children cannot
+  // enroll under their parent's original workspace root.
+  if(sessionId && !workspaceRootOverride &&
+      (name==='read_file'||name==='write_file'||name==='edit_file')){
+    const parsed=argsForHooks();
+    if(typeof parsed.path==='string' &&
+       !/^\s*\{\s*"error"\s*:/.test(result) &&
+       result!=='CANCELLED'){
+      try{
+        await noteSessionFileActivity({
+          sessionId,turnId,toolCallId:toolCall.id,
+          path:parsed.path,action:name==='read_file'?'read':'write',
+        });
+      }catch(error){
+        // The actual file tool already succeeded; never replay a mutation
+        // just because peer-awareness persistence is unavailable.
+        console.warn('Session file-change notification remains unavailable:',error);
+      }
+    }
+  }
+
+  // Compact only repeat read-only payloads from the same executing agent turn.
+  // Execute the native tool first so filesystem permissions and freshness
+  // checks cannot be bypassed by a stale frontend cache.
+  const exposureScope = [sessionId ?? 'unbound',turnId,workspaceRootOverride ?? '',agentLabel ?? ''].join('::');
+  if(name==='read_file' || name==='grep') {
+    const raw=argsForHooks();
+    result=desktopContextExposure.observe(exposureScope,name,raw,result);
+  } else if(name==='write_file' || name==='edit_file' || name==='run_shell') {
+    desktopContextExposure.invalidate(exposureScope);
+  }
+
   if (hooksForEvent('PostToolUse', name).length > 0) {
     fireObservedHooks('PostToolUse', { tool_name: name, args: argsForHooks(), session_id: sessionId, result });
   }
+  if(pairedLifecycle && hooksForEvent(pairedLifecycle.post,name).length>0)
+    fireObservedHooks(pairedLifecycle.post,{
+      tool_name:name,args:argsForHooks(),session_id:sessionId,result,
+    });
   try {
     await executionContext?.onCompleted?.(toolCall, result);
   } catch (error) {
@@ -973,6 +1017,37 @@ async function executeToolCallInner(
 
   const coordination = coordinateToolInvocation(name, args);
   if (coordination.error) return stringifyToolError(new Error(coordination.error));
+
+  if (name === 'session_list_peers' || name === 'session_send_message' || name === 'session_broadcast_message') {
+    if (usePermissionStore.getState().mode === 'plan')
+      return stringifyToolError(new Error('Session messaging is unavailable in Plan Mode.'));
+    if (!chatSessionId || executionContext?.isToolAvailable?.(name) !== true) {
+      return stringifyToolError(new Error('Cross-session messages are not offered to this turn.'));
+    }
+    try {
+      if (name === 'session_list_peers') {
+        return stringifyToolResult({sessions:await listCollaboratingSessions(chatSessionId)});
+      }
+      if(name==='session_broadcast_message') {
+        if(typeof args.text!=='string')
+          throw new Error('session_broadcast_message requires a text string.');
+        return stringifyToolResult(await broadcastSessionMessage({
+          senderSessionId:chatSessionId,turnId,toolCallId:toolCall.id,text:args.text,
+        }));
+      }
+      const recipient = args.recipient_session_id;
+      const text = args.text;
+      if (typeof recipient !== 'string' || typeof text !== 'string')
+        throw new Error('session_send_message requires a recipient_session_id and text.');
+      const receipt = await sendSessionMessage({
+        senderSessionId:chatSessionId,recipientSessionId:recipient,
+        text,toolCallId:toolCall.id,turnId,
+      });
+      return stringifyToolResult(receipt);
+    } catch (error) {
+      return stringifyToolError(error);
+    }
+  }
 
   if (name === PROGRAMMATIC_TOOL_NAME) {
     if (!programmatic) {
@@ -1125,7 +1200,7 @@ async function executeToolCallInner(
       if (!subagent) {
         return stringifyToolError(new Error('The workflow tool has no subagent execution context configured for this turn.'));
       }
-      const spec = resolveWorkflowSpec(args);
+      const spec = resolveWorkflowSpec(args, subagent.sessionId);
       return await runWorkflow({
         sessionId: subagent.sessionId,
         runId: subagent.runId,

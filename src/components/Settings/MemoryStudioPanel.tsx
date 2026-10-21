@@ -10,6 +10,7 @@ import {
   importMemories,
   listAllMemories,
   mergeMemories,
+  mergeMemoriesIfUnchanged,
   purgeExpiredMemories,
   setMemoryEnabled,
   setMemoryExpiry,
@@ -20,6 +21,12 @@ import {
   type MemoryEntry,
 } from "../../lib/memoryStudio";
 import { errorMessage } from "../../lib/errors";
+import { useModelStore } from "../../store/modelStore";
+import {readSemanticReviewQuality,recordSemanticReviewQuality,humanAgreementFraction} from "../../lib/semanticMemoryQuality";
+import {
+  requestSemanticMemoryReview,reviewScopeKey,configuredSemanticVerifiers,
+  type SemanticReviewProposal,
+} from "../../lib/semanticMemoryReview";
 
 /** Must match `MAX_FACT_CHARS` in `src-tauri/src/memory.rs`. */
 const MAX_FACT_CHARS = 500;
@@ -439,6 +446,12 @@ export function MemoryStudioPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [semanticSuggestions, setSemanticSuggestions] = useState<SemanticReviewProposal[]>([]);
+  const [verifierKey,setVerifierKey]=useState("");
+  const [quality,setQuality]=useState(readSemanticReviewQuality);
+  const providers=useModelStore(s=>s.providers);
+  const providerModels=useModelStore(s=>s.providerModels);
+  const semanticVerifiers=useMemo(()=>configuredSemanticVerifiers(),[providers,providerModels]);
 
   const refresh = async () => {
     try {
@@ -469,6 +482,43 @@ export function MemoryStudioPanel() {
 
   // One `now` per render pass, so every row's expiry verdict agrees.
   const now = useMemo(() => new Date().toISOString(), [entries]);
+
+  // Display only: all disabling still goes through the authoritative Rust
+  // memory studio command and applies to the next prompt build. A conflict
+  // always requires an explicit human choice about which statement to keep.
+  const contradictions = useMemo(() => {
+    const byScope = new Map<string,Map<string,{positive:MemoryEntry[];negative:MemoryEntry[]}>>();
+    for (const entry of entries) {
+      if (entry.source !== "agent" || !wouldReachPrompt(entry, now)) continue;
+      const normalized = entry.text.trim().replace(/\.+$/,"").replace(/\s+/g," ").toLowerCase();
+      const pairs = [
+        ["user prefers ","user does not prefer "],
+        ["user wants ","user does not want "],
+        ["the project is ","the project is not "],
+      ] as const;
+      for (const [positive,negative] of pairs) {
+        const isNegative = normalized.startsWith(negative);
+        const isPositive = !isNegative && normalized.startsWith(positive);
+        if (!isNegative && !isPositive) continue;
+        const tail = normalized.slice((isNegative?negative:positive).length);
+        if (!tail || /[/\\@=\`{}[\]<>#":?!]/.test(tail)) break;
+        const scope = entry.scope + ":" + (entry.project_root ?? "");
+        const list = byScope.get(scope) ?? new Map();
+        const key = positive + tail;
+        const pair = list.get(key) ?? {positive:[],negative:[]};
+        (isNegative ? pair.negative : pair.positive).push(entry);
+        list.set(key,pair);byScope.set(scope,list);
+        break;
+      }
+    }
+    const result:{positive:MemoryEntry;negative:MemoryEntry}[]=[];
+    for (const scope of byScope.values()) for (const pair of scope.values()) {
+      if (pair.positive[0] && pair.negative[0]) {
+        result.push({positive:pair.positive[0],negative:pair.negative[0]});
+      }
+    }
+    return result.slice(0,20);
+  },[entries,now]);
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -533,6 +583,57 @@ export function MemoryStudioPanel() {
     setMergeOpen(false);
     setSuccess(t("MemoryStudioPanel.mergeComplete", { count: merged.merged_from.length }));
   });
+
+  // Explicit button is the user approval to ask the SELECTED model to
+  // inspect bounded current agent facts; cloud privacy/cost policies still
+  // apply. The model can propose, but cannot mutate any memory.
+  const requestReview = () => run("semantic-review",async()=>{
+    const groups = new Map<string,MemoryEntry[]>();
+    for(const fact of filtered){
+      if(fact.source!=="agent" || !wouldReachPrompt(fact,now) || fact.pinned ||
+         fact.text.length>500)continue;
+      const key=reviewScopeKey(fact);
+      const list=groups.get(key)??[];
+      list.push(fact);
+      groups.set(key,list);
+    }
+    const batch=[...groups.values()].filter(items=>items.length>=2)
+      .sort((a,b)=>b.length-a.length)[0]?.slice(0,24);
+    if(!batch)throw Error("At least two eligible agent-owned memories in one scope are required.");
+    const proposals=await requestSemanticMemoryReview(batch,verifierKey);
+    setSemanticSuggestions(proposals);
+    if(proposals.length)setQuality(recordSemanticReviewQuality('proposed',proposals.length));
+    if(!proposals.length)setSuccess("No confident semantic changes suggested for this scope.");
+  });
+
+  const applySemanticSuggestion = (proposal:SemanticReviewProposal,keepId?:string)=>
+    run("semantic-approval",async()=>{
+      const latest=await listAllMemories();
+      // A human clicked Approve, but facts may have changed in another
+      // window since the model proposed them. Re-check every original
+      // identity, text, scope and eligibility before requesting Rust writes.
+      const originals=proposal.ids.map(id=>latest.find(f=>f.id===id));
+      if(originals.some((fact,i)=>!fact || fact.text!==proposal.expectedTexts[i]||
+         reviewScopeKey(fact)!==proposal.scopeKey ||
+         fact.source!=="agent" || !wouldReachPrompt(fact, new Date().toISOString()) ||
+         fact.pinned))throw Error("Memory facts changed since review; refresh and re-review.");
+      if(proposal.kind==="merge"){
+        await mergeMemoriesIfUnchanged(
+          proposal.ids,originals[0]!.project_root,
+          proposal.suggestedText,proposal.expectedTexts,
+        );
+        setSuccess("Approved and reversibly merged semantic memory suggestion.");
+      }else{
+        if(!keepId || !proposal.ids.includes(keepId))
+          throw Error("Select which contradictory memory to retain.");
+        const other=originals.find(f=>f?.id!==keepId)!;
+        await setMemoryEnabled(other.id,other.project_root,false);
+        setSuccess("Resolved selected contradiction; the other memory is disabled, not deleted.");
+      }
+      setQuality(recordSemanticReviewQuality('approved'));
+      setSemanticSuggestions(items=>items.filter(item=>item!==proposal));
+      await refresh();
+    });
 
   const purge = () => run("purge", async () => {
     const removed = await purgeExpiredMemories();
@@ -606,6 +707,122 @@ export function MemoryStudioPanel() {
       </div>
 
       {statusBanner(error, success)}
+      <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
+        <label htmlFor="semantic-independent-verifier">Independent verifier model</label>
+        <select id="semantic-independent-verifier" value={verifierKey}
+          onChange={event=>setVerifierKey(event.target.value)}
+          className="rounded-md border border-border bg-surface px-2 py-1 text-xs"
+          disabled={busy!==null}>
+          <option value="">Select a separately configured model</option>
+          {semanticVerifiers.map(item=><option key={item.key} value={item.key}>{item.label}</option>)}
+        </select>
+        <Button size="sm" variant="secondary"
+          disabled={busy !== null || !verifierKey}
+          onClick={() => void requestReview()}>
+          {busy==="semantic-review"?"Reviewing…":"Review paraphrases with selected model"}
+        </Button>
+        <span>
+          The selected chat model proposes, and a different explicitly configured model
+          independently verifies. Both calls use your normal privacy and cost controls;
+          no memory changes without review and approval.
+        </span>
+      </div>
+
+      <p className="text-xs text-muted" aria-label="Local memory review quality counters">
+        Locally observed reviews: {quality.proposed} proposed, {quality.approved} approved,
+        {quality.dismissed} dismissed.
+        Human agreement among decided suggestions: {humanAgreementFraction(quality)===null
+          ?"not established":(100*humanAgreementFraction(quality)!).toFixed(1)+"%"}.
+        These decisions are not an independent semantic accuracy benchmark.
+      </p>
+      {semanticSuggestions.length>0 && (
+        <section className="space-y-2 rounded-lg border border-border p-3"
+          aria-label="Model-proposed memory changes awaiting approval">
+          <h3 className="text-sm font-semibold">Review proposed memory changes</h3>
+          <p className="text-xs text-muted">
+            The model may be wrong. Read both originals and the proposed summary
+            before making a deliberate decision.
+          </p>
+          {semanticSuggestions.map((proposal,index)=>(
+            <div key={proposal.kind+":"+proposal.ids.join(":")+":"+index}
+              className="space-y-1 rounded border border-border p-2 text-xs">
+              <p className="font-semibold">
+                {proposal.kind==="merge"?"Suggested semantic merge":"Possible contradiction"}
+              </p>
+              {proposal.expectedTexts.map((value,i)=>(
+                <p key={proposal.ids[i]}>{i+1}. {value}</p>
+              ))}
+              {proposal.kind==="merge" && (
+                <p className="font-semibold">Proposed final memory: {proposal.suggestedText}</p>
+              )}
+              <p className="text-muted">Model rationale: {proposal.reason}</p>
+              <p className="text-[10px] text-muted">Scope: {proposal.scopeKey}</p>
+              <div className="flex flex-wrap gap-2">
+                {proposal.kind==="merge" ? (
+                  <Button size="sm" variant="secondary" disabled={busy!==null}
+                    onClick={()=>void applySemanticSuggestion(proposal)}>
+                    Approve reversible merge
+                  </Button>
+                ) : (
+                  proposal.ids.map((id,i)=>(
+                    <Button key={id} size="sm" variant="secondary" disabled={busy!==null}
+                      onClick={()=>void applySemanticSuggestion(proposal,id)}>
+                      Keep statement {i+1}
+                    </Button>
+                  ))
+                )}
+                <Button size="sm" variant="ghost" disabled={busy!==null}
+                  onClick={()=>{
+                    setSemanticSuggestions(items=>items.filter(item=>item!==proposal));
+                    setQuality(recordSemanticReviewQuality('dismissed'));
+                  }}>
+                  Dismiss
+                </Button>
+              </div>
+            </div>
+          ))}
+        </section>
+      )}
+
+      {contradictions.length > 0 && (
+        <section className="rounded-lg border border-warning/40 p-3" aria-label="Memory contradictions requiring review">
+          <h3 className="text-sm font-semibold">Contradictory memories need your decision</h3>
+          <p className="mt-1 text-xs text-muted">
+            The background curator never picks a winner. Select which statement should
+            remain enabled; the other will be soft-disabled and can be restored in Memory Studio.
+          </p>
+          <div className="mt-2 space-y-3">
+            {contradictions.map(({positive,negative}) => (
+              <div key={positive.id+":"+negative.id} className="rounded-md border border-border p-2">
+                <p className="text-xs">{positive.text}</p>
+                <p className="mt-1 text-xs">{negative.text}</p>
+                <p className="mt-1 text-[10px] text-muted">
+                  Scope: {positive.project_root ?? "global"}
+                </p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button size="sm" variant="secondary" disabled={busy !== null}
+                    onClick={() => void run("conflict",async()=>{
+                      await setMemoryEnabled(negative.id,negative.project_root,false);
+                      await refresh();
+                      setSuccess("Kept the positive memory; disabled the contradictory one.");
+                    })}>
+                    Keep first statement
+                  </Button>
+                  <Button size="sm" variant="secondary" disabled={busy !== null}
+                    onClick={() => void run("conflict",async()=>{
+                      await setMemoryEnabled(positive.id,positive.project_root,false);
+                      await refresh();
+                      setSuccess("Kept the negative memory; disabled the contradictory one.");
+                    })}>
+                    Keep second statement
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex gap-1 rounded-lg border border-border bg-surface-2 p-0.5">

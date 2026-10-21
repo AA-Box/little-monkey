@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Activity, Ban, Cloud, KeyRound, Loader2, Play, Power, RefreshCw, RotateCw, ShieldAlert, Smartphone, Square, Trash2, Wrench } from "lucide-react";
@@ -45,6 +45,9 @@ import {
 import { useRecipeStore } from "../../store/recipeStore";
 import { useRunStore } from "../../store/runStore";
 import { Button, Tabs } from "../ui";
+// The dedicated swarm and MCP management surface is intentionally split out
+// of the SettingsModal chunk to respect the production bundle budget.
+const SwarmPanel = lazy(() => import("./SwarmPanel").then(mod => ({ default: mod.SwarmPanel })));
 import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
 
@@ -95,7 +98,7 @@ function backpressureStateLabel(t: ReturnType<typeof useT>["t"], state: Backpres
 
 export function BackgroundAgentsPanel() {
   const { t } = useT();
-  const [tab, setTab] = useState<"daemon" | "queue" | "remote">("daemon");
+  const [tab, setTab] = useState<"daemon" | "queue" | "remote" | "swarm">("daemon");
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -202,7 +205,9 @@ export function BackgroundAgentsPanel() {
   return (
     <section className="flex flex-col gap-4">
       <div><h3 className="text-sm font-semibold text-foreground">Background agents and user-owned handoff</h3><p className="mt-1 text-xs leading-5 text-muted">The resident execution service is part of Little Monkey&apos;s runtime, not an add-on: desktop chat runs on it, as do background, CLI, ACP, scheduler, and workflow runs. The app installs it, keeps it on the shipped build, and starts it at launch — this panel is for managing it afterwards. Remote control is opt-in and keeps inference, provider keys, tools, and repository access on your runner.</p></div>
-      <Tabs tabs={[{ id: "daemon", label: "Service" }, { id: "queue", label: "Queue a run" }, { id: "remote", label: "Remote handoff" }]} active={tab} onChange={(id) => setTab(id as typeof tab)} />
+      <Tabs tabs={[{ id: "daemon", label: "Service" }, { id: "queue", label: "Queue a run" }, { id: "remote", label: "Remote handoff" }, { id: "swarm", label: "Agent swarms" }]} active={tab} onChange={(id) => setTab(id as typeof tab)} />
+
+      {tab === "swarm" && <Suspense fallback={<p className="text-xs text-muted">Loading swarm settings…</p>}><SwarmPanel /></Suspense>}
 
       {tab === "daemon" && <>
         <div className="grid grid-cols-2 gap-2 md:grid-cols-4">

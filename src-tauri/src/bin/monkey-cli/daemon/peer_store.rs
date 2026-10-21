@@ -202,6 +202,9 @@ pub struct PeerOutboundMessage {
     /// peer's own thread reported.
     pub state: String,
     pub result_text: Option<String>,
+    /// Canonical authenticated peer-model metering, never an invoice or
+    /// independently verified answer score. None when source had no usage.
+    pub model_metering: Option<serde_json::Value>,
     pub sent_at_ms: i64,
     pub checked_at_ms: Option<i64>,
 }
@@ -560,6 +563,28 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Resolve a cancellable job only through its original authenticated
+    /// sender, thread and exact task message id. No peer can cancel an
+    /// unrelated run, even if it guesses a daemon job id.
+    pub fn peer_owned_task_job(
+        &self,
+        peer_device_id: &str,
+        thread_id: &str,
+        message_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT job_id FROM peer_messages
+                 WHERE peer_device_id=?1 AND thread_id=?2 AND message_id=?3
+                   AND direction='inbound' AND kind='task_request'
+                   AND disposition='accepted' AND job_id IS NOT NULL",
+                params![peer_device_id, thread_id, message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     /// One thread, named by the pairing that owns it.
     ///
     /// The device id is not a filter that could be dropped for convenience:
@@ -878,17 +903,105 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Additive SQLite companion table: no alterations to immutable daemon
+    /// migrations. A paired peer may only write the exact bounded numeric
+    /// usage receipt on an outbound request we already durably initiated.
+    fn prepare_outbound_metering(&self)->Result<(),String>{
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS peer_outbound_model_metering (
+                alias TEXT NOT NULL, message_id TEXT NOT NULL,
+                metering_json TEXT NOT NULL CHECK(length(metering_json)<=2048),
+                PRIMARY KEY(alias,message_id),
+                FOREIGN KEY(alias,message_id)
+                    REFERENCES peer_outbound_messages(alias,message_id) ON DELETE CASCADE
+            );"
+        ).map_err(|e|e.to_string())
+    }
+
+    pub fn record_outbound_peer_metering(
+        &mut self,alias:&str,message_id:&str,claimed_state:&str,
+        claimed:&serde_json::Value,
+    )->Result<(),String>{
+        if !matches!(claimed_state,"succeeded"|"failed"|"cancelled"){
+            return Err("Unexpected peer metering outcome".into());
+        }
+        let object=claimed.as_object().ok_or("Peer metering is not an object")?;
+        const FIELDS:[&str;13]=[
+            "version","source","run_id","target_id","status","duration_ms",
+            "input_tokens","output_tokens","cached_input_tokens","model_calls",
+            "cost_micros","independently_quality_verified",
+            "provider_billing_reconciled",
+        ];
+        if object.len()!=FIELDS.len()||object.keys().any(|key|!FIELDS.contains(&key.as_str()))||
+            claimed["version"]!=1||
+            claimed["source"]!="receiver_verified_run_ledger"||
+            claimed["status"]!=claimed_state||
+            claimed["independently_quality_verified"]!=false||
+            claimed["provider_billing_reconciled"]!=false{
+            return Err("Invalid or overclaiming peer metering provenance".into());
+        }
+        let id=claimed["run_id"].as_str().ok_or("Missing peer run identity")?;
+        let target=claimed["target_id"].as_str().ok_or("Missing peer model identity")?;
+        if id.len()>220||!id.starts_with("run-")||
+            !id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-')||
+            target.is_empty()||target.len()>160||
+            !target.bytes().all(|b|b.is_ascii_alphanumeric()||
+                matches!(b,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%')){
+            return Err("Invalid peer metering identifier".into());
+        }
+        let duration=claimed["duration_ms"].as_u64().ok_or("Invalid peer runtime")?;
+        let input=claimed["input_tokens"].as_u64().ok_or("Invalid prompt tokens")?;
+        let output=claimed["output_tokens"].as_u64().ok_or("Invalid output tokens")?;
+        let cached=claimed["cached_input_tokens"].as_u64().ok_or("Invalid cached tokens")?;
+        let calls=claimed["model_calls"].as_u64().ok_or("Invalid model calls")?;
+        if duration>86_400_000||input>100_000_000||output>100_000_000||
+            cached>input||calls==0||calls>100_000||
+            (!claimed["cost_micros"].is_null() &&
+                claimed["cost_micros"].as_u64().is_none_or(|v|v>1_000_000_000_000)){
+            return Err("Unbounded or inconsistent peer usage".into());
+        }
+        self.prepare_outbound_metering()?;
+        let encoded=serde_json::to_string(claimed).map_err(|e|e.to_string())?;
+        if encoded.len()>2048{return Err("Peer metering receipt too large".into());}
+        let existing:Option<String>=self.connection.query_row(
+            "SELECT metering_json FROM peer_outbound_model_metering
+             WHERE alias=?1 AND message_id=?2",
+            params![alias,message_id],|r|r.get(0)
+        ).optional().map_err(|e|e.to_string())?;
+        if let Some(previous)=existing{
+            if previous==encoded{return Ok(());}
+            return Err("Conflicting metering receipt for same peer message".into());
+        }
+        let stored_state:Option<String>=self.connection.query_row(
+            "SELECT state FROM peer_outbound_messages
+             WHERE alias=?1 AND message_id=?2",
+            params![alias,message_id],|r|r.get(0)
+        ).optional().map_err(|e|e.to_string())?;
+        if stored_state.as_deref()!=Some(claimed_state){
+            return Err("Peer metering does not match a recorded terminal answer".into());
+        }
+        self.connection.execute(
+            "INSERT INTO peer_outbound_model_metering(alias,message_id,metering_json)
+             VALUES (?1,?2,?3)",params![alias,message_id,encoded]
+        ).map_err(|e|format!("Failed to persist peer metering: {e}"))?;
+        Ok(())
+    }
+
     /// What this installation has sent, newest first, for one peer or all.
     pub fn outbound_peer_messages(
         &self,
         alias: Option<&str>,
         limit: u32,
     ) -> Result<Vec<PeerOutboundMessage>, String> {
+        self.prepare_outbound_metering()?;
         let mut statement = self
             .connection
             .prepare(
                 "SELECT alias, message_id, thread_id, correlation_id, kind, state,
-                        result_text, sent_at_ms, checked_at_ms
+                        result_text, sent_at_ms, checked_at_ms,
+                        (SELECT metering_json FROM peer_outbound_model_metering AS m
+                         WHERE m.alias=peer_outbound_messages.alias
+                           AND m.message_id=peer_outbound_messages.message_id)
                    FROM peer_outbound_messages
                   WHERE (?1 IS NULL OR alias = ?1)
                   ORDER BY sent_at_ms DESC, message_id DESC LIMIT ?2",
@@ -906,6 +1019,8 @@ impl DaemonStore {
                     result_text: row.get(6)?,
                     sent_at_ms: row.get(7)?,
                     checked_at_ms: row.get(8)?,
+                    model_metering: row.get::<_,Option<String>>(9)?
+                        .and_then(|data|serde_json::from_str(&data).ok()),
                 })
             })
             .map_err(|error| error.to_string())?;
@@ -1554,6 +1669,39 @@ mod tests {
         assert!(store.outbound_peer_messages(None, 10).unwrap().is_empty());
     }
 
+    #[test]
+    fn verified_remote_model_usage_is_idempotent_scoped_and_not_peer_authority(){
+        let mut store=DaemonStore::open_in_memory().unwrap();
+        store.record_outbound_peer_message(
+            "paired-a","pmsg-1","thread-1",None,"task_request","queued",NOW
+        ).unwrap();
+        let usage=serde_json::json!({
+            "version":1,"source":"receiver_verified_run_ledger",
+            "run_id":"run-model-abcdef01","target_id":"provider:anthropic:model",
+            "status":"succeeded","duration_ms":1000,
+            "input_tokens":100,"output_tokens":30,"cached_input_tokens":5,
+            "model_calls":1,"cost_micros":200,
+            "independently_quality_verified":false,
+            "provider_billing_reconciled":false,
+        });
+        assert!(store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&usage).is_err(),
+            "an unaccepted result is not telemetry");
+        store.record_outbound_peer_result("paired-a","pmsg-1","succeeded",
+            Some("done"),NOW+1).unwrap();
+        store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&usage).unwrap();
+        store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&usage).unwrap();
+        let rows=store.outbound_peer_messages(Some("paired-a"),10).unwrap();
+        assert_eq!(rows[0].model_metering.as_ref(),Some(&usage));
+        let mut forged=usage.clone();
+        forged["input_tokens"]=serde_json::json!(9999);
+        assert!(store.record_outbound_peer_metering("paired-a","pmsg-1","succeeded",&forged).is_err());
+        let mut forged=usage.clone();
+        forged["provider_billing_reconciled"]=serde_json::json!(true);
+        assert!(store.record_outbound_peer_metering("paired-a","pmsg-2","succeeded",&forged).is_err());
+        assert!(store.record_outbound_peer_metering("another-peer","pmsg-1","succeeded",&usage).is_err());
+        assert_eq!(store.delete_outbound_peer_messages("paired-a").unwrap(),1);
+        assert!(store.outbound_peer_messages(Some("paired-a"),10).unwrap().is_empty());
+    }
     #[test]
     fn revoking_a_peer_takes_its_traffic_with_it() {
         let mut store = store_with_thread();

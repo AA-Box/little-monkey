@@ -8,6 +8,29 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeM
 // these tests pin the ORCHESTRATION contract: validation, deterministic
 // task ids, phase sequencing, prior-report injection, failure/cancellation
 // propagation, and the workflowStore lifecycle.
+const peersListMock=vi.fn();
+vi.mock("./peersClient", () => ({ peersList: (...args: unknown[]) => peersListMock(...args) }));
+const voter=(alias:string,index:number)=>({
+  alias,peer_id:'device-'+index,certificate_sha256:String(index).repeat(64),
+  grants:['task'],presence:'online',
+});
+const runPairedPeerAgentMock = vi.fn();
+const runPairedPeerAgentWithFailoverMock = vi.fn();
+vi.mock("./swarmPeer", () => ({ runPairedPeerAgent: (...args: unknown[]) => runPairedPeerAgentMock(...args) }));
+vi.mock("./swarmPeerRecovery", () => ({
+  runPairedPeerAgentWithFailover: (...args: unknown[]) => runPairedPeerAgentWithFailoverMock(...args),
+}));
+const retrieveSwarmKnowledgeMock = vi.fn();
+vi.mock("./swarmKnowledge", () => ({
+  retrieveSwarmKnowledge: (...args: unknown[]) => retrieveSwarmKnowledgeMock(...args),
+}));
+const autoMemoryRetrieveMock = vi.fn();
+const autoMemoryCaptureMock = vi.fn();
+vi.mock('./swarmAutoMemory', () => ({
+  validateAutoMemoryStack: (id: string) => id,
+  retrieveAutoMemory: (...args: unknown[]) => autoMemoryRetrieveMock(...args),
+  captureAutoMemory: (...args: unknown[]) => autoMemoryCaptureMock(...args),
+}));
 const runSubagentTaskMock = vi.fn();
 vi.mock("./subagent", () => ({
   runSubagentTask: (...args: unknown[]) => runSubagentTaskMock(...args),
@@ -15,6 +38,7 @@ vi.mock("./subagent", () => ({
 }));
 
 import { CANCELLED_TOOL_RESULT } from "./turnEngine";
+import { LiveSwarmBus } from './swarmLiveBus';
 import {
   MAX_WORKFLOW_PHASES,
   buildPriorReportsBlock,
@@ -24,12 +48,14 @@ import {
   resolveWorkflowSpec,
   runWorkflow,
   workflowAgentTaskId,
+  workflowCorrelationOrigin,
   type WorkflowSpec,
 } from "./workflow";
 import { useWorkflowStore } from "../store/workflowStore";
 import { selectSavedWorkflowList, useSavedWorkflowStore } from "../store/savedWorkflowStore";
 import { selectSubagentRun, useSubagentStore } from "../store/subagentStore";
-import { useSessionStore, type ChatSession, type WorkflowRunMeta } from "../store/sessionStore";
+import { SWARM_NOTEBOOK_STORAGE_KEY, listSwarmNotebook, approvedSwarmNotebookBlock } from "./swarmNotebook";
+import { normalizeWorkflowRunMeta, useSessionStore, type ChatSession, type WorkflowRunMeta } from "../store/sessionStore";
 
 const TARGET = {} as never;
 
@@ -55,12 +81,43 @@ function spec(overrides?: Partial<WorkflowSpec>): WorkflowSpec {
 }
 
 beforeEach(() => {
+  runPairedPeerAgentMock.mockReset().mockResolvedValue("Remote peer report");
+  peersListMock.mockReset().mockResolvedValue({outbound:[voter('node-a',1),voter('node-b',2)]});
+  runPairedPeerAgentWithFailoverMock.mockReset().mockResolvedValue("Recovered peer report");
   runSubagentTaskMock.mockReset();
   runSubagentTaskMock.mockResolvedValue("fine report");
+  retrieveSwarmKnowledgeMock.mockReset().mockResolvedValue("");
+  autoMemoryRetrieveMock.mockReset().mockResolvedValue('');
+  autoMemoryCaptureMock.mockReset().mockResolvedValue({saved:2,warnings:[]});
   useWorkflowStore.setState({ runs: {} });
 });
 
 describe("parseWorkflowSpec", () => {
+  it('validates opted-in peer failover boundaries',()=>{
+    const parse=(agent:Record<string,unknown>)=>parseWorkflowSpec({
+      name:'peer review',phases:[{title:'P',agents:[{
+        description:'read',prompt:'Inspect sources',profile:'explore',...agent}]}],
+    });
+    expect(parse({peer:'node-a',peerCandidates:['node-a','node-b'],peerFailover:true})
+      .phases[0].agents[0].peerFailover).toBe(true);
+    for(const bad of [
+      {peer:'node-a',peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a'],peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a','node-a'],peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a','node-b'],profile:'code',peerFailover:true},
+      {peer:'node-a',peerCandidates:['node-a','node-b'],peerFailover:'true'},
+    ])expect(()=>parse(bad)).toThrow();
+  });
+
+  it("rejects remote code agents and worktree placements", () => {
+    expect(() => parseWorkflowSpec({
+      name: "bad", phases: [{ title: "P", agents: [{ description: "write", prompt: "change", profile: "code", peer: "paired-node" }] }],
+    })).toThrow(/read-only/);
+    expect(() => parseWorkflowSpec({
+      name: "bad", phases: [{ title: "P", agents: [{ description: "read", prompt: "look", profile: "explore", peer: "paired-node", isolation: "worktree" }] }],
+    })).toThrow(/worktree/);
+  });
+
   it("normalizes a valid spec, passing unknown profiles through for dispatch to validate", () => {
     const parsed = parseWorkflowSpec({
       name: " audit ",
@@ -100,6 +157,18 @@ describe("parseWorkflowSpec", () => {
   });
 });
 
+describe("workflowCorrelationOrigin", () => {
+  it("preserves the original peer receipt across repeated workflow resumes", () => {
+    const first = workflowCorrelationOrigin("call-A");
+    const second = workflowCorrelationOrigin("call-B", "call-A", { correlationOrigin: first });
+    const third = workflowCorrelationOrigin("call-C", "call-B", { correlationOrigin: second });
+    expect(first).toBe("call-A");
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+    expect(workflowCorrelationOrigin("call-B", "legacy-run")).toBe("legacy-run");
+  });
+});
+
 describe("workflowAgentTaskId", () => {
   it("is deterministic from tool call id and position", () => {
     expect(workflowAgentTaskId("call_9", 1, 2)).toBe("call_9#p1a2");
@@ -113,6 +182,7 @@ describe("buildPriorReportsBlock", () => {
       { phaseTitle: "Audit", agentDescription: "audit A", report: "x".repeat(5000) },
     ]);
     expect(block).toContain("### Audit — audit A");
+    expect(block).toContain("[Untrusted data from prior workflow agent report]");
     expect(block).toContain("[truncated]");
     expect(block.length).toBeLessThan(3000);
   });
@@ -125,6 +195,155 @@ describe("runWorkflow", () => {
     toolCallId: "call_wf",
     target: TARGET,
   };
+
+  it("shares selected persistent knowledge among agents and preserves resume prompt hashing", async () => {
+    retrieveSwarmKnowledgeMock.mockResolvedValue("## Retrieved indexed evidence");
+    await runWorkflow({ ...baseParams, spec: spec({ memoryStackIds: ["stack-1"] }) });
+    expect(retrieveSwarmKnowledgeMock).toHaveBeenCalledWith(["stack-1"], "Verify roadmap claims");
+    expect(runSubagentTaskMock.mock.calls.length).toBe(3);
+    for (const call of runSubagentTaskMock.mock.calls) {
+      expect((call[0] as { prompt: string }).prompt).toContain("Retrieved indexed evidence");
+    }
+  });
+
+  it("rejects a malicious persisted workflow that tries to run a code agent remotely", async () => {
+    const untrustedSpec = spec({
+      phases: [{ title: "Bad", agents: [{ description: "bad", prompt: "mutate", profile: "code", peer: "paired-node" }] }],
+    });
+    const result = await runWorkflow({ ...baseParams, spec: untrustedSpec });
+    expect(result).toContain("read-only");
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects unauthenticated, duplicate and revoked peer voters before dispatch',async()=>{
+    const quorum=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Peer reviewers',agents:[
+        {description:'Reviewer A',prompt:'Vote on claim',profile:'explore',peer:'node-a'},
+        {description:'Reviewer B',prompt:'Vote on claim',profile:'explore',peer:'node-b'},
+      ]},
+      {title:'Local verification',agents:[{description:'Verifier',prompt:'Verify sources',profile:'explore'}]},
+    ]});
+    peersListMock.mockResolvedValueOnce({outbound:[voter('node-a',1),
+      {...voter('node-b',2),peer_id:'device-1'}]});
+    const failure=await runWorkflow({...baseParams,spec:quorum});
+    expect(failure).toContain('Reviewer quorum peer not distinct');
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('binds actual peer reviewer agreement to separate certificate identities',async()=>{
+    const vote=JSON.stringify({claims:[{id:'api/auth',verdict:'support',evidence:['src/auth.ts:21']}]});
+    runPairedPeerAgentMock.mockResolvedValue(vote);
+    const quorum=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Peer reviewers',agents:[
+        {description:'Reviewer A',prompt:'Vote on claim',profile:'explore',peer:'node-a'},
+        {description:'Reviewer B',prompt:'Vote on claim',profile:'explore',peer:'node-b'},
+      ]},
+      {title:'Local verification',agents:[{description:'Verifier',prompt:'Verify sources',profile:'explore'}]},
+    ]});
+    const success=await runWorkflow({...baseParams,spec:quorum});
+    expect(success).toContain('reviewer_agreement');
+    expect(success).toContain('paired:'+String(1).repeat(64));
+    expect(success).toContain('paired:'+String(2).repeat(64));
+    expect(peersListMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('invalidates the vote if a peer certificate changes after execution',async()=>{
+    const quorum=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Review',agents:[
+        {description:'A',prompt:'Report',profile:'explore',peer:'node-a'},
+        {description:'B',prompt:'Report',profile:'explore',peer:'node-b'}]},
+      {title:'Verify',agents:[{description:'V',prompt:'Verify',profile:'explore'}]},
+    ]});
+    peersListMock.mockResolvedValueOnce({outbound:[voter('node-a',1),voter('node-b',2)]})
+      .mockResolvedValueOnce({outbound:[voter('node-a',1),{...voter('node-b',2),certificate_sha256:'f'.repeat(64)}]});
+    const result=await runWorkflow({...baseParams,spec:quorum});
+    expect(result).toContain('certificate identity changed');
+  });
+
+  it("routes an explicitly selected explore agent to the paired peer", async () => {
+    const remoteSpec = spec({
+      phases: [{ title: "Peer phase", agents: [{ description: "peer audit", prompt: "Inspect API", profile: "explore", peer: "my-node" }] }],
+    });
+    await runWorkflow({ ...baseParams, spec: remoteSpec });
+    expect(runPairedPeerAgentMock).toHaveBeenCalledWith(expect.objectContaining({
+      peer: "my-node", taskId: "call_wf#p0a0", correlationTaskPosition: "p0a0", prompt: "Inspect API",
+    }));
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
+  it("dispatches an explicitly opt-in peer failure recovery through the guarded runner", async () => {
+    const remoteSpec = spec({
+      phases: [{ title: "Peer recovery", agents: [{ description: "peer audit", prompt: "Read API",
+        profile: "explore", peer: "node-a", peerCandidates: ["node-a","node-b"], peerFailover: true }] }],
+    });
+    await runWorkflow({ ...baseParams, spec: remoteSpec });
+    expect(runPairedPeerAgentWithFailoverMock).toHaveBeenCalledWith(expect.objectContaining({
+      peer: "node-a", peerCandidates: ["node-a","node-b"],
+      correlationTaskPosition: "p0a0", prompt: "Read API",
+    }));
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses to forward selected indexed private memory to remote peers", async () => {
+    const remoteSpec = spec({
+      memoryStackIds: ["private-index"],
+      phases: [{ title: "Remote", agents: [{ description: "remote", prompt: "inspect", profile: "explore", peer: "my-node" }] }],
+    });
+    const result = await runWorkflow({ ...baseParams, spec: remoteSpec });
+    expect(result).toContain("Indexed knowledge cannot be automatically forwarded");
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("relays source-labelled successful reports through read-only ring waves", async () => {
+    runSubagentTaskMock.mockImplementation(async (params: {toolCallId: string}) => 'verified report of '+params.toolCallId);
+    const result = await runWorkflow({...baseParams, spec:spec({topology:'ring', phases:[{
+      title:'Team',agents:[
+        {description:'A',prompt:'Inspect A',profile:'explore'},
+        {description:'B',prompt:'Inspect B',profile:'explore'},
+        {description:'C',prompt:'Inspect C',profile:'explore'},
+      ],
+    }]})});
+    const calls=runSubagentTaskMock.mock.calls.map(call=>call[0] as {prompt:string;toolCallId:string});
+    expect(calls.map(call=>call.toolCallId)).toEqual(['call_wf#p0a0','call_wf#p0a1','call_wf#p0a2']);
+    expect(calls[0].prompt).toBe('Inspect A');
+    expect(calls[1].prompt).toContain('verified report of call_wf#p0a0');
+    expect(calls[1].prompt).toContain('untrusted');
+    expect(calls[2].prompt).toContain('verified report of call_wf#p0a1');
+    expect(JSON.parse(result).status).toBe('completed');
+  });
+
+  it("dynamically replaces a failed read-only coordinator, then fans out without stale or failed messages", async () => {
+    runSubagentTaskMock.mockImplementation(async (params: {toolCallId:string}) =>
+      params.toolCallId === 'call_wf#p0a0'
+        ? JSON.stringify({error:'coordinator unavailable'})
+        : 'verified report of '+params.toolCallId);
+    const result=await runWorkflow({...baseParams,spec:spec({topology:'adaptive',phases:[{
+      title:'Adaptive',agents:[
+        {description:'Lead',prompt:'Check lead',profile:'explore'},
+        {description:'Fallback',prompt:'Check fallback',profile:'explore'},
+        {description:'Worker A',prompt:'Check A',profile:'explore'},
+        {description:'Worker B',prompt:'Check B',profile:'explore'},
+      ],
+    }]})});
+    const calls=runSubagentTaskMock.mock.calls.map(call=>call[0] as {toolCallId:string;prompt:string});
+    expect(calls.map(call=>call.toolCallId)).toEqual([
+      'call_wf#p0a0','call_wf#p0a1','call_wf#p0a2','call_wf#p0a3',
+    ]);
+    expect(calls[1].prompt).not.toContain('coordinator unavailable');
+    expect(calls[2].prompt).toContain('verified report of call_wf#p0a1');
+    expect(calls[3].prompt).toContain('verified report of call_wf#p0a1');
+    expect(calls[3].prompt).not.toContain('verified report of call_wf#p0a2');
+    expect(JSON.parse(result).status).toBe('completed_with_failures');
+  });
+
+  it("never enables intra-phase relays for modifying or remote peers", async () => {
+    const result=await runWorkflow({...baseParams,spec:spec({topology:'ring',
+      phases:[{title:'Bad',agents:[{description:'write',prompt:'edit',profile:'code'}]}]})});
+    expect(result).toContain('read-only');expect(runSubagentTaskMock).not.toHaveBeenCalled();
+  });
 
   it("dispatches phases strictly in order and injects earlier reports into later prompts", async () => {
     runSubagentTaskMock.mockImplementation(async (params: { toolCallId: string }) => `report of ${params.toolCallId}`);
@@ -165,6 +384,17 @@ describe("runWorkflow", () => {
     const run = useWorkflowStore.getState().runs["call_wf"];
     expect(run.name).toBe("roadmap-audit");
     expect(run.phases[0].agents.map((agent) => agent.taskId)).toEqual(["call_wf#p0a0", "call_wf#p0a1"]);
+  });
+
+  it("blocks downstream phases when prerequisites fail in a fail-fast workflow", async () => {
+    runSubagentTaskMock.mockImplementation(async (params: { toolCallId: string }) =>
+      params.toolCallId === "call_wf#p0a0" ? JSON.stringify({ error: "investigation failed" }) : "success"
+    );
+    const result = await runWorkflow({ ...baseParams, spec: spec({ stopOnFailure: true }) });
+    expect(runSubagentTaskMock.mock.calls).toHaveLength(2);
+    const parsed = JSON.parse(result) as { status: string; phases: { title: string }[] };
+    expect(parsed.status).toBe("completed_with_failures");
+    expect(parsed.phases.map(p => p.title)).toEqual(["Audit"]);
   });
 
   it("reports per-agent failures and excludes them from later phases' context", async () => {
@@ -214,6 +444,37 @@ describe("resolveWorkflowSpec", () => {
   beforeEach(() => {
     useSavedWorkflowStore.setState({ workflows: {} });
   });
+
+  it("compiles an explicit dependency graph before execution", () => {
+    const graph = resolveWorkflowSpec({
+      name: "dependency-graph",
+      tasks: [
+        { id: "test", description: "Verify code", prompt: "Test the code", depends_on: ["build"] },
+        { id: "build", description: "Implement code", prompt: "Build the feature" },
+      ],
+    });
+    expect(graph.stopOnFailure).toBe(true);
+    expect(graph.phases.map(p => p.agents.map(a => a.description))).toEqual([
+      ["Implement code"], ["Verify code"],
+    ]);
+  });
+
+  it("resolves a goal to an automatic read-only swarm and keeps memory selections", () => {
+    const auto = resolveWorkflowSpec({ goal: "Improve API authentication", mode: "analyze", memory_stack_ids: ["project_index"] });
+    expect(auto.name).toMatch(/^auto-swarm-analysis-/);
+    expect(auto.memoryStackIds).toEqual(["project_index"]);
+    expect(auto.phases.flatMap(p => p.agents).every(a => a.profile === "explore")).toBe(true);
+  });
+
+  it("compiles the 15-agent security preset through the normal workflow resolver", () => {
+    const recipe = resolveWorkflowSpec({ preset: "security-red-team", scope: "backend auth" });
+    expect(recipe.name).toBe("security-red-team");
+    expect(recipe.phases.flatMap((phase) => phase.agents)).toHaveLength(15);
+    expect(recipe.phases[0].agents[0].prompt).toContain("backend auth");
+    expect(() => resolveWorkflowSpec({ scope: "backend auth" })).toThrow(/require a goal or preset/);
+    expect(() => resolveWorkflowSpec({ preset: "security-red-team", saved: "old-run" })).toThrow(/cannot be combined/);
+  });
+
 
   it("returns the saved spec for a known name when phases are omitted", () => {
     useSavedWorkflowStore.getState().upsert(spec());
@@ -405,6 +666,21 @@ describe("runWorkflow / resume (v2)", () => {
     }));
   }
 
+  it('never drops authenticated peer quorum requirements when reconstructing a resume',()=>{
+    const protectedSpec=spec({consensus:'strict',authenticatedPeerVoting:true,phases:[
+      {title:'Peer review',agents:[
+        {description:'A',prompt:'Review A',profile:'explore',peer:'node-a'},
+        {description:'B',prompt:'Review B',profile:'explore',peer:'node-b'},
+      ]},
+      {title:'Verification',agents:[{description:'V',prompt:'Validate',profile:'explore'}]},
+    ]});
+    seedSession({call_old:{...fullJournal('call_old'),spec:protectedSpec}});
+    const recovered=resolveWorkflowSpec({resume:'call_old'},SESSION);
+    expect(recovered.authenticatedPeerVoting).toBe(true);
+    expect(recovered.consensus).toBe('strict');
+    expect(recovered.phases[0].agents.map(agent=>agent.peer)).toEqual(['node-a','node-b']);
+  });
+
   it("replays every journaled agent on a full prompt-hash match, dispatching nothing", async () => {
     seedSession({ call_old: fullJournal("call_old") });
 
@@ -450,16 +726,167 @@ describe("runWorkflow / resume (v2)", () => {
     expect(runSubagentTaskMock).toHaveBeenCalledTimes(3);
   });
 
-  it("ignores resume for an unknown run id or a fully-successful run", async () => {
-    seedSession({ call_done: { ...fullJournal("call_done"), status: "done" } });
+  it("refuses to re-dispatch an unknown, active, or completed resume target", async () => {
+    seedSession({
+      call_done: { ...fullJournal("call_done"), status: "done" },
+      call_active: { ...fullJournal("call_active"), status: "running" },
+    });
+    for (const oldId of ["call_done", "call_active", "call_missing"]) {
+      const outcome = await runWorkflow({
+        sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_try_" + oldId,
+        resume: oldId, spec: spec(), target: TARGET,
+      });
+      expect(outcome).toContain("Cannot resume");
+    }
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+    expect(runPairedPeerAgentMock).not.toHaveBeenCalled();
+  });
 
-    await runWorkflow({ sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_new4", resume: "call_done", spec: spec(), target: TARGET });
-    expect(runSubagentTaskMock).toHaveBeenCalledTimes(3);
+  it("checkpoints completed agents while later phases are still running", async () => {
+    seedSession({});
+    runSubagentTaskMock.mockImplementation(async (params: { toolCallId: string }) => {
+      if (params.toolCallId.endsWith("p1a0")) {
+        const snapshot = useSessionStore.getState().sessions.find(s => s.id === SESSION)
+          ?.workflowRunMeta?.["call_live"];
+        expect(snapshot?.status).toBe("running");
+        expect(snapshot?.spec?.name).toBe("roadmap-audit");
+        expect(snapshot?.agentResults?.[workflowAgentTaskId("call_live", 0, 0)]?.status).toBe("done");
+      }
+      return "completed";
+    });
+    await runWorkflow({ sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_live", spec: spec(), target: TARGET });
+    const final = useSessionStore.getState().sessions.find(s => s.id === SESSION)?.workflowRunMeta?.["call_live"];
+    expect(final?.status).toBe("done");
+    expect(Object.keys(final?.agentResults ?? {})).toHaveLength(3);
+  });
 
-    runSubagentTaskMock.mockClear();
-    runSubagentTaskMock.mockResolvedValue("fine report");
-    await runWorkflow({ sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_new5", resume: "call_missing", spec: spec(), target: TARGET });
-    expect(runSubagentTaskMock).toHaveBeenCalledTimes(3);
+  it("persists a completed phase before dispatching its dependent reviewers", async () => {
+    seedSession({});
+    const saved: Array<{ workflowRunMeta?: Record<string, WorkflowRunMeta> }> = [];
+    invokeMock.mockImplementation(async (command: unknown, args?: unknown) => {
+      if (command === "sessions_save") {
+        const payload = (args as { payload: string }).payload;
+        saved.push(JSON.parse(payload).sessions.find((s: { id: string }) => s.id === SESSION));
+      }
+      return null;
+    });
+    try {
+      runSubagentTaskMock.mockImplementation(async (params: { toolCallId: string }) => {
+        if (params.toolCallId.endsWith("p1a0")) {
+          const durablySaved = saved.some(snapshot => {
+            const run = snapshot?.workflowRunMeta?.["call_durable"];
+            return run?.status === "running" &&
+              run.agentResults?.[workflowAgentTaskId("call_durable", 0, 0)]?.status === "done" &&
+              run.agentResults?.[workflowAgentTaskId("call_durable", 0, 1)]?.status === "done";
+          });
+          expect(durablySaved).toBe(true);
+        }
+        return "report";
+      });
+      const outcome = await runWorkflow({ sessionId: SESSION, parentCheckpointId: null,
+        toolCallId: "call_durable", spec: spec(), target: TARGET });
+      expect(JSON.parse(outcome).status).toBe("completed");
+      expect(saved[saved.length - 1]?.workflowRunMeta?.call_durable?.status).toBe("done");
+    } finally {
+      invokeMock.mockReset().mockResolvedValue(null);
+    }
+  });
+
+  it("hydrates crashed workflow journals as interrupted without executing agents", () => {
+    const meta = fullJournal("call_crashed");
+    meta.status = "running";
+    meta.spec = spec({ stopOnFailure: true, memoryStackIds: ["existing-stack"] });
+    const recovered = normalizeWorkflowRunMeta({ call_crashed: meta }, true);
+    expect(recovered.call_crashed.status).toBe("error");
+    expect(recovered.call_crashed.agentResults?.[workflowAgentTaskId("call_crashed", 0, 1)]?.status).toBe("done");
+    expect(recovered.call_crashed.spec?.memoryStackIds).toEqual(["existing-stack"]);
+    seedSession(recovered);
+    const resolved = resolveWorkflowSpec({ resume: "call_crashed" }, SESSION);
+    expect(resolved.stopOnFailure).toBe(true);
+    expect(resolved.memoryStackIds).toEqual(["existing-stack"]);
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+    expect(() => resolveWorkflowSpec({ resume: "call_crashed" }, "different-session")).toThrow(/recoverable/);
+  });
+
+  it('recovers pending mailbox messages after a simulated process restart without replaying completed code work',async()=>{
+    const old='crashed-mailbox';
+    const agents=[
+      {description:'reader',prompt:'Read code',profile:'explore'},
+      {description:'verifier',prompt:'Verify code',profile:'explore'},
+    ];
+    const durableSpec: WorkflowSpec={
+      name:'durable-agent-chat',description:'Verify mail delivery',
+      liveMessaging:true,phases:[{title:'Review',agents}],
+    };
+    const ids=[workflowAgentTaskId(old,0,0),workflowAgentTaskId(old,0,1)];
+    const oldBus=new LiveSwarmBus(ids);
+    oldBus.send(ids[0],ids[1],'Review auth.ts before completing');
+    oldBus.finishAgent(ids[0]);
+    const snapshot=oldBus.snapshot();
+    // An actual app restart normalizes every running snapshot into an
+    // interrupted one before the operator explicitly resumes it.
+    const persisted=normalizeWorkflowRunMeta({[old]:{
+      name:durableSpec.name,description:durableSpec.description,status:'running',
+      startedAt:1,finishedAt:2,spec:durableSpec,
+      phases:[{title:'Review',agents:ids.map((taskId,i)=>({
+        taskId,description:agents[i].description,
+      }))}],
+      liveMailbox:snapshot,
+      agentResults:{
+        [ids[0]]:{promptHash:promptHash('Read code'),status:'done',report:'read complete'},
+        [ids[1]]:{promptHash:promptHash('Verify code'),status:'error',report:'lost model connection'},
+      },
+    }},true);
+    seedSession(persisted);
+    expect(persisted[old].status).toBe('error');
+    expect(persisted[old].liveMailbox?.queues[ids[1]]).toHaveLength(1);
+    let recovered=false;
+    runSubagentTaskMock.mockImplementation(async (params:{toolCallId:string;liveBus:LiveSwarmBus})=>{
+      if(params.toolCallId.endsWith('#p0a1')){
+        const received=params.liveBus.peek(params.toolCallId);
+        expect(received).toMatchObject([{sender:workflowAgentTaskId('restored-mailbox',0,0),
+          recipient:params.toolCallId,kind:'direct'}]);
+        recovered=true;
+      }
+      return 'verified';
+    });
+    const outcome=await runWorkflow({sessionId:SESSION,parentCheckpointId:null,
+      toolCallId:'restored-mailbox',resume:old,spec:durableSpec,target:TARGET});
+    expect(outcome).toContain('completed');
+    expect(recovered).toBe(true);
+    expect(runSubagentTaskMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stages only structurally agreed claims for explicit operator approval", async () => {
+    const data = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => data.get(key) ?? null,
+      setItem: (key: string, value: string) => { data.set(key, value); },
+      removeItem: (key: string) => { data.delete(key); },
+    });
+    seedSession({});
+    localStorage.removeItem(SWARM_NOTEBOOK_STORAGE_KEY);
+    const strict = resolveWorkflowSpec({ goal: "Audit backend authentication", consensus: "strict", notebook: true });
+    runSubagentTaskMock.mockImplementation(async (params: { toolCallId: string }) => {
+      if (params.toolCallId.includes("#p1a")) return JSON.stringify({
+        claims: [{ id: "auth-boundary", verdict: "support", evidence: ["src/auth.ts:42"] }],
+      });
+      return "Investigation or synthesis with evidence.";
+    });
+    const result = await runWorkflow({
+      sessionId: SESSION, parentCheckpointId: null, toolCallId: "call_consensus",
+      spec: strict, target: TARGET,
+    });
+    const parsed = JSON.parse(result) as {
+      consensus: { status: string; claims: { status: string }[] };
+      notebookStaged: string[]; notebookRequiresApproval: boolean;
+    };
+    expect(parsed.consensus.status).toBe("reviewer_agreement");
+    expect(parsed.consensus.claims[0].status).toBe("reviewer_agreement");
+    expect(parsed.notebookStaged).toEqual(["auth-boundary"]);
+    expect(parsed.notebookRequiresApproval).toBe(true);
+    expect(listSwarmNotebook("session:" + SESSION)[0].revisions[0].status).toBe("pending");
+    expect(approvedSwarmNotebookBlock("session:" + SESSION)).toBe("");
   });
 
   it("writes this run's own journal into the terminal meta, so a chain of resumes works", async () => {
@@ -497,5 +924,75 @@ describe("parseWorkflowSpec / isolation", () => {
     });
     expect(parsed.phases[0].agents[0].isolation).toBe("worktree");
     expect(parsed.phases[0].agents[1].isolation).toBeUndefined();
+  });
+});
+
+describe('P0 runtime workflow integration', () => {
+  const base = {
+    sessionId: 'p0-session', parentCheckpointId: null,
+    toolCallId: 'p0-call', target: TARGET,
+  };
+
+  it('passes a live mailbox into independently running agents and collects actual delivery evidence', async () => {
+    let releaseReader: () => void = () => {};
+    const readerReady = new Promise<void>(resolve => { releaseReader = resolve; });
+    runSubagentTaskMock.mockImplementation(async (params: {toolCallId: string; liveBus: LiveSwarmBus}) => {
+      const bus = params.liveBus;
+      if (params.toolCallId.endsWith('#p0a0')) {
+        bus.observeRead(params.toolCallId, 'src/auth.ts');
+        await readerReady;
+        const incoming = bus.receive(params.toolCallId);
+        expect(incoming).toHaveLength(2);
+        expect(incoming.map(message => message.kind)).toEqual(['direct', 'file_changed']);
+        return 'reader reviewed changed source';
+      }
+      bus.send(params.toolCallId, 'p0-call#p0a0', 'please re-read before reviewing');
+      bus.observeMutation(params.toolCallId, 'src/auth.ts');
+      releaseReader();
+      return 'writer completed';
+    });
+    const workflow: WorkflowSpec = {
+      name: 'p0-local', description: 'verify local collaboration',
+      liveMessaging: true,
+      phases: [{ title: 'Collaborate', agents: [
+        {description: 'reader',prompt: 'Read',profile: 'explore'},
+        {description: 'writer',prompt: 'Write',profile: 'code'},
+      ]}],
+    };
+    const response = await runWorkflow({ ...base, spec: workflow });
+    expect(response).toContain('completed');
+    expect(response).toContain('"directDeliveries":1');
+    expect(response).toContain('"fileNotifications":1');
+    expect(response).toContain('"received":2');
+  });
+
+  it('retrieves semantic history before dispatch and captures successful reports afterwards', async () => {
+    autoMemoryRetrieveMock.mockResolvedValue('## Historical model report');
+    const workflow: WorkflowSpec = {
+      name: 'p0-memory', description: 'review authentication',
+      autoMemoryStackId: 'stack-one',
+      phases: [{title:'Audit',agents:[{description:'reviewer',prompt:'Review',profile:'explore'}]}],
+    };
+    const response = await runWorkflow({ ...base, spec: workflow });
+    expect(autoMemoryRetrieveMock).toHaveBeenCalledWith(
+      'stack-one', 'session:p0-session', 'review authentication',
+    );
+    expect(runSubagentTaskMock.mock.calls[0][0].prompt).toContain('Historical model report');
+    expect(autoMemoryCaptureMock).toHaveBeenCalledWith(
+      'stack-one', 'session:p0-session', 'p0-memory',
+      expect.arrayContaining([expect.objectContaining({role:'reviewer',report:'fine report'})]),
+    );
+    expect(response).toContain('"saved":2');
+  });
+
+  it('rejects remote placement without sharing live collaboration or memory', async () => {
+    const remote: WorkflowSpec = {
+      name:'remote',description:'remote work',liveMessaging:true,autoMemoryStackId:'stack-one',
+      phases:[{title:'P',agents:[{description:'peer',prompt:'Run',profile:'explore',peer:'node-a'}]}],
+    };
+    const result = await runWorkflow({ ...base, spec: remote });
+    expect(result).toContain('local only');
+    expect(runSubagentTaskMock).not.toHaveBeenCalled();
+    expect(autoMemoryRetrieveMock).not.toHaveBeenCalled();
   });
 });

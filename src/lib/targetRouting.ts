@@ -34,6 +34,7 @@ import {
 } from './modelTargets';
 import {
   observedTimeToFirstTokenMs,
+  matchPolicy,
   routeRequest,
   type RoutingCandidate,
   type RoutingDecision,
@@ -42,6 +43,9 @@ import {
 import { getActiveChatTarget, useModelStore, type MlxChatStatus as MlxChatStatusPayload } from '../store/modelStore';
 import { useCostControlStore } from '../store/costControlStore';
 import { useRoutingPolicyStore } from '../store/routingPolicyStore';
+import { rankEligibleSwarmTargets,loadSwarmBenchmark,swarmBenchmarkRoutingEnabled } from './swarmVerifiedBenchmarks';
+import { optimizeSwarmRoutingCosts,swarmCostOptimizationEnabled } from './swarmCostOptimizer';
+import { selectLiveGuardedCostRoute } from './swarmLiveOptimizer';
 
 /** Mirrors `LlamaState::default()` in src-tauri/src/llama.rs. */
 const DEFAULT_LLAMA_PORT = 8090;
@@ -464,7 +468,45 @@ export function routeFromActive(active: ResolvedTarget, context: RoutingContext)
     candidates.push(routingCandidate(snapshot));
   }
 
-  const decision = routeRequest(policies, candidates, context, activeKey);
+  const initial = routeRequest(policies, candidates, context, activeKey);
+  // Accuracy routing is operator opt-in, only for subagents, and only inside
+  // the *already validated* policy candidate list. Explicit preferred model
+  // order, per-profile model pins and the later Privacy Firewall all win.
+  const policy = matchPolicy(policies, context.taskClass);
+  const ranked = initial.policyId &&
+    (context.taskClass === 'subagent_explore' || context.taskClass === 'subagent_code') &&
+    policy?.preferredTargetKeys.length === 0
+    ? rankEligibleSwarmTargets(initial.sequence, policy.preferredTargetKeys)
+    : [...initial.sequence];
+  const costPlan=initial.policyId &&
+    (context.taskClass==='subagent_explore'||context.taskClass==='subagent_code') &&
+    policy?.preferredTargetKeys.length===0 && swarmBenchmarkRoutingEnabled()
+    ? optimizeSwarmRoutingCosts(ranked,loadSwarmBenchmark(),
+        useCostControlStore.getState().rates,useCostControlStore.getState().entries,
+        swarmCostOptimizationEnabled(),policy.preferredTargetKeys)
+    : {sequence:ranked,changed:false,estimatedSavingsFraction:null,evidenceSamples:0};
+  // Completion/failure telemetry is continuously recorded by the real
+  // subagent executor. Gate cost proposals behind a rolling baseline, gradual
+  // canary and automated reliability/latency rollback. Self-reported success
+  // never substitutes for the independently benchmarked correctness gate.
+  const guarded=selectLiveGuardedCostRoute(
+    ranked,costPlan.sequence,costPlan.changed&&swarmCostOptimizationEnabled(),
+  );
+  const finalOrder=guarded.sequence;
+  const benchmarkChanged = ranked.length > 1 && ranked[0] !== initial.chosenKey;
+  const decision: RoutingDecision = benchmarkChanged||guarded.changed ? {
+    ...initial,
+    chosenKey: finalOrder[0],
+    changedFromActive: finalOrder[0] !== activeKey,
+    sequence: finalOrder,
+    reason: initial.reason +
+      (benchmarkChanged ? ' Operator-approved live-model fixture accuracy reordered eligible subagent candidates.' : '') +
+      (guarded.changed ?
+        ' Opted-in cost optimizer chose an independently fixture-equivalent candidate, with '+
+        guarded.phase+' live rollout, observed token mix and configured prices; predicted token-rate savings '+
+        Math.round((costPlan.estimatedSavingsFraction??0)*100)+'% (NOT provider billing).' : '') +
+      ' Permissions, privacy policy and explicit pins remain authoritative.',
+  } : initial;
   useRoutingPolicyStore.getState().recordDecision(decision);
 
   const sequence: ResolvedTarget[] = [];

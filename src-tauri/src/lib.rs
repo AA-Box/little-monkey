@@ -58,6 +58,8 @@ pub mod managed_runtime;
 // K22: the startup self-integrity check every native launch path consults, and
 // the one-step rollback the in-app updater takes before it replaces the install.
 pub mod self_integrity;
+// Shared bounded lexical declaration hints for coding-agent grep.
+pub mod structural_grep;
 pub mod update_rollback;
 // The stack registry and the embedding path, shared by v1 Knowledge Stacks
 // (`stacks`) and Knowledge 2.0 (`knowledge_service`/`knowledge_pipeline`).
@@ -234,6 +236,7 @@ pub mod models;
 pub mod ollama;
 mod process_lock;
 pub mod providers;
+pub mod provider_oauth;
 pub mod triage;
 // Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
 // Tauri-free static-registry + comparison logic shared by `providers.rs`'s
@@ -265,6 +268,7 @@ pub mod config_revisions;
 // the CLI cannot drift into two different learning behaviours.
 mod login_path;
 mod sessions;
+pub mod session_mail;
 pub mod skill_activation;
 mod skill_activation_commands;
 pub mod skill_learning;
@@ -1400,6 +1404,7 @@ pub fn run() {
             providers::providers_add_custom,
             providers::providers_remove_custom,
             providers::providers_set_key,
+            provider_oauth::providers_openrouter_login,
             providers::providers_remove_key,
             providers::providers_list_models,
             providers::providers_check_model_retirements,
@@ -1411,12 +1416,15 @@ pub fn run() {
             models::models_cancel_download,
             mlx_chat::mlx_chat_start,
             mlx_chat::mlx_chat_status,
+            mlx_chat::mlx_chat_canary,
             mlx_chat::mlx_chat_stop,
             models::models_resolve_reference,
             models::models_install_reference,
             models::models_delete,
             models::models_add_external,
             models::models_add_external_folder,
+            models::models_verify_fused_weights,
+            models::models_import_verified_fusion,
             models::models_remove_external,
             models::models_detect_projectors,
             models::models_set_projector,
@@ -1487,6 +1495,7 @@ pub fn run() {
             hooks::hook_exec,
             memory::memory_list,
             memory::memory_add,
+            memory::memory_auto_apply,
             memory::memory_delete,
             memory::memory_update,
             memory::memory_clear,
@@ -1498,11 +1507,18 @@ pub fn run() {
             memory::memory_studio_set_pinned,
             memory::memory_studio_set_expiry,
             memory::memory_studio_merge,
+            memory::memory_studio_merge_guarded,
             memory::memory_studio_unmerge,
             memory::memory_studio_purge_expired,
             memory::memory_mark_used,
             sessions::sessions_load,
             sessions::sessions_save,
+            session_mail::session_mail_register,
+            session_mail::session_mail_peers,
+            session_mail::session_mail_send,
+            session_mail::session_mail_pending,
+            session_mail::session_mail_ack,
+            session_mail::session_mail_file_activity,
             profiles::profiles_list,
             profiles::profiles_create,
             profiles::profiles_rename,
@@ -1932,9 +1948,18 @@ pub fn run() {
             daemon_commands::peers_clear,
             daemon_commands::peers_forget,
             daemon_commands::peers_status,
+            daemon_commands::peers_send_task,
             daemon_commands::peers_threads,
             daemon_commands::peers_outbound,
             daemon_commands::peers_remote_thread,
+            daemon_commands::peers_cancel_task,
+            daemon_commands::peers_memory_share,
+            daemon_commands::peers_memory_put,
+            daemon_commands::peers_memory_search,
+            daemon_commands::peers_memory_sync,
+            daemon_commands::peers_memory_watch,
+            daemon_commands::peers_memory_add_text,
+            daemon_commands::peers_memory_query_text,
             daemon_commands::telecom_list,
             daemon_commands::telecom_add,
             daemon_commands::telecom_probe,
@@ -1956,6 +1981,13 @@ pub fn run() {
             daemon_commands::daemon_desktop_stop,
             daemon_commands::daemon_desktop_uninstall,
             daemon_commands::daemon_desktop_queue,
+            daemon_commands::daemon_swarm_submit,
+            daemon_commands::daemon_swarm_replica_status,
+            daemon_commands::daemon_swarm_status,
+            daemon_commands::daemon_cluster_setup,
+            daemon_commands::daemon_cluster_status,
+            daemon_commands::daemon_cluster_elect,
+            daemon_commands::daemon_swarm_cancel,
             daemon_commands::daemon_desktop_pause,
             daemon_commands::daemon_desktop_resume,
             daemon_commands::daemon_desktop_cancel,

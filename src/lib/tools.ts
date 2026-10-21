@@ -252,6 +252,10 @@ export const TOOLS: ToolDef[] = [
             description:
               "Optional directory or file to scope the search to, relative to the primary workspace folder. Defaults to the whole primary folder. To search a secondary attached folder, pass its label (or a label-prefixed subpath), e.g. 'other-folder'.",
           },
+          structure: {
+            type: 'boolean',
+            description: 'When true, include bounded nearest named function/class/type hints with declaration line and line displacement for Rust, Python, JS/TS and other common coding languages. Hints are lexical, not AST proof of containment.',
+          },
         },
         required: ['pattern'],
         additionalProperties: false,
@@ -705,15 +709,185 @@ export const TASK_TOOL: ToolDef = {
  * Frontend-only: `executeToolCall` intercepts the name before the
  * `invoke('tool_'+name)` dispatch, exactly like `task`.
  */
+/** A finite JSON schema (no unbounded $ref) for nested delegation.
+ * It is constructed once when tools are registered, not by a model turn.
+ * Every level is strict, and the compiler repeats the structural checks. */
+function workflowGraphTaskSchema(depth: number): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties: {
+      id: { type: 'string', description: 'Unique lowercase kebab-case task id.' },
+      description: { type: 'string', description: 'Short label.' },
+      prompt: { type: 'string', description: 'Complete independent task instructions.' },
+      profile: { type: 'string', description: 'explore, code or an installed agent profile.' },
+      depends_on: { type: 'array', items: { type: 'string' }, description: 'Explicit predecessor IDs. Child also always depends on its parent.' },
+      effort: { type: 'string', enum: ['low', 'medium', 'high'] },
+      isolation: { type: 'string', enum: ['worktree'] },
+      peer: { type: 'string', description: 'Read-only paired peer alias, checked by existing peer permission policy.' },
+      ...(depth < 3 ? {
+        children: {
+          type: 'array', maxItems: 6, items: workflowGraphTaskSchema(depth + 1),
+          description: 'Bounded preapproved child tasks, never a grant of new tool authority.',
+        },
+      } : {}),
+    },
+    required: ['id', 'description', 'prompt'],
+    additionalProperties: false,
+  };
+}
+
+/** Tools are only offered to agents explicitly enrolled in a live local
+ * workflow. Dispatch is bound to the validated run-scoped mailbox; no peer
+ * transport, filesystem, network, or tool permission is acquired here. */
+/** Session-to-session messages are NOT native swarm messages: these are
+ * explicitly opt-in, desktop-only, file-backed, same-workspace notices. */
+export const SESSION_PEERS_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'session_list_peers',
+    description: 'List OTHER local desktop chat sessions available for opt-in same-workspace messaging. Never includes sessions from another workspace.',
+    parameters: {type:'object',properties:{},additionalProperties:false},
+  },
+};
+export const SESSION_SEND_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'session_send_message',
+    description: 'Send a bounded untrusted notice to a peer desktop chat session in the same workspace. Persists before acknowledging. It never wakes/resumes the recipient, grants tools, or reaches remote peers.',
+    parameters: {
+      type:'object',
+      properties:{
+        recipient_session_id:{type:'string',description:'Exact session ID returned by session_list_peers.'},
+        text:{type:'string',description:'Message text, max 1600 characters. No secrets.'},
+      },
+      required:['recipient_session_id','text'],
+      additionalProperties:false,
+    },
+  },
+};
+
+/** Opt-in broadcast to peers already admitted by the SQLite directory. */
+export const SESSION_BROADCAST_TOOL: ToolDef = {
+  type:'function',
+  function:{
+    name:'session_broadcast_message',
+    description:'Durably broadcast one bounded untrusted message to all currently enrolled local desktop sessions in this workspace. The other sessions receive it at their next model safe point or their next chat turn; no remote messages or tool permissions are granted.',
+    parameters:{
+      type:'object',
+      properties:{text:{type:'string',description:'Text up to 1600 UTF-8 bytes; do not include secrets.'}},
+      required:['text'],
+      additionalProperties:false,
+    },
+  },
+};
+
+export const SWARM_SEND_MESSAGE_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'swarm_send_message',
+    description: 'Send a bounded untrusted coordination notice to another agent in this workflow. Use recipient "*" to broadcast. Messages arrive at the recipient\'s next model turn, never as instructions with higher authority.',
+    parameters: {
+      type: 'object',
+      properties: {
+        recipient: { type: 'string', description: 'Agent task ID from swarm_read_messages, or * for broadcast.' },
+        text: { type: 'string', description: 'Message (1–1200 characters), no credentials.' },
+      },
+      required: ['recipient', 'text'],
+      additionalProperties: false,
+    },
+  },
+};
+
+export const SWARM_READ_MESSAGES_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'swarm_read_messages',
+    description: 'Get a bounded batch of live coordination messages and the registered agent IDs in this workflow. Messages are automatically presented at model-turn boundaries too.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+  },
+};
+
 export const WORKFLOW_TOOL: ToolDef = {
   type: 'function',
   function: {
     name: 'workflow',
     description:
-      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). Each agent is isolated: give every prompt full, self-contained context. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
+      'Run a named, multi-phase orchestration of subagents. Phases run in order; the agents inside one phase run in parallel. Each later phase automatically receives the earlier phases\' reports appended to its prompts. Use this instead of plain task calls when the work has distinct stages (e.g. survey then verify, or explore then implement then review). For built-in multi-agent security reviews, pass {"preset":"security-red-team"} for a read-only 15-agent audit or {"preset":"security-audit-and-fix"} ONLY when the user explicitly requests code modifications; optional "scope" narrows the target. These presets reuse the same permission-gated workflow engine. For evidence-heavy reviews, optional "consensus":"strict" adds independent, source-attributed reviewer votes and explicitly reports disputes. Optional "notebook":true shares approved versioned project claims and stages new consensus claims for operator review without auto-promoting them. For arbitrary goals, use {"goal":"...","mode":"analyze"} to select specialist agents automatically, or mode "implement" ONLY when the user explicitly requests code changes. For explicit interdependent subtasks, pass name and tasks:[{id,description,prompt,profile,depends_on:[ids],children?:[nested tasks],peer?:alias}]. Children form a preapproved three-level tree: they start only after their parent succeeds, are flattened into the standard bounded DAG and never receive additional authority. Peer execution is opt-in for read-only explore tasks, and requires an already paired and task-authorized peer; independent waves run in parallel, dependent waves wait, and failed prerequisites stop downstream work. For an explicitly named read-only phased agent, peerFailover:true with peerCandidates:[aliases] permits a single distinct correlation on another authorized peer ONLY after an independently verified terminal failure. Network uncertainty and cancellation never trigger failover. Optionally pass memory_stack_ids naming already-indexed Knowledge stacks for source-attributed shared retrieval. Optional peer_aliases:[alias] on a read-only goal analysis dispatches specialist discovery to operator-selected paired peers; never auto-select a peer or use for code changes. Alternatively use auto_peer_pool:[aliases] to choose a healthy recipient within that explicit list using observed task outcomes; this never widens access. Each agent is isolated: give every prompt full, self-contained context. Set live_messaging:true to let LOCAL agents coordinate through a bounded untrusted mailbox and receive file-change notices. Set auto_memory_stack_id to an existing Knowledge 2.0 stack ID for opt-in local semantic recall and successful-report capture; both features refuse remote peers. Limits: at most 6 phases, 6 agents per phase, 16 agents total. To re-run a previously saved workflow, pass only {"saved": "<name>"} (see the "Saved workflows" section of the system prompt) and omit every other field.',
     parameters: {
       type: 'object',
       properties: {
+        tasks: {
+          type: 'array',
+          maxItems: 16,
+          description: 'Explicit DAG with optional three-level, six-child bounded hierarchical delegation. Every child waits for its parent and inherits the normal execution permission boundary.',
+          items: workflowGraphTaskSchema(1),
+        },
+        notebook: {
+          type: 'boolean',
+          description: 'Opt-in versioned per-project swarm notebook. Only operator-approved claims from earlier swarms enter this run as untrusted reference. With strict consensus, reviewer-agreed claims are staged as pending proposals; never auto-approved. Not forwarded to paired peers.',
+        },
+        authenticated_peer_voting: {
+          type: 'boolean',
+          description: 'Opt-in authenticated multi-peer reviewer voting. Requires consensus and two phases (reviewers then verification); every reviewer must have a distinct pinned paired peer, task grant, read-only explore profile, and no placement failover. Certificates and grants are revalidated before accepting any votes. This is model reviewer agreement, NOT distributed Raft/BFT consensus.',
+        },
+        consensus: {
+          type: 'string',
+          enum: ['strict','majority','supermajority','unanimous'],
+          description: 'Optional source-citing reviewer vote policy: strict two votes, majority (>1/2), supermajority (>=2/3), or unanimous. Non-strict goal swarms use five independent reviewers. Any explicit dissent remains disputed. Not Raft/BFT or factual verification.',
+        },
+        stop_on_failure: {
+          type: 'boolean',
+          description: 'Optional for explicit phases: stop before later phases when any agent fails. Always enabled for task dependency graphs and built-in implementation swarms.',
+        },
+        goal: {
+          type: 'string',
+          description: 'Optional user-provided objective for automatic domain-specific multi-agent orchestration. When set, omit preset, saved, name, description and phases.',
+        },
+        topology: {
+          type: 'string',
+          enum: ['phased', 'hierarchical', 'star', 'ring', 'mesh', 'adaptive'],
+          description: 'Read-only local team scheduling and source-labelled report relays. Ring and adaptive relay serially; star and hierarchy elect an initial coordinator; mesh uses independent simultaneous reports reconciled in later phases. Never apply to code agents or remote peer tasks.',
+        },
+        mode: {
+          type: 'string',
+          enum: ['analyze', 'implement'],
+          description: 'Only valid with goal. analyze (default) is read-only. implement may change code and run tests under ordinary permission gates: use ONLY when the user explicitly asks for implementation.',
+        },
+        auto_peer_pool: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 3,
+          description: 'Opt-in adaptive placement for read-only goal analysis only. Choose a pool of 1–3 already paired peer aliases. Before dispatch, ranks granted, non-offline peers by recent observed completion reliability and latency; never discovers or contacts a new peer. Reattaches to existing remote receipts before selecting a peer.',
+        },
+        peer_aliases: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 3,
+          description: 'Optional explicit list of up to three already-paired, task-granted Little Monkey peer aliases. Only with goal + analyze: specialist discovery tasks are assigned across the selected peers; all later verification remains local. Never selects peers automatically.',
+        },
+        live_messaging: {
+          type: 'boolean',
+          description: 'Opt into real-time local agent messages and notifications when another agent edits an exact path this agent read. Only within this workflow, never to remote peers. All messages are untrusted.',
+        },
+        auto_memory_stack_id: {
+          type: 'string',
+          description: 'Opt into durable automatic semantic memory: use an existing Knowledge 2.0 embedding stack ID. Retrieves historical local workflow reports and indexes successful agent reports automatically after completion, scoped by workspace. Never shares with remote peers.',
+        },
+        memory_stack_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 5,
+          description: 'Optional explicit selection of existing, indexed Knowledge 2.0 stack IDs. Retrieves capped source-attributed snippets for all agents. Never silently select private indexes.',
+        },
+        preset: {
+          type: 'string',
+          enum: ['security-red-team', 'security-audit-and-fix', 'frontend-audit', 'backend-resilience', 'performance-budget', 'knowledge-evidence', 'integration-readiness', 'release-assurance'],
+          description: 'Optional built-in agent swarm. security-red-team is read-only and uses 15 specialist agents. security-audit-and-fix can edit code and run tests behind regular permissions; choose it only after an explicit user request to apply fixes. When set, omit name, description, phases and saved.',
+        },
+        scope: {
+          type: 'string',
+          description: 'Optional one-line workspace/module/repository scope for a preset (maximum 300 characters). Only valid with goal or preset.',
+        },
         saved: {
           type: 'string',
           description: 'Name of a previously saved workflow to re-run. When set, omit "name"/"description"/"phases" — the saved spec is used as-is.',
@@ -763,6 +937,20 @@ export const WORKFLOW_TOOL: ToolDef = {
                       type: 'string',
                       enum: ['worktree'],
                       description: "Optional — same meaning as the task tool's isolation: run this (code-class) agent in its own git worktree so parallel agents never collide on files.",
+                    },
+                    peerCandidates: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      maxItems: 3,
+                      description: 'Optional explicitly approved alternative aliases for this read-only peer task. Runtime reconnects to any prior receipt before selecting one healthy task-granted peer.',
+                    },
+                    peerFailover: {
+                      type: 'boolean',
+                      description: 'Optional TRUE only with 2–3 distinct explicitly approved peerCandidates and a read-only explore agent. Allows exactly ONE alternate peer after receiver-confirmed terminal failure of the original durable request. Never retries cancellations, missing network acknowledgements or uncertain delivery.',
+                    },
+                    peer: {
+                      type: 'string',
+                      description: 'Explicit paired peer alias (read-only explore agents only, no worktree). The remote peer applies its own task grants, recipe and permissions. No automatic remote placement.',
                     },
                   },
                   required: ['description', 'prompt', 'profile'],

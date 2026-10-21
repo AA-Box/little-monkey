@@ -644,6 +644,108 @@ fn a_message_from_one_installation_becomes_a_turn_on_the_other() {
 }
 
 #[test]
+fn a_signed_task_owner_can_request_cancellation_but_cannot_cancel_another_peers_job() {
+    let (alice, bob, pairing) = two_nodes(every_grant());
+    let other_pairing = bob.admit_peer(every_grant(), "other-installation");
+    let request = envelope(&alice, "msg-cancellable", PeerMessageKind::TaskRequest, "Read the test repository");
+    let sent = send(&bob, &pairing, &request, NOW + 100);
+    assert_eq!(sent.status, 202);
+    let job_id = job_id_of(&bob, 0);
+    let run_id = "run-cancellable";
+    let mut store = DaemonStore::open(&bob.paths).unwrap();
+    store.insert_preparing(&NewDaemonJob {
+        job_id: job_id.clone(),
+        recipe_snapshot: PathBuf::from("/tmp/peer-task.json"),
+        priority: 0, max_attempts: 1, created_at_ms: NOW + 110,
+        max_runtime_ms: 60_000, max_memory_bytes: None, max_log_bytes: 1_024,
+        repository_policy_json: None, worktree_json: None, parent_run_id: None,
+    }, 64).unwrap();
+    store.mark_queued(&job_id, run_id, NOW + 120).unwrap();
+    drop(store);
+    let mut ledger = RunLedger::open(&bob.paths.ledger_db).unwrap();
+    ledger.submit_run(&run_spec(run_id, NOW + 120)).unwrap();
+    drop(ledger);
+
+    let body = serde_json::json!({"message_id":"msg-cancellable"}).to_string();
+    let endpoint = "/v1/remote/peer/threads/thread-1/cancel";
+    // Authenticated outsiders have peer standing but not *this* task.
+    assert_eq!(call(&bob, &other_pairing, "POST", endpoint, body.as_bytes(), NOW + 130).status, 404);
+    assert_eq!(call(&bob, &pairing, "POST", "/v1/remote/peer/threads/thread-other/cancel",
+        body.as_bytes(), NOW + 140).status, 404);
+    assert_eq!(call(&bob, &pairing, "POST", endpoint,
+        br#"{"message_id":"different-task"}"#, NOW + 150).status, 404);
+    assert!(!DaemonStore::open(&bob.paths).unwrap().get_job(&job_id).unwrap().unwrap().cancel_requested);
+
+    let response = call(&bob, &pairing, "POST", endpoint, body.as_bytes(), NOW + 160);
+    assert_eq!(response.status, 202, "{:?}", json(&response));
+    assert_eq!(json(&response)["status"], "cancellation_requested");
+    assert!(DaemonStore::open(&bob.paths).unwrap().get_job(&job_id).unwrap().unwrap().cancel_requested);
+    let again = call(&bob, &pairing, "POST", endpoint, body.as_bytes(), NOW + 170);
+    assert_eq!(again.status, 200);
+    assert_eq!(json(&again)["status"], "cancellation_already_requested");
+    // Revoking the task grant also removes the power to cancel.
+    bob.set_grants(&pairing.device_id, BTreeSet::from([DeviceCapability::PeerMessage]));
+    assert_eq!(call(&bob, &pairing, "POST", endpoint, body.as_bytes(), NOW + 180).status, 403);
+}
+
+#[test]
+fn two_separate_installations_share_only_operator_authorized_vector_memory() {
+    use super::peer_memory::{self,VectorDocument,LOCAL_AUTHOR};
+    let (alice,mut bob,pairing)=two_nodes(BTreeSet::from([
+        DeviceCapability::PeerMemoryRead,DeviceCapability::PeerMemoryWrite,
+    ]));
+    let path="/v1/remote/peer/memory/project-alpha";
+    let doc=VectorDocument{id:"claim-1".into(),revision:1,
+        model:"embed-local-v1".into(),text:"Evidence from Alice".into(),
+        vector:vec![0.25,0.5,0.75],deleted:false};
+    let body=serde_json::to_vec(&doc).unwrap();
+    // Pairing never implicitly grants any namespace.
+    assert_eq!(call(&bob,&pairing,"GET",path,b"",NOW+50).status,403);
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+60).status,403);
+    {
+        let mut store=DaemonStore::open(&bob.paths).unwrap();
+        peer_memory::grant(&store,&pairing.device_id,"project-alpha",true,true).unwrap();
+        peer_memory::put(&mut store,"project-alpha",LOCAL_AUTHOR,&VectorDocument {
+            id:"bob-claim".into(),revision:1,model:"embed-local-v1".into(),
+            text:"Evidence from Bob".into(),vector:vec![0.3,0.4,0.6],deleted:false,
+        }).unwrap();
+    }
+    assert_eq!(call(&bob,&pairing,"GET","/v1/remote/peer/memory/not-shared",b"",NOW+70).status,403);
+    let written=call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+80);
+    assert_eq!(written.status,201,"{:?}",json(&written));
+    let replay=call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+90);
+    assert_eq!(replay.status,200);
+    let mut corrupted=doc.clone();corrupted.text="changed without revision".into();
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),
+        &serde_json::to_vec(&corrupted).unwrap(),NOW+100).status,409);
+    let mut wrong_model=doc.clone();wrong_model.id="claim-2".into();
+    wrong_model.model="different-embedding-space".into();
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),
+        &serde_json::to_vec(&wrong_model).unwrap(),NOW+110).status,409);
+    let remote_only=call(&bob,&pairing,"GET",path,b"",NOW+120);
+    assert_eq!(remote_only.status,200);
+    let exports=json(&remote_only)["records"].as_array().unwrap().clone();
+    // Bob cannot impersonate Alice as an export author; each author
+    // propagates only its own records to the receiving installation.
+    assert_eq!(exports.len(),1);
+    assert_eq!(exports[0]["id"],"bob-claim");
+    let search=call(&bob,&pairing,"POST",&format!("{path}/search"),
+        br#"{"model":"embed-local-v1","vector":[0.25,0.5,0.75],"top_k":5}"#,NOW+130);
+    assert_eq!(search.status,200,"{:?}",json(&search));
+    assert_eq!(json(&search)["matches"].as_array().unwrap().len(),2);
+    bob.restart();
+    assert_eq!(call(&bob,&pairing,"GET",path,b"",NOW+140).status,200);
+    assert_eq!(peer_memory::list(&DaemonStore::open(&bob.paths).unwrap(),"project-alpha",false)
+        .unwrap().len(),2);
+    // Revoking read leaves write independent and prevents further export.
+    peer_memory::grant(&DaemonStore::open(&bob.paths).unwrap(),
+        &pairing.device_id,"project-alpha",false,true).unwrap();
+    assert_eq!(call(&bob,&pairing,"GET",path,b"",NOW+150).status,403);
+    assert_eq!(call(&bob,&pairing,"POST",&format!("{path}/records"),&body,NOW+160).status,200);
+    let _=alice; // distinct node is deliberately not collapsed into Bob.
+}
+
+#[test]
 fn a_task_request_runs_under_the_receivers_own_authority_and_its_result_correlates_back() {
     let (alice, mut bob, pairing) = two_nodes(every_grant());
 
@@ -1803,4 +1905,238 @@ fn every_layer_agrees_on_what_a_peer_may_hand_over() {
     absurd.message_id = "msg-2".into();
     absurd.artifacts[0].size_bytes = Some(ceiling + 1);
     assert_eq!(send(&bob, &pairing, &absurd, NOW + 120).status, 400);
+}
+
+
+#[test]
+fn signed_pairing_votes_establish_real_two_store_strict_quorum_and_survive_restart() {
+    use super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest,VoteReceipt};
+    let (alice,mut bob,pairing)=two_nodes(
+        BTreeSet::from([DeviceCapability::PeerTaskRequest]));
+    let alice_fingerprint="a".repeat(64);
+    let bob_fingerprint="b".repeat(64);
+    let bob_roster=ClusterRoster{
+        version:1,group:"real-paired-election".into(),members:vec![
+            ClusterMember{fingerprint:bob_fingerprint.clone(),
+                device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:alice_fingerprint.clone(),
+                device_id:pairing.device_id.clone(),alias:Some("alice".into())},
+        ],
+    };
+    let alice_roster=ClusterRoster{
+        version:1,group:bob_roster.group.clone(),members:vec![
+            ClusterMember{fingerprint:alice_fingerprint.clone(),
+                device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:bob_fingerprint.clone(),
+                device_id:"bob-paired-device".into(),alias:Some("bob".into())},
+        ],
+    };
+    let mut alice_store=DaemonStore::open(&alice.paths).unwrap();
+    let mut bob_store=DaemonStore::open(&bob.paths).unwrap();
+    super::swarm_cluster::configure(&mut alice_store,&alice_roster,NOW as i64).unwrap();
+    super::swarm_cluster::configure(&mut bob_store,&bob_roster,NOW as i64).unwrap();
+    assert_eq!(alice_roster.digest(),bob_roster.digest());
+    let election=VoteRequest{group:bob_roster.group.clone(),term:1,
+        candidate_fingerprint:alice_fingerprint.clone(),
+        roster_sha256:alice_roster.digest()};
+    let initial=super::swarm_cluster::vote(
+        &mut alice_store,&election,"@local",NOW as i64).unwrap();
+    let remote=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&election).unwrap(),NOW+2);
+    assert_eq!(remote.status,200,"actual paired signed vote: {:?}",json(&remote));
+    let bob_vote:VoteReceipt=serde_json::from_slice(&remote.body).unwrap();
+    assert_eq!(bob_vote.voter_fingerprint,bob_fingerprint);
+    let until=super::swarm_cluster::persist_quorum(
+        &alice_store,&election,&[initial,bob_vote],NOW as i64).unwrap();
+    assert!(until>NOW as i64+5000);
+    assert!(super::swarm_cluster::may_schedule(
+        &alice_store,&election.group,NOW as i64+10).unwrap());
+    assert!(!super::swarm_cluster::may_schedule(
+        &alice_store,&election.group,until+1).unwrap());
+
+    // The voter lease lives on disk, not in RemoteApi memory. A restarted
+    // peer still rejects a candidate attempting to steal the same term.
+    bob.restart();
+    let mut different=election.clone();
+    different.candidate_fingerprint=bob_fingerprint;
+    let unauthorized=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&different).unwrap(),NOW+5);
+    assert_eq!(unauthorized.status,409);
+
+    let replay=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&election).unwrap(),NOW+8);
+    assert_eq!(replay.status,200);
+    let mut altered=election.clone();
+    altered.roster_sha256="0".repeat(64);
+    let mismatch=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&altered).unwrap(),NOW+10);
+    assert_eq!(mismatch.status,409);
+
+    // Pairing revocation is stronger than any stored election result:
+    // a revoked source may never renew its lease.
+    bob.revoke(&pairing.device_id);
+    let revoked=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&election).unwrap(),NOW+22);
+    assert_ne!(revoked.status,200);
+}
+
+#[test]
+fn election_route_never_grants_non_task_peers_a_voting_capability() {
+    use super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest};
+    let (_alice,bob,pairing)=two_nodes(
+        BTreeSet::from([DeviceCapability::PeerMessage]));
+    let roster=ClusterRoster{version:1,group:"read-only-voting".into(),
+        members:vec![
+            ClusterMember{fingerprint:"b".repeat(64),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:"a".repeat(64),
+                device_id:pairing.device_id.clone(),alias:Some("alice".into())},
+        ]};
+    let mut store=DaemonStore::open(&bob.paths).unwrap();
+    super::swarm_cluster::configure(&mut store,&roster,NOW as i64).unwrap();
+    let req=VoteRequest{group:roster.group.clone(),term:1,
+        candidate_fingerprint:"a".repeat(64),roster_sha256:roster.digest()};
+    let forbidden=call(&bob,&pairing,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&req).unwrap(),NOW+10);
+    assert_eq!(forbidden.status,403);
+}
+
+
+#[test]
+fn signed_three_node_election_uses_majority_when_third_member_is_partitioned() {
+    use super::swarm_cluster::{ClusterMember,ClusterRoster,VoteRequest,VoteReceipt};
+    let alice=Node::start("quorum-alice");
+    let bob=Node::start("quorum-bob");
+    let carol=Node::start("quorum-carol");
+    let grants=BTreeSet::from([DeviceCapability::PeerTaskRequest]);
+    let alice_at_bob=bob.admit_peer(grants.clone(),"quorum-alice");
+    let alice_at_carol=carol.admit_peer(grants,"quorum-alice");
+    let fingerprints=["a".repeat(64),"b".repeat(64),"c".repeat(64)];
+    let group="majority-with-one-offline";
+    let alice_roster=ClusterRoster { version:1,group:group.into(),members:vec![
+        ClusterMember{fingerprint:fingerprints[0].clone(),
+            device_id:"@local".into(),alias:None},
+        ClusterMember{fingerprint:fingerprints[1].clone(),
+            device_id:"paired-bob".into(),alias:Some("bob".into())},
+        ClusterMember{fingerprint:fingerprints[2].clone(),
+            device_id:"paired-carol".into(),alias:Some("carol".into())},
+    ]};
+    let bob_roster=ClusterRoster { version:1,group:group.into(),members:vec![
+        ClusterMember{fingerprint:fingerprints[0].clone(),
+            device_id:alice_at_bob.device_id.clone(),alias:Some("alice".into())},
+        ClusterMember{fingerprint:fingerprints[1].clone(),
+            device_id:"@local".into(),alias:None},
+        ClusterMember{fingerprint:fingerprints[2].clone(),
+            device_id:"paired-carol".into(),alias:Some("carol".into())},
+    ]};
+    let carol_roster=ClusterRoster { version:1,group:group.into(),members:vec![
+        ClusterMember{fingerprint:fingerprints[0].clone(),
+            device_id:alice_at_carol.device_id.clone(),alias:Some("alice".into())},
+        ClusterMember{fingerprint:fingerprints[1].clone(),
+            device_id:"paired-bob".into(),alias:Some("bob".into())},
+        ClusterMember{fingerprint:fingerprints[2].clone(),
+            device_id:"@local".into(),alias:None},
+    ]};
+    let mut stores=[
+        DaemonStore::open(&alice.paths).unwrap(),
+        DaemonStore::open(&bob.paths).unwrap(),
+        DaemonStore::open(&carol.paths).unwrap(),
+    ];
+    for (store,roster) in stores.iter_mut().zip(
+      [&alice_roster,&bob_roster,&carol_roster].iter()) {
+        super::swarm_cluster::configure(store,roster,NOW as i64).unwrap();
+    }
+    let req=VoteRequest{group:group.into(),term:1,
+        candidate_fingerprint:fingerprints[0].clone(),
+        roster_sha256:alice_roster.digest()};
+    let local=super::swarm_cluster::vote(
+        &mut stores[0],&req,"@local",NOW as i64).unwrap();
+    // Bob is reachable, Carol is partitioned. Alice + Bob is a legitimate
+    // strict majority; Carol neither votes nor learns a synthesized vote.
+    let approved=call(&bob,&alice_at_bob,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&req).unwrap(),NOW+100);
+    assert_eq!(approved.status,200);
+    let bob_vote:VoteReceipt=serde_json::from_slice(&approved.body).unwrap();
+    let now=NOW as i64+100;
+    assert!(super::swarm_cluster::persist_quorum(
+        &stores[0],&req,&[local.clone(),bob_vote.clone()],now).is_ok());
+    assert!(super::swarm_cluster::may_schedule(&stores[0],group,now+100).unwrap());
+    // A fabricated vote by unreachable Carol is not constructed or accepted
+    // by the signed HTTP path. One local receipt alone is never a quorum.
+    assert!(super::swarm_cluster::persist_quorum(
+        &stores[2],&req,&[local.clone()],now).is_err());
+    assert!(!super::swarm_cluster::may_schedule(&stores[2],group,now).unwrap());
+    // An explicit revocation before a later election makes Bob unavailable.
+    bob.revoke(&alice_at_bob.device_id);
+    let blocked=call(&bob,&alice_at_bob,"POST","/v1/remote/peer/swarm-election/vote",
+        &serde_json::to_vec(&req).unwrap(),NOW+200);
+    assert_ne!(blocked.status,200);
+}
+
+
+#[test]
+fn signed_replica_endpoint_persists_monotonic_checkpoints_and_never_grants_task_execution(){
+    use super::swarm_cluster::{ClusterMember,ClusterRoster};
+    use super::swarm_replication::{ReplicaNode,ReplicaSnapshot};
+    let (alice,mut bob,pairing)=two_nodes(
+        BTreeSet::from([DeviceCapability::PeerTaskRequest]));
+    let a_fp="a".repeat(64);
+    let b_fp="b".repeat(64);
+    let roster=ClusterRoster{
+        version:1,group:"signed-replica-e2e".into(),members:vec![
+            ClusterMember{fingerprint:b_fp.clone(),device_id:"@local".into(),alias:None},
+            ClusterMember{fingerprint:a_fp.clone(),device_id:pairing.device_id.clone(),
+                alias:Some("alice".into())},
+        ],
+    };
+    {
+        let mut store=DaemonStore::open(&bob.paths).unwrap();
+        super::swarm_cluster::configure(&mut store,&roster,NOW as i64).unwrap();
+    }
+    let mut snapshot=ReplicaSnapshot{
+        version:1,group:roster.group.clone(),graph_id:"review-123".into(),
+        source_fingerprint:a_fp,roster_sha256:roster.digest(),
+        sequence:1,term:1,captured_at_ms:NOW as i64,
+        graph_state:"running".into(),
+        nodes:vec![ReplicaNode{id:"audit".into(),state:"submitted".into(),
+            job_id:Some("job-abc123".into())}],
+        trace_events:vec![],
+        model_usage:vec![],
+        checksum:String::new(),
+    };
+    snapshot.seal().unwrap();
+    let url="/v1/remote/peer/swarm-state/checkpoints";
+    let post=|node:&Node,snap:&ReplicaSnapshot,time:u64|call(
+        node,&pairing,"POST",url,&serde_json::to_vec(snap).unwrap(),time,
+    );
+    let first=post(&bob,&snapshot,NOW+50);
+    assert_eq!(first.status,200,"signed checkpoint: {:?}",json(&first));
+    assert_eq!(json(&first)["changed"],true);
+    assert_eq!(json(&post(&bob,&snapshot,NOW+51))["changed"],false);
+    let mut conflict=snapshot.clone();
+    conflict.nodes[0].state="succeeded".into();
+    conflict.seal().unwrap();
+    assert_eq!(post(&bob,&conflict,NOW+52).status,409);
+    bob.restart();
+    let list=call(&bob,&pairing,"GET",
+        "/v1/remote/peer/swarm-state/signed-replica-e2e/review-123",
+        &[],NOW+54);
+    assert_eq!(list.status,200);
+    assert_eq!(json(&list)["replicas"][0]["sequence"],1);
+    assert_eq!(json(&list)["replicas"][0]["nodes"][0]["state"],"submitted");
+    snapshot.sequence=2;snapshot.nodes[0].state="succeeded".into();
+    snapshot.seal().unwrap();
+    assert_eq!(post(&bob,&snapshot,NOW+55).status,200);
+    assert_eq!(post(&bob,&conflict,NOW+56).status,409);
+    let mut incorrect=snapshot.clone();
+    incorrect.source_fingerprint="c".repeat(64);
+    incorrect.seal().unwrap();
+    assert_eq!(post(&bob,&incorrect,NOW+57).status,409);
+    // A peer whose explicit task grant is removed cannot fetch or publish.
+    bob.set_grants(&pairing.device_id,BTreeSet::from([DeviceCapability::PeerMessage]));
+    assert_ne!(post(&bob,&snapshot,NOW+58).status,200);
+    let denied=call(&bob,&pairing,"GET",
+        "/v1/remote/peer/swarm-state/signed-replica-e2e/review-123",
+        &[],NOW+59);
+    assert_ne!(denied.status,200);
+    drop(alice);
 }

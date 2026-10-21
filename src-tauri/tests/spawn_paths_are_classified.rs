@@ -301,6 +301,15 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "signature and notarization checks of this app's own bundle",
     ),
     (
+        "session_mail.rs",
+        Class::HostUtility,
+        "OS process spawning occurs ONLY in cfg(test) tests: current_exe with fixed \
+         literal cargo-test filter and a disposable SQLite path. Production \
+         mailbox code never launches a child; it only opens profile-local SQLite. \
+         Do not add model-authored subprocess arguments to this module",
+    ),
+
+    (
         "dictation/macos.rs",
         Class::HostUtility,
         "`/usr/bin/tccutil reset Microphone <bundle identifier>`, with the identifier read          from this app's own Tauri config and the other two arguments literal. There is no          argument here a model could reach, and the command can only ever return this app's          own microphone decision to \"not determined\" — it grants nothing, and the          operator still answers the dialog that follows",
@@ -371,6 +380,14 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "launcher.rs",
         Class::HostUtility,
         "re-execs this binary to attach a terminal session",
+    ),
+    (
+        "providers_cli.rs",
+        Class::HostUtility,
+        "interactive OpenRouter PKCE sign-in only: launches the OS browser with a \
+         trusted https://openrouter.ai/auth URL assembled by provider_oauth; \
+         the executable is the fixed macOS 'open' or Linux 'xdg-open' helper, \
+         not a model/user-authored shell command. Does not launch an agent task",
     ),
     (
         "cmds.rs",

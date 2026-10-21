@@ -282,6 +282,149 @@ pub trait ProcessAdapter: Send + Sync {
         paths: &DaemonPaths,
     ) -> Result<Box<dyn ManagedProcess>, String>;
     fn terminate_orphan(&self, process_id: u32) -> Result<(), String>;
+    /// Only an attested original process may be adopted. A test/fake or
+    /// unsupported platform must NEVER pretend a worker survived.
+    fn adopt(
+        &self, _job: &DaemonJob, _paths: &DaemonPaths,
+    ) -> Result<Option<Box<dyn ManagedProcess>>, String> { Ok(None) }
+}
+
+/// PID reuse protection: immutable proc start ticks (Linux boot-relative)
+/// plus durable job/run identity written before the daemon publishes its PID.
+/// The marker is NEVER a credential or an executable instruction.
+#[cfg(target_os="linux")]
+#[derive(serde::Serialize,serde::Deserialize)]
+struct WorkerIdentity {
+    job_id: String,
+    run_id: String,
+    pid: u32,
+    start_ticks: u64,
+    /// Process start ticks reset on reboot. A persistent handoff marker must
+    /// also bind to the OS boot to reject accidental PID/ticks collisions.
+    boot_id: String,
+}
+#[cfg(target_os="linux")]
+fn worker_boot_id()->Result<String,String>{
+    let id=std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+       .map_err(|e|format!("Cannot attest Linux kernel boot identity: {e}"))?;
+    let id=id.trim();
+    if id.len()!=36||!id.bytes().all(|x|x.is_ascii_hexdigit()||x==b'-'){
+        return Err("Invalid kernel boot identity".into());
+    }
+    Ok(id.to_string())
+}
+#[cfg(target_os="linux")]
+fn worker_process_group(pid:u32)->Result<Option<u32>,String>{
+    let raw=match std::fs::read_to_string(format!("/proc/{pid}/stat")){
+        Ok(raw)=>raw,
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(e)=>return Err(format!("Cannot inspect worker process group: {e}")),
+    };
+    let fields=raw.rsplit_once(") ").ok_or("Malformed process group stat")?
+        .1.split_whitespace().collect::<Vec<_>>();
+    if fields.len()<3||matches!(fields[0],"Z"|"X"|"x"){return Ok(None);}
+    fields[2].parse::<u32>().map(Some)
+        .map_err(|_|"Malformed worker process group identity".to_string())
+}
+#[cfg(target_os="linux")]
+pub(super) fn worker_start_ticks(pid:u32)->Result<Option<u64>,String>{
+    let content=match std::fs::read_to_string(format!("/proc/{pid}/stat")){
+        Ok(content)=>content,
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+        Err(error)=>return Err(format!("Could not inspect managed PID: {error}")),
+    };
+    // The comm field is parentheses-delimited and may itself contain spaces.
+    let fields=content.rsplit_once(") ")
+        .ok_or("Invalid /proc PID format")?.1.split_whitespace().collect::<Vec<_>>();
+    if fields.len()<=19{return Err("Incomplete /proc PID start identity".into());}
+    if matches!(fields[0],"Z"|"X"|"x"){return Ok(None);}
+    let ticks=fields[19].parse::<u64>()
+       .map_err(|_|"Invalid /proc PID start ticks".to_string())?;
+    Ok(Some(ticks))
+}
+#[cfg(target_os="linux")]
+fn identity_path(paths:&DaemonPaths,job_id:&str)->std::path::PathBuf{
+    paths.logs.join(format!("{job_id}.handoff.json"))
+}
+#[cfg(target_os="linux")]
+fn store_worker_identity(paths:&DaemonPaths,job:&DaemonJob,pid:u32)->Result<(),String>{
+    let ticks=worker_start_ticks(pid)?.ok_or("Managed child exited before handoff marker")?;
+    if worker_process_group(pid)?!=Some(pid){
+        return Err("Managed worker is not a process-group leader".into());
+    }
+    let identity=WorkerIdentity{job_id:job.job_id.clone(),
+      run_id:job.run_id.clone().ok_or("Missing run id for handoff")?,pid,start_ticks:ticks,
+      boot_id:worker_boot_id()?};
+    let path=identity_path(paths,&job.job_id);
+    let tmp=paths.logs.join(format!("{}.{}.tmp",job.job_id,uuid::Uuid::new_v4()));
+    let result=(||{
+        use std::io::Write;
+        let mut file=std::fs::OpenOptions::new().create_new(true).write(true)
+           .open(&tmp).map_err(|e|e.to_string())?;
+        super::store::restrict_file(&tmp)?;
+        file.write_all(&serde_json::to_vec(&identity).map_err(|e|e.to_string())?)
+          .map_err(|e|e.to_string())?;
+        file.sync_all().map_err(|e|e.to_string())?;
+        std::fs::rename(&tmp,&path).map_err(|e|e.to_string())
+    })();
+    if result.is_err(){let _=std::fs::remove_file(&tmp);}
+    result
+}
+#[cfg(target_os="linux")]
+pub(super) fn attested_worker(paths:&DaemonPaths,job:&DaemonJob)->Result<Option<(u32,u64)>,String>{
+    let pid=match job.process_id{Some(pid)=>pid,None=>return Ok(None)};
+    let path=identity_path(paths,&job.job_id);
+    let meta=match std::fs::symlink_metadata(&path){
+       Ok(meta)=>meta,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+       Err(error)=>return Err(format!("Could not inspect handoff marker: {error}")),
+    };
+    if !meta.is_file()||meta.file_type().is_symlink(){
+        return Err("Refusing non-regular worker identity marker".into());
+    }
+    let bytes=std::fs::read(&path).map_err(|e|e.to_string())?;
+    if bytes.len()>4096{return Err("Oversized worker identity marker".into());}
+    let identity:WorkerIdentity=serde_json::from_slice(&bytes)
+        .map_err(|e|format!("Malformed worker identity marker: {e}"))?;
+    if identity.job_id!=job.job_id||Some(identity.run_id.as_str())!=job.run_id.as_deref()
+      ||identity.pid!=pid {return Err("Worker identity does not match durable job".into());}
+    if identity.boot_id!=worker_boot_id()?{
+        return Err("Worker identity was recorded during a different Linux boot".into());
+    }
+    if worker_process_group(pid)?!=Some(pid){
+        return Err("Attested PID no longer owns its own process group".into());
+    }
+    let current=worker_start_ticks(pid)?;
+    if current==Some(identity.start_ticks){Ok(Some((pid,identity.start_ticks)))}else{Ok(None)}
+}
+/// Reattached POSIX worker is NOT a Child after supervisor restart.
+/// The task itself owns the original provider connection and still publishes
+/// its RunLedger events; the daemon only regains monitoring/signalling.
+#[cfg(target_os="linux")]
+struct AdoptedProcess { pid:u32,start_ticks:u64 }
+#[cfg(target_os="linux")]
+impl ManagedProcess for AdoptedProcess {
+    fn id(&self)->u32{self.pid}
+    fn try_wait(&mut self)->Result<Option<i32>,String>{
+        match worker_start_ticks(self.pid)?{
+            Some(ticks) if ticks==self.start_ticks=>Ok(None),
+            _=>Ok(Some(1)), // Terminal truth comes from the durable run ledger.
+        }
+    }
+    fn signal(&mut self,signal:ProcessSignal)->Result<(),String>{
+        if worker_start_ticks(self.pid)?!=Some(self.start_ticks){
+           return Err("Reattached worker identity changed; refusing to signal reused PID".into());
+        }
+        match signal{
+           ProcessSignal::Pause=>little_monkey_lib::os_signal::suspend_process_group(self.pid),
+           ProcessSignal::Resume=>little_monkey_lib::os_signal::resume_process_group(self.pid),
+           ProcessSignal::Terminate=>terminate_process_group(self.pid),
+           ProcessSignal::Kill=>kill_process_group(self.pid),
+        }
+    }
+    fn memory_bytes(&self)->Result<Option<u64>,String>{
+        if worker_start_ticks(self.pid)?!=Some(self.start_ticks){return Ok(None);}
+        process_memory_bytes(self.pid)
+    }
 }
 
 pub struct RealProcessAdapter {
@@ -349,14 +492,38 @@ impl ProcessAdapter for RealProcessAdapter {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| format!("Failed to launch daemon task child: {error}"))?;
+        // Only opt-in Linux live handoff requires a recoverable birth identity.
+        // Persist BEFORE the scheduler marks the new child as running.
+        #[cfg(target_os="linux")]
+        if std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1"){
+            if let Err(error)=store_worker_identity(paths,job,child.id()){
+                let _=terminate_process_group(child.id());
+                let _=child.wait();
+                return Err(error);
+            }
+        }
         Ok(Box::new(RealManagedProcess { child }))
     }
 
     fn terminate_orphan(&self, process_id: u32) -> Result<(), String> {
         terminate_process_group(process_id)
+    }
+    fn adopt(&self,job:&DaemonJob,paths:&DaemonPaths)
+        ->Result<Option<Box<dyn ManagedProcess>>,String>{
+        #[cfg(target_os="linux")]
+        {
+            if let Some((pid,ticks))=attested_worker(paths,job)?{
+                // Reuse only the birth identity that matched the marker;
+                // never adopt a PID using a second, potentially reused birth.
+                return Ok(Some(Box::new(AdoptedProcess{pid,start_ticks:ticks})));
+            }
+        }
+        #[cfg(not(target_os="linux"))]
+        let _=(job,paths);
+        Ok(None)
     }
 }
 
@@ -901,6 +1068,9 @@ pub struct DaemonEngine<P, N, C> {
     notifier: N,
     clock: C,
     owner_id: String,
+    /// Only the isolated Linux service installed with KillMode=process may
+    /// leave its executing task workers alive across a daemon replacement.
+    live_handoff: bool,
     active: HashMap<String, ActiveProcess>,
     last_retention_ms: u64,
     /// Jobs whose durable latch asked for `kill` rather than `stop`, so the
@@ -951,6 +1121,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             notifier,
             clock,
             owner_id,
+            live_handoff: false,
             active: HashMap::new(),
             last_retention_ms: 0,
             immediate_termination: std::collections::HashSet::new(),
@@ -959,6 +1130,15 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             profile_limits: ProfileLimits::unbounded(),
             preempted: HashMap::new(),
         }
+    }
+
+    /// Enable only for the selfdev-owned Linux systemd service whose unit
+    /// independently guarantees that terminating the daemon never terminates
+    /// the provider worker's process group.
+    #[must_use]
+    pub fn with_live_handoff(mut self,enabled:bool)->Self{
+        self.live_handoff=enabled && cfg!(target_os="linux");
+        self
     }
 
     /// Holds this daemon to the active profile's quota and machine share.
@@ -1161,20 +1341,52 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
     pub fn recover(&mut self) -> Result<(), String> {
         let now = self.clock.now_ms();
         for job in self.store.active_jobs()? {
+            #[cfg(target_os="linux")]
+            if self.live_handoff {
+                // This is the SAME child that owns the provider socket. Its
+                // RunLedger events have been durable the whole time. Never
+                // re-invoke the model, shell tools, or recipe on adoption.
+                if let Some(process)=self.process_adapter.adopt(&job,&self.paths)?{
+                    let run_id=job.run_id.as_deref()
+                        .ok_or("Attested running worker has no run ID")?;
+                    let lease=self.shared.take_over_attested_worker_lease(
+                        run_id,&self.owner_id,now,self.config.lease_duration_ms)?;
+                    self.active.insert(job.job_id.clone(),ActiveProcess{process,lease});
+                    continue;
+                }
+                if let Some(pid)=job.process_id {
+                    // A PID may have been reused after the original worker
+                    // exited. Never blindly signal a PID that does not match
+                    // our recorded birth identity. If it is occupied, fail
+                    // closed for operator reconciliation instead of killing
+                    // an unrelated process or replaying a non-idempotent tool.
+                    if worker_start_ticks(pid)?.is_some(){
+                        return Err(format!(
+                           "Cannot reattach live worker '{}': PID {} is occupied without valid matching worker identity",
+                           job.job_id,pid));
+                    }
+                }
+                self.reconcile_interrupted(&job,now,
+                    "original attested worker exited before daemon reattachment")?;
+                continue;
+            }
             if let Some(process_id) = job.process_id {
-                // A service crash can leave the task child detached. Stop the
-                // whole process group before deciding from durable events;
-                // never run a second copy alongside an orphan.
+                // Old behavior is retained for legacy, dead or unprovable
+                // workers: do not re-execute uncertain external mutations.
                 let _ = self.process_adapter.terminate_orphan(process_id);
             }
             self.reconcile_interrupted(&job, now, "daemon restarted while the run was active")?;
         }
-        // Reservations belong to processes that no longer exist. The loop above
-        // already moved every active job out of an active state, so this is the
-        // belt to that braces: any row still carrying a claim after it is one
-        // nothing released, and holding it would shrink the budget of a daemon
-        // that has nothing running at all.
-        self.store.sweep_stale_reservations()?;
+        // Adopted live workers still hold their original reservations; only
+        // the legacy/crashed jobs above were moved out of an active state.
+        // Never sweep live claims when a verified worker survived.
+        if self.active.is_empty(){self.store.sweep_stale_reservations()?;}
+        // Prove new-daemon ownership of existing provider workers, not merely
+        // the existence of a surviving PID or an unchanged SQLite row.
+        self.store.set_meta("last_live_handoff_adopted_count",
+            &self.active.len().to_string())?;
+        self.store.set_meta("last_live_handoff_daemon_pid",
+            &std::process::id().to_string())?;
         self.store.set_meta("last_recovery_ms", &now.to_string())?;
         Ok(())
     }
@@ -1281,6 +1493,13 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
     /// one; and admissions walk the ranking in order, holding rather than
     /// stopping at whatever does not fit.
     fn schedule(&mut self, now: u64) -> Result<(), String> {
+        // A cold self-development service swap must never kill an in-flight
+        // model turn or replay its non-idempotent tools. Drain leaves ACTIVE
+        // tasks running and all queued snapshots durable, admitting no new
+        // jobs until an operator explicitly clears the flag after restart.
+        if self.store.get_meta("maintenance_drain")?.as_deref()==Some("1"){
+            return Ok(());
+        }
         // The candidate window is the whole queue, not the free-slot count.
         //
         // This is the starvation bug the `// ponytail:` comment that used to live
@@ -3302,6 +3521,113 @@ pub(super) mod tests {
             signals: Arc::new(Mutex::new(Vec::new())),
             memory: Arc::new(Mutex::new(Some(1024))),
         }
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn real_os_worker_is_reattached_with_same_pid_and_live_lease_after_daemon_replacement(){
+        use std::os::unix::process::CommandExt;
+        let (paths,mut store,mut shared,recorder,run_id)=fixture("actual-handoff");
+        let mut child=Command::new("sleep").arg("30").process_group(0)
+            .spawn().expect("spawn independent real worker process group");
+        let pid=child.id();
+        let mut cleanup=||{let _=child.kill();let _=child.wait();};
+        let result=(||->Result<(),String>{
+            recorder.emit(RunEvent::Started{engine_id:"original-stream".into()})
+                .map_err(|e|e.to_string())?;
+            recorder.emit(RunEvent::ModelDelta{
+                message_id:"original-model-message".into(),
+                channel:little_monkey_lib::run_protocol::OutputChannel::Assistant,
+                text:"first provider fragment".into(),
+            }).map_err(|e|e.to_string())?;
+            store.transition("job-actual-handoff",JobState::Running,2_000,Some(pid),None)?;
+            let job=store.get_job("job-actual-handoff")?
+                .ok_or("missing running fixture")?;
+            store_worker_identity(&paths,&job,pid)?;
+            let old=shared.acquire_lease(&run_id,"daemon-4294967295-prior",
+                2_000,30_000)?.ok_or("missing old lease")?;
+            assert_eq!(old.generation,1);
+            let mut engine=DaemonEngine::new(store,shared,paths.clone(),
+                DaemonConfig::default(),
+                RealProcessAdapter{executable:std::path::PathBuf::from("/bin/sleep")},
+                FakeNotifier::default(),FakeClock(Arc::new(Mutex::new(3_000))),
+                "daemon-100-new".into()).with_live_handoff(true);
+            engine.recover()?;
+            assert_eq!(engine.active_count(),1,
+                "new daemon must adopt original worker, not reconcile or spawn");
+            let adopted=engine.active.get_mut("job-actual-handoff")
+                .expect("durably reattached running job");
+            assert_eq!(adopted.process.id(),pid);
+            assert_eq!(adopted.process.try_wait()?,None);
+            assert_eq!(adopted.lease.owner_id,"daemon-100-new");
+            assert_eq!(adopted.lease.generation,2);
+            assert!(engine.shared.heartbeat_lease(&adopted.lease,3_000,30_000)?);
+            // The ORIGINAL recorder (analogous to the already-running model
+            // request held inside the detached CLI child) keeps appending to
+            // the SAME ledger after the daemon owner has been replaced.
+            recorder.emit(RunEvent::ModelDelta{
+                message_id:"original-model-message".into(),
+                channel:little_monkey_lib::run_protocol::OutputChannel::Assistant,
+                text:"next provider fragment".into(),
+            }).map_err(|e|e.to_string())?;
+            let events=engine.shared.events(&run_id,0,100)?;
+            let deltas=events.iter().filter_map(|e|match &e.event{
+                RunEvent::ModelDelta{text,..}=>Some(text.as_str()),
+                _=>None,
+            }).collect::<Vec<_>>();
+            assert_eq!(deltas,vec!["first provider fragment","next provider fragment"],
+               "the original event cursor must continue across supervisor restart");
+            assert_eq!(events.iter().filter(|e|matches!(e.event,RunEvent::Started{..})).count(),1,
+               "recovery must not duplicate a Started event or replay the model");
+            assert_eq!(engine.store.get_job("job-actual-handoff")?
+                .ok_or("missing adopted job")?.state,JobState::Running);
+            let mut tampered=job.clone();
+            tampered.process_id=Some(pid.saturating_add(1));
+            assert!(attested_worker(&paths,&tampered).is_err(),
+                "a different PID cannot steal the provider worker identity");
+            let marker=identity_path(&paths,&job.job_id);
+            let original=std::fs::read(&marker).map_err(|e|e.to_string())?;
+            let mut value:WorkerIdentity=serde_json::from_slice(&original)
+                .map_err(|e|e.to_string())?;
+            value.boot_id="00000000-0000-0000-0000-000000000000".to_string();
+            std::fs::write(&marker,serde_json::to_vec(&value)
+                .map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+            assert!(attested_worker(&paths,&job).is_err(),
+                "a stale marker from an earlier kernel boot cannot adopt a reused PID");
+            std::fs::write(&marker,&original).map_err(|e|e.to_string())?;
+            assert!(attested_worker(&paths,&job)?.is_some(),
+                "original process must remain reattachable after restoring identity");
+            Ok(())
+        })();
+        cleanup();
+        let _=std::fs::remove_dir_all(&paths.root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn maintenance_drain_preserves_durable_queue_and_resumes_after_release(){
+        let (paths,mut store,shared,_recorder,_run_id)=fixture("safe-drain");
+        store.set_meta("maintenance_drain","1").unwrap();
+        let adapter=fake_adapter();
+        let count=adapter.spawns.clone();
+        let mut engine=DaemonEngine::new(
+            store,shared,paths.clone(),DaemonConfig::default(),
+            adapter,FakeNotifier::default(),
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-drain-test-owner".into()
+        );
+        engine.tick().unwrap();
+        assert_eq!(*count.lock().unwrap(),0);
+        let job=engine.store.get_job("job-safe-drain").unwrap().unwrap();
+        assert_eq!(job.state,JobState::Queued);
+        assert_eq!(engine.store.get_meta("maintenance_drain").unwrap().as_deref(),Some("1"));
+        engine.store.set_meta("maintenance_drain","0").unwrap();
+        engine.tick().unwrap();
+        assert_eq!(*count.lock().unwrap(),1);
+        let job=engine.store.get_job("job-safe-drain").unwrap().unwrap();
+        assert_eq!(job.state,JobState::Running);
+        drop(engine);
+        let _=std::fs::remove_dir_all(paths.root);
     }
 
     #[test]

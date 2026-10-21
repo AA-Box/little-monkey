@@ -22,7 +22,9 @@ import {
 import { primaryRoot, useWorkspaceStore } from "./workspaceStore";
 import { usePromptStore } from "./promptStore";
 import type { UsageInfo } from "./usageStore";
+import type { WorkflowSpec } from "../lib/workflow";
 import { errorMessage } from "../lib/errors";
+import { fireObservedHooks } from "../lib/userHooks";
 
 /** localStorage key sessions were persisted under BEFORE file-based
  * persistence existed — only read (once, then removed) to migrate old data.
@@ -182,6 +184,8 @@ export interface SubagentRunMeta {
   finishedAt: number;
   toolCallCount: number;
   usage?: UsageInfo;
+  /** Initial model-routing explanation captured at dispatch, never billed usage. */
+  routing?: { targetLabel: string; targetKey?: string; reason: string; policyName: string | null };
   /** Set when this run executed in an isolated git worktree that STILL
    * EXISTS (an unchanged worktree is removed at finish and records nothing)
    * — what the SubagentRow footer's Apply/Discard actions operate on.
@@ -221,14 +225,28 @@ export interface WorkflowAgentResult {
 export interface WorkflowRunMeta {
   name: string;
   description: string;
-  status: "done" | "error" | "cancelled";
+  status: "running" | "done" | "error" | "cancelled";
   startedAt: number;
   finishedAt: number;
   phases: { title: string; agents: { taskId: string; description: string }[] }[];
+  /** Explicitly recoverable spec, including selected peer placement.
+   * Persisted to permit user-approved resume after a crash. Never execute
+   * automatically on load, especially for write-capable agents. */
+  spec?: WorkflowSpec;
+  /** Rust run-ledger id of the parent execution, not the workflow tool-call id.
+   * Required for native skill-learning capture/evaluation eligibility. */
+  sourceRunId?: string;
   /** Per-agent journal (workflow v2) — written once, in the same terminal
    * snapshot as the rest of this meta, so any terminal-with-failures run is
    * resumable. Absent on runs persisted before v2. */
   agentResults?: Record<string, WorkflowAgentResult>;
+  /** Initial workflow call id of a resumed chain. Preserving this across
+   * successive resumes lets remote workers reconnect to their original
+   * peer-task receipt instead of accidentally dispatching duplicate work. */
+  correlationOrigin?: string;
+  /** Crash-consistent local mailbox. Recovery is only by explicit workflow
+   * resume and never grants tool access by itself. */
+  liveMailbox?: import('../lib/swarmLiveBus').LiveSwarmSnapshot;
 }
 
 export interface MessageTranslation {
@@ -1067,6 +1085,18 @@ function normalizeSubagentRunMeta(raw: unknown): Record<string, SubagentRunMeta>
       finishedAt: candidate.finishedAt as number,
       toolCallCount: Number.isFinite(candidate.toolCallCount) ? (candidate.toolCallCount as number) : 0,
       usage,
+      ...(candidate.routing && typeof candidate.routing === "object" &&
+        typeof candidate.routing.targetLabel === "string" && candidate.routing.targetLabel.length <= 180 &&
+        typeof candidate.routing.reason === "string" && candidate.routing.reason.length <= 500 &&
+        (candidate.routing.policyName === null ||
+         (typeof candidate.routing.policyName === "string" && candidate.routing.policyName.length <= 120))
+          ? { routing: { targetLabel: candidate.routing.targetLabel, reason: candidate.routing.reason,
+              policyName: candidate.routing.policyName,
+              ...(typeof candidate.routing.targetKey === "string" &&
+                candidate.routing.targetKey.length <= 180 &&
+                /^(local|ollama|provider):[^\x00-\x1f]{1,175}$/.test(candidate.routing.targetKey)
+                ? { targetKey: candidate.routing.targetKey } : {}) } }
+          : {}),
       ...(candidate.worktree &&
       typeof candidate.worktree === "object" &&
       typeof (candidate.worktree as SubagentWorktreeInfo).path === "string" &&
@@ -1364,6 +1394,58 @@ function normalizeGroup(raw: unknown, interruptRunning: boolean): SessionGroup |
   return group;
 }
 
+/** Validate workflow checkpoints received from persisted sessions, never
+ * trusting arbitrary JSON to grant tools. A running snapshot becomes an
+ * interrupted error on restart; recovery is always an explicit action. */
+export function normalizeWorkflowRunMeta(value: unknown, interruptRunning = true): Record<string, WorkflowRunMeta> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result: Record<string, WorkflowRunMeta> = {};
+  for (const [runId, raw] of Object.entries(value as Record<string, unknown>).slice(0, 100)) {
+    if (!runId || runId.length > 200 || !raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const record = raw as Partial<WorkflowRunMeta>;
+    if (typeof record.name !== "string" || !record.name.trim() || typeof record.description !== "string") continue;
+    if (!["running", "done", "error", "cancelled"].includes(record.status ?? "")) continue;
+    if (!Number.isFinite(record.startedAt) || !Number.isFinite(record.finishedAt) || !Array.isArray(record.phases)) continue;
+    if (!record.phases.every(phase => phase && typeof phase.title === "string" &&
+      Array.isArray(phase.agents) && phase.agents.every(agent =>
+        agent && typeof agent.taskId === "string" && typeof agent.description === "string"))) continue;
+    const agentResults: Record<string, WorkflowAgentResult> = {};
+    if (record.agentResults && typeof record.agentResults === "object") {
+      for (const [id, candidate] of Object.entries(record.agentResults).slice(0, 16)) {
+        if (!candidate || typeof candidate !== "object") continue;
+        const item = candidate as WorkflowAgentResult;
+        if (!/^[0-9a-f]{8}$/.test(item.promptHash) ||
+            !["done", "error", "cancelled"].includes(item.status) ||
+            typeof item.report !== "string" || item.report.length > 8_000) continue;
+        agentResults[id] = { promptHash: item.promptHash, status: item.status, report: item.report,
+          ...(item.reused ? { reused: true } : {}) };
+      }
+    }
+    // Specs containing code/peer agents are revalidated at actual dispatch;
+    // hydration must never cause execution or grant access by itself.
+    const spec = record.spec && typeof record.spec === "object" &&
+      Array.isArray(record.spec.phases) && record.spec.phases.length > 0 &&
+      record.spec.phases.length <= 6 ? record.spec : undefined;
+    result[runId] = {
+      name: record.name, description: record.description,
+      status: interruptRunning && record.status === "running" ? "error" : record.status!,
+      startedAt: record.startedAt!, finishedAt: record.finishedAt!,
+      phases: record.phases,
+      agentResults,
+      ...(spec ? { spec } : {}),
+      ...(typeof record.sourceRunId === "string" && record.sourceRunId.length <= 200
+        ? { sourceRunId: record.sourceRunId } : {}),
+      ...(typeof record.correlationOrigin === "string" && record.correlationOrigin.length <= 200
+        ? { correlationOrigin: record.correlationOrigin } : {}),
+      ...(record.liveMailbox && typeof record.liveMailbox === "object" &&
+        !Array.isArray(record.liveMailbox) &&
+        JSON.stringify(record.liveMailbox).length <= 900_000
+        ? { liveMailbox: record.liveMailbox } : {}),
+    };
+  }
+  return result;
+}
+
 function normalizeSession(raw: Partial<ChatSession>, interruptRunning: boolean): ChatSession {
   const parsedMessages = Array.isArray(raw.messages)
     ? raw.messages.map(normalizeMessage).filter((message): message is ChatMessage => message !== null)
@@ -1390,6 +1472,7 @@ function normalizeSession(raw: Partial<ChatSession>, interruptRunning: boolean):
     docChatMode: raw.docChatMode === true,
     subagentRuns: normalizeSubagentRuns(raw.subagentRuns),
     subagentRunMeta: normalizeSubagentRunMeta(raw.subagentRunMeta),
+    workflowRunMeta: normalizeWorkflowRunMeta(raw.workflowRunMeta, interruptRunning),
     messageTranslations: normalizeMessageTranslations(raw.messageTranslations),
     threadTranslations: normalizeThreadTranslations(raw.threadTranslations),
     displayTranslationLocale: normalizeLocale(raw.displayTranslationLocale),
@@ -1446,25 +1529,44 @@ function parsePersisted(raw: string | null, interruptRunning: boolean): Persiste
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingPayload: string | null = null;
+// File saves must be FIFO: a slow earlier write must never overwrite a
+// completed workflow checkpoint written later. Awaitable barriers share this
+// queue with the ordinary debounced chat saves.
+let persistenceQueue: Promise<void> = Promise.resolve();
 
-function flushPersist(): void {
+function flushPersist(): Promise<void> {
   if (persistTimer !== null) {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
   const payload = pendingPayload;
   pendingPayload = null;
-  if (payload === null) return;
+  if (payload === null) return persistenceQueue;
 
-  invoke("sessions_save", { payload })
-    .then(() => {
+  const next = persistenceQueue.catch(() => undefined).then(async () => {
+    try {
+      await invoke("sessions_save", { payload });
       if (useSessionStore.getState().persistError !== null) {
         useSessionStore.setState({ persistError: null });
       }
-    })
-    .catch((err: unknown) => {
+    } catch (err) {
       useSessionStore.setState({ persistError: errorMessage(err) });
-    });
+      throw err;
+    }
+  });
+  persistenceQueue = next;
+  // Ordinary debounced callers cannot await a timer callback; errors still
+  // surface in persistError. Explicit workflow barriers await the same promise.
+  void next.catch(() => undefined);
+  return next;
+}
+
+/** Durability barrier for workflow checkpoints. Flushes all earlier queued
+ * session saves and the latest snapshot before a dependent agent may start.
+ * Browser-only tests have no filesystem and retain in-memory behavior. */
+export async function flushSessionPersistence(): Promise<void> {
+  if (!isTauri()) return;
+  await flushPersist();
 }
 
 function persist(
@@ -1484,7 +1586,7 @@ function persist(
     return;
   }
   if (persistTimer === null) {
-    persistTimer = setTimeout(flushPersist, PERSIST_DEBOUNCE_MS);
+    persistTimer = setTimeout(() => { void flushPersist(); }, PERSIST_DEBOUNCE_MS);
   }
 }
 
@@ -1492,7 +1594,7 @@ function persist(
 // mid-debounce. The IPC message is posted synchronously even though its
 // completion can't be awaited here.
 if (typeof window !== "undefined") {
-  window.addEventListener("beforeunload", flushPersist);
+  window.addEventListener("beforeunload", () => { void flushPersist(); });
 }
 
 /**
@@ -1888,6 +1990,10 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   },
 
   deleteSession: (id) => {
+    // A real user action ends this session. Observe it once, outside Zustand's
+    // pure state updater, and never run shell hooks from model-authored text.
+    if(get().sessions.some(session=>session.id===id))
+      fireObservedHooks('SessionEnd',{session_id:id});
     set((state) => {
       const deleted = state.sessions.find((s) => s.id === id);
       let remaining = state.sessions.filter((s) => s.id !== id);

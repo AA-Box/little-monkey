@@ -980,7 +980,6 @@ impl LoopbackListener {
     /// Binds to an OS-assigned ephemeral port on `127.0.0.1` specifically
     /// (never `0.0.0.0`/`::`) — this listener must only ever be reachable
     /// from the same machine's browser, not the network.
-    #[cfg(test)]
     pub async fn bind() -> Result<Self, String> {
         Self::bind_with_redirect_host("127.0.0.1").await
     }

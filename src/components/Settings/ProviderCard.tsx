@@ -1,4 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { errorMessage as formatError } from "../../lib/errors";
 import { Button, ModelListRow, StatusPill } from "../ui";
 import { providerIsConnected, useModelStore, type ProviderConfig, type ProviderModelInfo } from "../../store/modelStore";
 import { isVisionCapableProviderModel } from "../../lib/visionModels";
@@ -37,6 +39,7 @@ export function ProviderCard({ provider }: ProviderCardProps) {
   const activeProviderId = useModelStore((s) => s.activeProviderId);
   const activeProviderModel = useModelStore((s) => s.activeProviderModel);
   const setProviderKey = useModelStore((s) => s.setProviderKey);
+  const refreshProviders = useModelStore((s) => s.refreshProviders);
   const removeProviderKey = useModelStore((s) => s.removeProviderKey);
   const refreshProviderModels = useModelStore((s) => s.refreshProviderModels);
   const removeCustomProvider = useModelStore((s) => s.removeCustomProvider);
@@ -53,6 +56,9 @@ export function ProviderCard({ provider }: ProviderCardProps) {
   const { t } = useT();
 
   const [apiKey, setApiKey] = useState("");
+  const [oauthBusy, setOauthBusy] = useState(false);
+  const [oauthError, setOauthError] = useState<string | null>(null);
+  const [oauthConnected, setOauthConnected] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState("");
@@ -72,6 +78,23 @@ export function ProviderCard({ provider }: ProviderCardProps) {
       setSaving(false);
     }
   }, [apiKey, saving, provider.id, setProviderKey]);
+
+  const handleOpenRouterLogin = useCallback(async () => {
+    if (oauthBusy) return;
+    setOauthBusy(true);
+    setOauthError(null);
+    setOauthConnected(false);
+    try {
+      await invoke("providers_openrouter_login");
+      await refreshProviders();
+      await refreshProviderModels("openrouter");
+      setOauthConnected(true);
+    } catch (cause) {
+      setOauthError(formatError(cause));
+    } finally {
+      setOauthBusy(false);
+    }
+  }, [oauthBusy, refreshProviders, refreshProviderModels]);
 
   const handleRemoveKey = useCallback(async () => {
     if (!window.confirm(t("ProviderCard.confirmRemoveKey", { label: provider.label }))) return;
@@ -176,6 +199,17 @@ export function ProviderCard({ provider }: ProviderCardProps) {
         </div>
       )}
 
+      {provider.id === "openrouter" && (
+        <div className="flex flex-col gap-1">
+          <Button variant="secondary" size="sm" disabled={oauthBusy}
+            onClick={() => void handleOpenRouterLogin()}>
+            {oauthBusy ? "Complete login in your browser…" : provider.has_key ? "Sign in with another OpenRouter account" : "Sign in with OpenRouter"}
+          </Button>
+          <p className="text-xs text-muted">Official OpenRouter OAuth PKCE. Creates a user-controlled API key in your OS keychain. OpenRouter model usage is billed by OpenRouter; this does not use another provider subscription.</p>
+          {oauthError && <p role="alert" className="text-xs text-danger">{oauthError}</p>}
+          {oauthConnected && <p role="status" className="text-xs text-success">OpenRouter connected.</p>}
+        </div>
+      )}
       {errorMessage && <p className="text-xs text-danger">{errorMessage}</p>}
 
       {providerIsConnected(provider) && providerModels.length > 0 && (

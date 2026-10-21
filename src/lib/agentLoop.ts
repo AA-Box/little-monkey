@@ -27,7 +27,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools, toolsForWorkspace } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, SESSION_PEERS_TOOL, SESSION_SEND_TOOL, SESSION_BROADCAST_TOOL, buildTools, toolsForWorkspace } from './tools';
 import {
   candidateNotice,
   finalizeLearningForRun,
@@ -76,16 +76,18 @@ import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
 import { composeCustomAgentCatalog } from './customAgents';
 import { selectCustomAgentList, useCustomAgentStore } from '../store/customAgentStore';
-import { collectUserPromptSubmitContext } from './userHooks';
+import { collectUserPromptSubmitContext,fireObservedHooks } from './userHooks';
 import { protectKnowledgeNoticeForModel, protectToolResult } from './untrustedContent';
 import { isBtwNotice } from './slashCommands';
 import { sessionMessages, useSessionStore } from '../store/sessionStore';
+import { syncSessionMailbox, syncSessionMailboxAtSafePoint } from './sessionCollaboration';
 import { effortForTarget, useModelStore } from '../store/modelStore';
 import { useUsageStore } from '../store/usageStore';
 import { useUsageHistoryStore } from '../store/usageHistoryStore';
 import { useTurnStatusStore } from '../store/turnStatusStore';
 import { useSettingsStore } from '../store/settingsStore';
 import { useRulesStore } from '../store/rulesStore';
+import { captureConversationMemory } from './conversationAutoMemory';
 import { useCheckpointStore } from '../store/checkpointStore';
 import { usePermissionStore, type PermissionMode } from '../store/permissionStore';
 import { useStackStore, type StackQueryResult } from '../store/stackStore';
@@ -668,6 +670,7 @@ export function toolsForSettings(
   skillSearchToolEnabled = false,
   desktopControlEnabled = false,
   deviceActionAvailable = false,
+  sessionCollaborationEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
@@ -683,6 +686,7 @@ export function toolsForSettings(
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
     ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
     ...(skillSearchToolEnabled ? [SEARCH_SKILLS_TOOL] : []),
+    ...(sessionCollaborationEnabled ? [SESSION_PEERS_TOOL, SESSION_SEND_TOOL, SESSION_BROADCAST_TOOL] : []),
   ];
 }
 
@@ -1729,6 +1733,10 @@ export async function runAgentTurn(
   }
   turnControllers.set(sessionId, controller);
   registerDurableController(turnId, controller, sessionId);
+  // Resume persisted local peer notices BEFORE this turn begins streaming.
+  // A failed read does not discard durable SQLite messages or block chat.
+  try { await syncSessionMailbox(sessionId); }
+  catch (error) { console.warn('Local peer mail remains pending:', error); }
   useSessionStore.getState().markTurnRunning(sessionId, true);
   useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
@@ -1868,6 +1876,73 @@ export async function runAgentTurn(
     }
     useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
+    // Stop is an observe-only hook on an ACTUAL turn terminal boundary.
+    // A shell hook cannot overturn the daemon's signed terminal decision or
+    // silently restart model work. One event per accepted turn, including
+    // cancellation, with bounded metadata rather than prompt/transcript.
+    fireObservedHooks('Stop',{session_id:sessionId,
+      args:{turn_id:turnId,outcome:controller.signal.aborted?'cancelled':turnError?'error':'done'}});
+    // A normal completed conversation (including daemon-backed chats) is
+    // eligible for memory capture ONLY after explicit operator opt-in.
+    // Extraction sees only the actual user message, not arbitrary model or
+    // connector output, and writes through Rust's guarded fact store.
+    if (!controller.signal.aborted && !turnError && resume === null &&
+        useSettingsStore.getState().memoryEnabled &&
+        useSettingsStore.getState().autoMemoryEnabled &&
+        typeof userText === 'string' && userText.trim()) {
+      try {
+        await useRulesStore.getState().refresh();
+        const target = await resolveTarget();
+        const workspace = useSessionStore.getState().sessions.find(entry => entry.id === sessionId)?.workspacePath ?? null;
+        const active = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? null;
+        if (workspace === active) {
+          const result = await captureConversationMemory({
+            userText, turnId, expectedWorkspace: workspace,
+            facts: useRulesStore.getState().facts,
+            callModel: async (messages) => {
+              const reflectionController = new AbortController();
+              const timeout = setTimeout(() => reflectionController.abort(), 60_000);
+              try {
+                let permittedMessages = messages;
+                if (target.kind === 'provider') {
+                  assertCostBudgetAllowsRequest(useCostControlStore.getState());
+                  const privacyOutcome = await gatePrivacyWireMessages(
+                    messages,
+                    (content) => usePrivacyFirewallStore.getState().gateOutbound(
+                      content, 'cloud_model', workspace ?? 'global',
+                    ),
+                    new Map(),
+                  );
+                  if (privacyOutcome.action !== 'send')
+                    throw new Error('Automatic memory extraction blocked by privacy policy.');
+                  permittedMessages = privacyOutcome.messages;
+                  recordRequest(target.providerId);
+                }
+                const reflection = await attemptStream(
+                  target, permittedMessages, [], reflectionController.signal, effortForTarget(target),
+                  sessionId, undefined, false,
+                );
+                if (reflection.usage)
+                  useUsageHistoryStore.getState().recordUsage(describeUsageTarget(target), reflection.usage);
+                if (reflectionController.signal.aborted || reflection.streamError !== null || reflection.toolCalls.length)
+                  throw new Error(reflection.streamError || 'Automatic memory reflection timed out or returned unexpected tools');
+                return reflection.content;
+              } finally {
+                clearTimeout(timeout);
+              }
+            },
+          });
+          if (result.added || result.corrected || result.merged)
+            await useRulesStore.getState().refresh();
+          if (result.warnings.length)
+            console.warn('Automatic memory capture warnings:', result.warnings);
+        }
+      } catch (error) {
+        // No memory failure can convert an already completed conversation
+        // into a failed turn or trigger a retry of tools or mutations.
+        console.warn('Automatic memory capture failed:', error);
+      }
+    }
     if (processId) {
       const outcome = exitStatusFor({
         aborted: controller.signal.aborted,
@@ -3063,6 +3138,7 @@ async function runAgentTurnBody(
       skillSearchToolEnabled,
       settings.desktopControlEnabled,
       deviceActionAvailable(),
+      settings.sessionCollaborationEnabled && mode !== 'plan',
     ),
     hasWorkspace,
   );
@@ -3250,6 +3326,14 @@ async function runAgentTurnBody(
     // round trips, where there's no stream to abort) — don't start another.
     if (signal?.aborted) return;
 
+    // No stream or partial tool call is in flight at this boundary. Replaying
+    // SQLite mail here makes the next model attempt see peer notices during
+    // the CURRENT execution, not only after the whole turn ends.
+    if (settings.sessionCollaborationEnabled) {
+      try { await syncSessionMailboxAtSafePoint(sessionId); }
+      catch(error) { console.warn('Live peer mail remains durable and pending:',error); }
+    }
+
     if (settings.contextTrimEnabled) {
       const current = sessionMessages(sessionId);
       if (shouldTrim(current, useUsageStore.getState().contextLimit, settings.contextTrimThreshold)) {
@@ -3295,6 +3379,8 @@ async function runAgentTurnBody(
       if (!toolsForTurn.some((tool) => tool.function.name === toolName)) return false;
       const currentSettings = useSettingsStore.getState();
       if (toolName === 'remember' && !currentSettings.memoryEnabled) return false;
+      if ((toolName === 'session_send_message' || toolName === 'session_list_peers' || toolName === 'session_broadcast_message')
+          && (!currentSettings.sessionCollaborationEnabled || usePermissionStore.getState().mode === 'plan')) return false;
       if (WEB_TOOL_NAMES.has(toolName) && !currentSettings.webToolsEnabled) return false;
       if ((toolName === 'task' || toolName === 'workflow') && !currentSettings.subagentsEnabled && !ultracode) {
         return false;

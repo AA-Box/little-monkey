@@ -173,6 +173,48 @@ impl SharedLedger {
         }))
     }
 
+    /// Re-key an ACTIVE run lease only after the service singleton lock has
+    /// been acquired, its prior daemon owner has died, and an original
+    /// worker's PID birth identity has been verified in /proc.
+    ///
+    /// This method MUST NOT be called for ordinary job admission.
+    #[cfg(target_os="linux")]
+    pub fn take_over_attested_worker_lease(
+        &mut self,run_id:&str,owner_id:&str,now_ms:u64,duration_ms:u64,
+    )->Result<LeaseToken,String>{
+        let expires=now_ms.checked_add(duration_ms)
+          .ok_or_else(||"lease expiry overflow".to_string())?;
+        let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)
+          .map_err(|e|e.to_string())?;
+        let prior=tx.query_row(
+          "SELECT owner_id, generation FROM run_leases WHERE run_id=?1",
+          [run_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)))
+          .optional().map_err(|e|e.to_string())?
+          .ok_or_else(||"Missing previous lease; cannot prove continuous run ownership".to_string())?;
+        let (old_owner,generation)=prior;
+        let pid=old_owner.strip_prefix("daemon-")
+           .and_then(|suffix|suffix.split_once('-'))
+           .and_then(|(pid,_)|pid.parse::<u32>().ok())
+           .ok_or("Invalid prior daemon lease owner identity")?;
+        if super::engine::worker_start_ticks(pid)?.is_some(){
+            return Err("Prior daemon owner is still alive; refusing lease takeover".into());
+        }
+        if old_owner==owner_id {return Err("Refusing self-takeover".into());}
+        let generation=generation.checked_add(1).ok_or("Lease generation overflow")?;
+        let token_sha256=sha256_hex(uuid::Uuid::new_v4().to_string().as_bytes());
+        let changed=tx.execute(
+          "UPDATE run_leases SET owner_id=?1, lease_token_sha256=?2,
+             generation=?3, acquired_at_ms=?4, heartbeat_at_ms=?4, expires_at_ms=?5
+             WHERE run_id=?6 AND owner_id=?7",
+          params![owner_id,token_sha256,generation,to_i64(now_ms)?,
+             to_i64(expires)?,run_id,old_owner]).map_err(|e|e.to_string())?;
+        if changed!=1{return Err("Lease changed concurrently during handoff".into());}
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(LeaseToken{run_id:run_id.to_string(),owner_id:owner_id.to_string(),
+           token_sha256,generation:u64::try_from(generation)
+             .map_err(|_|"Invalid new lease generation".to_string())?})
+    }
+
     pub fn heartbeat_lease(
         &mut self,
         lease: &LeaseToken,

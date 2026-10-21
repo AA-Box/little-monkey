@@ -1,0 +1,451 @@
+name: Native swarm live acceptance (operator owned machines)
+
+# This workflow is intentionally never triggered by pull_request or push.
+# It runs real models and talks to a separately configured paired installation.
+# The operator must review the selected branch and both machines first.
+on:
+  workflow_dispatch:
+    inputs:
+      sender_runner:
+        description: Runner label of the prepared sending installation
+        required: true
+        type: choice
+        options:
+          - swarm-node-a
+          - swarm-node-b
+      peer_alias:
+        description: Explicitly paired read-only receiving installation alias
+        required: true
+        type: string
+      model_targets:
+        description: Comma-separated configured target inventory keys for real model benchmarks
+        required: true
+        type: string
+      specialist_target:
+        description: Optional installed Ollama target for real specialist source-fixture verification
+        required: false
+        default: ''
+        type: string
+      specialist_domain:
+        description: Domain to evaluate against independently graded source fixtures
+        required: true
+        default: security
+        type: choice
+        options:
+          - security
+          - frontend
+          - backend
+          - performance
+          - general
+      repair_review_target:
+        description: Distinct installed Ollama reviewer model (required when repair_target is set)
+        required: false
+        default: ''
+        type: string
+      repair_target:
+        description: Optional installed Ollama target for real permission-gated repository repair (operator MUST approve every write)
+        required: false
+        default: ''
+        type: string
+      expected_evidence:
+        description: Optional source filename expected in the actual peer report
+        required: false
+        default: README
+        type: string
+      memory_namespace:
+        description: Disposable pre-granted lm-e2e- namespace (empty skips memory acceptance)
+        required: false
+        default: ''
+        type: string
+      receiver_memory_record:
+        description: Receiver-authored record ID already seeded in this test namespace
+        required: false
+        default: ''
+        type: string
+      cluster_group:
+        description: Optional operator-enrolled real signed peer quorum group (empty skips actual cluster election)
+        required: false
+        default: ''
+        type: string
+      cluster_min_voters:
+        description: Number of real signed votes required by operator's prepared cluster (at least strict majority)
+        required: false
+        default: '2'
+        type: string
+      source_fingerprint:
+        description: Original source A device certificate fingerprint (64 lowercase hex); activates independently hosted receiver acceptance
+        required: false
+        default: ''
+        type: string
+      replica_graph_id:
+        description: Optional already-prestaged read-only DAG to verify on two real installations
+        required: false
+        default: ''
+        type: string
+      network_stage:
+        description: Operator-controlled physical peer partition stage; no firewall edits are made
+        required: false
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - partition
+          - restore
+      network_evidence_path:
+        description: Absolute persistent, private evidence path on the same self-hosted runner
+        required: false
+        default: ''
+        type: string
+      stress_rounds:
+        description: Concurrent checkpoint publications after verified physical restore (10..500)
+        required: false
+        default: '30'
+        type: string
+      stress_concurrency:
+        description: Parallel checkpoint workers (one per separately preapproved graph; 1..8)
+        required: false
+        default: '1'
+        type: string
+      stress_additional_graphs:
+        description: Optional comma-separated other preapproved read-only graph IDs for parallel stress
+        required: false
+        default: ''
+        type: string
+      fallback_graph_id:
+        description: Optional already-running disposable resident graph whose primary read-only root was captured before failing
+        required: false
+        default: ''
+        type: string
+      fallback_root_id:
+        description: Root node ID whose preapproved PLAN fallback must complete
+        required: false
+        default: ''
+        type: string
+      fallback_receipt_path:
+        description: Absolute path to pre-captured protected fallback receipt on this persistent self-hosted runner
+        required: false
+        default: ''
+        type: string
+      mlx_config_json:
+        description: 'Optional JSON with model_dir, train_data_dir, new_adapter_output, max_test_ppl, fuse_for_import, previous_model_dir. Empty object skips MLX.'
+        required: false
+        default: '{}'
+        type: string
+      verify_remote_cancellation:
+        description: Run a disposable remote task and verify actual cancellation
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-swarm-live-${{ inputs.sender_runner }}
+  cancel-in-progress: false
+
+jobs:
+  live-two-node-models:
+    name: Real model and peer acceptance
+    runs-on: [self-hosted, swarm-acceptance, "${{ inputs.sender_runner }}"]
+    timeout-minutes: 90
+    env:
+      PEER_ALIAS: ${{ inputs.peer_alias }}
+      MODEL_TARGETS: ${{ inputs.model_targets }}
+      EXPECT_EVIDENCE: ${{ inputs.expected_evidence }}
+      LITTLE_MONKEY_KEEP_EVAL_REPO: "0"
+    steps:
+      - name: Checkout the reviewed Little Monkey branch
+        uses: actions/checkout@v4
+      - name: Verify actual operator-installed runtime and pairing
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v node
+          command -v git
+          command -v monkey
+          monkey --version
+          node --check scripts/swarm-two-peer-live-acceptance.mjs
+          node --check scripts/swarm-model-benchmark.mjs
+          node --check scripts/swarm-specialist-live-benchmark.mjs
+          node --check scripts/swarm-cluster-live-acceptance.mjs
+          node --check scripts/swarm-dag-network-recovery-live-acceptance.mjs
+          node --check scripts/swarm-replica-stress-live-acceptance.mjs
+          node --test scripts/swarm-replica-stress-acceptance.contract.test.mjs
+          node scripts/swarm-dag-network-recovery-live-acceptance.mjs --self-check
+          node --check scripts/swarm-resident-restart-live-acceptance.mjs
+          node --check scripts/swarm-resident-fallback-live-acceptance.mjs
+          node scripts/swarm-resident-fallback-live-acceptance.mjs --self-check
+          node --check scripts/swarm-repository-repair-live-acceptance.mjs
+          node scripts/swarm-repository-repair-live-acceptance.mjs --self-check
+          node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all
+          node --test scripts/swarm-specialist-oracle.contract.test.mjs
+          node --check scripts/swarm-mlx-fused-inference-acceptance.mjs
+          node scripts/swarm-mlx-fused-inference-acceptance.mjs --self-check
+          node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
+          node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
+          node --test scripts/swarm-two-peer-acceptance.contract.test.mjs scripts/swarm-two-peer-memory-acceptance.contract.test.mjs scripts/swarm-two-peer-cancellation-acceptance.contract.test.mjs
+      - name: Exercise actual signed, pinned-TLS peer work and completed result
+        if: ${{ inputs.network_stage != 'partition' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/swarm-two-peer-live-acceptance.mjs \
+            --peer "$PEER_ALIAS" --expect "$EXPECT_EVIDENCE" \
+            --timeout-seconds 600 --poll-seconds 5 --require-model-metering \
+            > "$RUNNER_TEMP/native-swarm-peer-acceptance.json"
+      - name: Verify real signed peer-leader quorum and local scheduler fencing
+        # Never elect a fresh term while replaying an already-owned DAG. In
+        # particular, election during partition/restore can fence its owner.
+        if: ${{ inputs.cluster_group != '' && inputs.replica_graph_id == '' && inputs.network_stage != 'partition' }}
+        shell: bash
+        env:
+          SWARM_CLUSTER_GROUP: ${{ inputs.cluster_group }}
+          SWARM_CLUSTER_VOTERS: ${{ inputs.cluster_min_voters }}
+        run: |
+          set -euo pipefail
+          node scripts/swarm-cluster-live-acceptance.mjs \
+            --group "$SWARM_CLUSTER_GROUP" --min-voters "$SWARM_CLUSTER_VOTERS" \
+            --confirm-operator-cluster \
+            > "$RUNNER_TEMP/native-swarm-signed-leader-quorum.json"
+      - name: Verify signed DAG remote SQLite state across an operator-owned network partition
+        if: ${{ inputs.replica_graph_id != '' }}
+        shell: bash
+        env:
+          SWARM_GROUP: ${{ inputs.cluster_group }}
+          SWARM_GRAPH: ${{ inputs.replica_graph_id }}
+          NETWORK_STAGE: ${{ inputs.network_stage }}
+          NETWORK_EVIDENCE: ${{ inputs.network_evidence_path }}
+        run: |
+          set -euo pipefail
+          test -n "$SWARM_GROUP" && test -n "$SWARM_GRAPH" && test -n "$NETWORK_EVIDENCE"
+          case "$NETWORK_STAGE" in
+            baseline) FLAG='' ;;
+            partition) FLAG='--confirm-network-isolated-externally' ;;
+            restore) FLAG='--confirm-network-restored-externally' ;;
+            *) exit 2 ;;
+          esac
+          node scripts/swarm-dag-network-recovery-live-acceptance.mjs \
+            --stage "$NETWORK_STAGE" --group "$SWARM_GROUP" --graph "$SWARM_GRAPH" \
+            --peer "$PEER_ALIAS" --evidence "$NETWORK_EVIDENCE" \
+            --confirm-operator-owned-readonly-cluster $FLAG \
+            > "$RUNNER_TEMP/native-swarm-replica-network-acceptance.json"
+      - name: Stress real two-device SQLite checkpoint publication AFTER proven restore
+        if: ${{ inputs.network_stage == 'restore' && inputs.replica_graph_id != '' }}
+        shell: bash
+        env:
+          STRESS_GROUP: ${{ inputs.cluster_group }}
+          STRESS_GRAPH: ${{ inputs.replica_graph_id }}
+          STRESS_ROUNDS: ${{ inputs.stress_rounds }}
+          STRESS_CONCURRENCY: ${{ inputs.stress_concurrency }}
+          STRESS_ADDITIONAL_GRAPHS: ${{ inputs.stress_additional_graphs }}
+        run: |
+          set -euo pipefail
+          test -n "$STRESS_GROUP" && test -n "$STRESS_GRAPH"
+          ADDITIONAL_GRAPHS=()
+          if [ -n "$STRESS_ADDITIONAL_GRAPHS" ]; then
+            ADDITIONAL_GRAPHS=(--additional-graphs "$STRESS_ADDITIONAL_GRAPHS")
+          fi
+          node scripts/swarm-replica-stress-live-acceptance.mjs \
+            --group "$STRESS_GROUP" --graph "$STRESS_GRAPH" --peer "$PEER_ALIAS" \
+            --rounds "$STRESS_ROUNDS" --concurrency "$STRESS_CONCURRENCY" "${ADDITIONAL_GRAPHS[@]}" \
+            --confirm-operator-owned-readonly-cluster \
+            --confirm-independent-machines --confirm-post-recovery \
+            > "$RUNNER_TEMP/native-swarm-replica-stress-acceptance.json"
+      - name: Measure actual model behavior against independent test fixtures
+        if: ${{ inputs.network_stage != 'partition' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/swarm-model-benchmark.mjs \
+            --targets "$MODEL_TARGETS" --repetitions 3 \
+            > "$RUNNER_TEMP/native-swarm-real-model-benchmark.json"
+      # The following operations never run on PRs or ordinary pushes and
+      # never enable capabilities on either node. Explicitly seeded data only.
+      - name: Verify real peer vector replication, convergence and tombstones
+        if: ${{ inputs.network_stage != 'partition' && inputs.memory_namespace != '' && inputs.receiver_memory_record != '' }}
+        shell: bash
+        env:
+          MEMORY_NS: ${{ inputs.memory_namespace }}
+          MEMORY_RECEIVER_ID: ${{ inputs.receiver_memory_record }}
+        run: |
+          set -euo pipefail
+          node scripts/swarm-two-peer-memory-live-acceptance.mjs \
+            --peer "$PEER_ALIAS" --namespace "$MEMORY_NS" \
+            --receiver-record "$MEMORY_RECEIVER_ID" --confirm-disposable \
+            > "$RUNNER_TEMP/native-swarm-vector-memory-acceptance.json"
+      - name: Verify real authorized remote cancellation reaches terminal state
+        if: ${{ inputs.network_stage != 'partition' && inputs.verify_remote_cancellation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/swarm-two-peer-cancellation-live-acceptance.mjs \
+            --peer "$PEER_ALIAS" --confirm-disposable \
+            --timeout-seconds 300 --poll-seconds 5 \
+            > "$RUNNER_TEMP/native-swarm-cancellation-acceptance.json"
+      - name: Run genuine installed-model specialist source quality evaluation
+        if: ${{ inputs.specialist_target != '' }}
+        shell: bash
+        env:
+          SPECIALIST_TARGET: ${{ inputs.specialist_target }}
+          SPECIALIST_DOMAIN: ${{ inputs.specialist_domain }}
+        run: |
+          set -euo pipefail
+          node scripts/swarm-specialist-live-benchmark.mjs \
+            --domain "$SPECIALIST_DOMAIN" \
+            --target "$SPECIALIST_TARGET" --repetitions 3 \
+            > "$RUNNER_TEMP/native-swarm-specialist-quality.json"
+      - name: Real vulnerability discovery, manual repair and external regression tests
+        if: ${{ inputs.repair_target != '' }}
+        shell: bash
+        env:
+          REPAIR_TARGET: ${{ inputs.repair_target }}
+          REPAIR_REVIEW_TARGET: ${{ inputs.repair_review_target }}
+        run: |
+          set -euo pipefail
+          node scripts/swarm-repository-repair-live-acceptance.mjs \
+            --target "$REPAIR_TARGET" --review-target "$REPAIR_REVIEW_TARGET" --confirm-manual-approvals \
+            --timeout-seconds 2400 \
+            > "$RUNNER_TEMP/native-swarm-repository-repair.json"
+      - name: Verify installed daemon re-elects a preapproved read-only fallback
+        if: ${{ inputs.fallback_graph_id != '' || inputs.fallback_root_id != '' || inputs.fallback_receipt_path != '' }}
+        shell: bash
+        env:
+          FALLBACK_GRAPH: ${{ inputs.fallback_graph_id }}
+          FALLBACK_ROOT: ${{ inputs.fallback_root_id }}
+          FALLBACK_RECEIPT: ${{ inputs.fallback_receipt_path }}
+        run: |
+          set -euo pipefail
+          test -n "$FALLBACK_GRAPH" && test -n "$FALLBACK_ROOT" && test -n "$FALLBACK_RECEIPT"
+          node scripts/swarm-resident-fallback-live-acceptance.mjs \
+            --phase verify --graph "$FALLBACK_GRAPH" --root "$FALLBACK_ROOT" \
+            --checkpoint "$FALLBACK_RECEIPT" --confirm-disposable \
+            > "$RUNNER_TEMP/native-swarm-resident-fallback-acceptance.json"
+      - name: Train and evaluate a real local MLX LoRA adapter with held-out quality gate
+        if: ${{ inputs.mlx_config_json != '{}' && inputs.mlx_config_json != '' }}
+        shell: bash
+        env:
+          MLX_CONFIG_JSON: ${{ inputs.mlx_config_json }}
+        run: |
+          set -euo pipefail
+          # GitHub workflow_dispatch permits at most 25 top-level inputs.
+          # Decode six supervised MLX settings without eval or shell interpolation.
+          MLX_FIELDS=()
+          while IFS= read -r -d '' field; do MLX_FIELDS+=("$field"); done < <(
+            node -e '
+              const p = JSON.parse(process.env.MLX_CONFIG_JSON);
+              if (!p || typeof p !== "object" || Array.isArray(p)) process.exit(2);
+              const allowed = ["model_dir","train_data_dir","new_adapter_output","max_test_ppl","fuse_for_import","previous_model_dir"];
+              if (Object.keys(p).some(k => !allowed.includes(k))) process.exit(2);
+              const checked = (v, optional=false) => {
+                if (optional && (v === undefined || v === "")) return "";
+                if (typeof v !== "string" || v.length === 0 || v.length > 4096 || /[\x00-\x1f]/.test(v)) process.exit(2);
+                return v;
+              };
+              const threshold = String(p.max_test_ppl ?? "");
+              if (!/^(?:[0-9]+)(?:\.[0-9]+)?$/.test(threshold) || Number(threshold) <= 0) process.exit(2);
+              if (p.fuse_for_import !== undefined && ![true,false,"true","false"].includes(p.fuse_for_import)) process.exit(2);
+              const fields = [
+                checked(p.model_dir),checked(p.train_data_dir),
+                checked(p.new_adapter_output),threshold,
+                p.fuse_for_import === true || p.fuse_for_import === "true" ? "true" : "false",
+                checked(p.previous_model_dir, true)
+              ];
+              for (const value of fields) process.stdout.write(value + "\0");
+            '
+          )
+          test "${#MLX_FIELDS[@]}" -eq 6
+          MLX_BASE="${MLX_FIELDS[0]}"
+          MLX_DATA="${MLX_FIELDS[1]}"
+          MLX_OUTPUT="${MLX_FIELDS[2]}"
+          MLX_GATE="${MLX_FIELDS[3]}"
+          MLX_FUSE="${MLX_FIELDS[4]}"
+          MLX_PREVIOUS="${MLX_FIELDS[5]}"
+          test -n "$MLX_BASE" && test -n "$MLX_DATA" && test -n "$MLX_OUTPUT" && test -n "$MLX_GATE"
+          test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64
+          python3 -c "import mlx_lm"
+          FUSE_FLAGS=()
+          if [ "$MLX_FUSE" = "true" ]; then
+            FUSE_FLAGS=(--fuse-for-import --confirm-fusion)
+          fi
+          node scripts/swarm-mlx-lora.mjs \
+            --model "$MLX_BASE" --data "$MLX_DATA" --output "$MLX_OUTPUT" \
+            --iters 200 --max-test-ppl "$MLX_GATE" \
+            --confirm-local-training "${FUSE_FLAGS[@]}" \
+            > "$RUNNER_TEMP/native-swarm-mlx-lora-acceptance.json"
+          if [ "$MLX_FUSE" = "true" ]; then
+            PREVIOUS_ARGS=()
+            if [ -n "$MLX_PREVIOUS" ]; then
+              PREVIOUS_ARGS=(--previous-model "$MLX_PREVIOUS")
+            fi
+            node scripts/swarm-mlx-fused-inference-acceptance.mjs \
+              --receipt "$MLX_OUTPUT/training-receipt.json" \
+              --python "$(command -v python3)" \
+              --confirm-local-mlx-inference "${PREVIOUS_ARGS[@]}" \
+              > "$RUNNER_TEMP/native-swarm-mlx-fused-inference-acceptance.json"
+          fi
+      - name: Publish source model usage and DAG transitions via signed pinned-TLS readback
+        if: ${{ inputs.source_fingerprint != '' && inputs.replica_graph_id != '' && inputs.cluster_group != '' }}
+        shell: bash
+        env:
+          SWARM_GROUP: ${{ inputs.cluster_group }}
+          SWARM_GRAPH: ${{ inputs.replica_graph_id }}
+        run: |
+          set -euo pipefail
+          node scripts/swarm-cross-host-telemetry-live-acceptance.mjs \
+            --stage publish --group "$SWARM_GROUP" --graph "$SWARM_GRAPH" \
+            --peer "$PEER_ALIAS" --confirm-independent-installed-peers \
+            > "$RUNNER_TEMP/native-swarm-metered-source.json"
+      - name: Publish real-run verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-swarm-acceptance-${{ inputs.sender_runner }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/native-swarm-peer-acceptance.json
+            ${{ runner.temp }}/native-swarm-signed-leader-quorum.json
+            ${{ runner.temp }}/native-swarm-replica-network-acceptance.json
+            ${{ runner.temp }}/native-swarm-replica-stress-acceptance.json
+            ${{ runner.temp }}/native-swarm-real-model-benchmark.json
+            ${{ runner.temp }}/native-swarm-metered-source.json
+            ${{ runner.temp }}/native-swarm-vector-memory-acceptance.json
+            ${{ runner.temp }}/native-swarm-cancellation-acceptance.json
+            ${{ runner.temp }}/native-swarm-specialist-quality.json
+            ${{ runner.temp }}/native-swarm-repository-repair.json
+            ${{ runner.temp }}/native-swarm-resident-fallback-acceptance.json
+            ${{ runner.temp }}/native-swarm-mlx-lora-acceptance.json
+            ${{ runner.temp }}/native-swarm-mlx-fused-inference-acceptance.json
+
+  verify-independent-receiver:
+    name: Verify original-host metered model execution on separate enrolled runner
+    if: ${{ inputs.source_fingerprint != '' && inputs.replica_graph_id != '' && inputs.cluster_group != '' }}
+    needs: live-two-node-models
+    runs-on: [self-hosted, swarm-acceptance, "${{ inputs.sender_runner == 'swarm-node-a' && 'swarm-node-b' || 'swarm-node-a' }}"]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the same reviewed acceptance code
+        uses: actions/checkout@v4
+      - name: Query the receiver installation's OWN SQLite-backed daemon
+        shell: bash
+        env:
+          SWARM_GROUP: ${{ inputs.cluster_group }}
+          SWARM_GRAPH: ${{ inputs.replica_graph_id }}
+          ORIGINAL_SOURCE_FP: ${{ inputs.source_fingerprint }}
+        run: |
+          set -euo pipefail
+          command -v monkey
+          node scripts/swarm-cross-host-telemetry-live-acceptance.mjs \
+            --stage verify --group "$SWARM_GROUP" --graph "$SWARM_GRAPH" \
+            --source-fingerprint "$ORIGINAL_SOURCE_FP" \
+            --require-model-usage --confirm-independent-installed-peers \
+            > "$RUNNER_TEMP/native-swarm-independent-metering.json"
+      - name: Store actual independent receiver receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-swarm-independent-receiver-${{ inputs.sender_runner }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: ${{ runner.temp }}/native-swarm-independent-metering.json

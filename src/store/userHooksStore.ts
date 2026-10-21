@@ -1,13 +1,16 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 
-/** The four lifecycle events hooks can attach to in this slice — see
- * `src/lib/userHooks.ts` for what firing each one means. */
-export const USER_HOOK_EVENTS = ["PreToolUse", "PostToolUse", "SessionStart", "UserPromptSubmit"] as const;
+/** Native lifecycle events with explicit execution points. Unsupported
+ * external plugin SDK events remain unsupported, never silently remapped. */
+export const USER_HOOK_EVENTS = [
+  "PreToolUse","PostToolUse","SessionStart","SessionEnd","UserPromptSubmit",
+  "PreTask","PostTask","PreCommand","PostCommand","PreEdit","PostEdit","Stop",
+] as const;
 export type UserHookEvent = (typeof USER_HOOK_EVENTS)[number];
 
 /** One user-configured hook: a shell command wired to a lifecycle event,
- * optionally filtered to matching tool names (PreToolUse/PostToolUse only). */
+ * optionally filtered to the name of the affected tool or lifecycle action. */
 export interface UserHookDef {
   id: string;
   event: UserHookEvent;

@@ -88,26 +88,30 @@ function stdoutDenial(stdout: string): string | null {
  * first denial — or `null` when every hook allowed (or failed to answer; see
  * the module doc comment for why an unanswering hook proceeds).
  */
-export async function evaluatePreToolUseHooks(
+export type PreHookEvent = 'PreToolUse'|'PreCommand'|'PreEdit'|'PreTask';
+/** Execute one explicitly configured pre-operation hook family in order,
+ * honoring its deny verdict before any tool execution. */
+export async function evaluatePreActionHooks(
+  event: PreHookEvent,
   toolName: string,
   args: Record<string, unknown>,
   sessionId: string | undefined,
 ): Promise<HookDenial | null> {
-  const hooks = hooksForEvent('PreToolUse', toolName);
+  const hooks = hooksForEvent(event, toolName);
   for (const hook of hooks) {
     let outcome: HookExecOutcome;
     try {
-      outcome = await execHook(hook, { event: 'PreToolUse', tool_name: toolName, args, session_id: sessionId });
+      outcome = await execHook(hook, { event, tool_name: toolName, args, session_id: sessionId });
     } catch (err) {
-      console.warn(`PreToolUse hook "${hook.command}" could not run — proceeding:`, err);
+      console.warn(`${event} hook "${hook.command}" could not run — proceeding:`, err);
       continue;
     }
     if (outcome.timed_out || outcome.exit_code === null) {
-      console.warn(`PreToolUse hook "${hook.command}" timed out or was killed — proceeding.`);
+      console.warn(`${event} hook "${hook.command}" timed out or was killed — proceeding.`);
       continue;
     }
     if (outcome.exit_code !== 0) {
-      const reason = outcome.stderr.trim() || outcome.stdout.trim() || `PreToolUse hook exited with code ${outcome.exit_code}.`;
+      const reason = outcome.stderr.trim() || outcome.stdout.trim() || `${event} hook exited with code ${outcome.exit_code}.`;
       return { reason };
     }
     const denial = stdoutDenial(outcome.stdout);
@@ -115,11 +119,26 @@ export async function evaluatePreToolUseHooks(
   }
   return null;
 }
+export async function evaluatePreToolUseHooks(
+  toolName: string,args: Record<string, unknown>,sessionId:string|undefined,
+): Promise<HookDenial|null> {
+  return evaluatePreActionHooks('PreToolUse',toolName,args,sessionId);
+}
+/** Pure routing of actual tool name to lifecycle hook pair. */
+export function toolLifecyclePair(name:string):
+  {pre:'PreCommand'|'PreEdit';post:'PostCommand'|'PostEdit'}|null {
+  if(['run_shell','run_command','execute_command','shell_command'].includes(name))
+    return {pre:'PreCommand',post:'PostCommand'};
+  if(['write_file','edit_file','apply_patch','multi_edit'].includes(name))
+    return {pre:'PreEdit',post:'PostEdit'};
+  return null;
+}
 
 /** Fires every matching hook for an observe-only event (PostToolUse,
  * SessionStart) and never blocks on, or surfaces, anything they do — errors
  * are console noise by design. */
-export function fireObservedHooks(event: 'PostToolUse' | 'SessionStart', payload: Omit<HookPayload, 'event'> = {}): void {
+export function fireObservedHooks(event: 'PostToolUse' | 'SessionStart' | 'SessionEnd' | 'PostTask' | 'PostCommand' | 'PostEdit' | 'Stop',
+  payload: Omit<HookPayload, 'event'> = {}): void {
   for (const hook of hooksForEvent(event, payload.tool_name)) {
     void execHook(hook, { event, ...payload }).catch((err) => {
       console.warn(`${event} hook "${hook.command}" failed:`, err);

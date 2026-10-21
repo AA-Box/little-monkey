@@ -6,6 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AudioLines, CornerDownLeft, Radio, Square } from "lucide-react";
 
 import { compactSessionNow, runAgentTurn, stopTurn } from "../../lib/agentLoop";
+import { syncSessionMailbox } from "../../lib/sessionCollaboration";
 import type { AttachmentRef } from "../../lib/agentLoop";
 import { startComparison } from "../../lib/compareRunner";
 import { startCrew } from "../../lib/crewRunner";
@@ -381,6 +382,21 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setInputState(value);
   }, []);
   const sending = useSessionStore(selectTurnRunning(sessionId));
+  const sessionCollaborationEnabled=useSettingsStore((state)=>state.sessionCollaborationEnabled);
+  // Read persisted SQLite inbox rows while this chat is idle and visible.
+  // The mailbox NEVER starts an autonomous model execution.
+  useEffect(()=>{
+    if(!sessionCollaborationEnabled || sending)return;
+    let active=true;
+    const refresh=()=>{
+      if(active)void syncSessionMailbox(sessionId).catch(error=>
+        console.warn('Local peer mail remains pending until retry:',error));
+    };
+    refresh();
+    const timer=setInterval(refresh,4000);
+    return ()=>{active=false;clearInterval(timer);};
+  },[sessionId,sessionCollaborationEnabled,sending]);
+
   const activeProvider = useModelStore((state) => state.activeProvider);
   const llamaStatus = useModelStore((state) => state.llamaStatus);
   const localModelStarting = activeProvider === "local" && llamaStatus === "starting";
@@ -677,6 +693,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setSlashQuery(null);
     slashStartRef.current = null;
     requestAnimationFrame(resizeTextarea);
+  }, [sessionId, resizeTextarea, setInput]);
+
+  // Settings' SwarmPanel prepares an editable, user-reviewed draft in the
+  // active chat. This does not execute tools or circumvent Send/approvals.
+  useEffect(() => {
+    const onDraft = (raw: Event) => {
+      const payload = (raw as CustomEvent<{ sessionId?: unknown; text?: unknown }>).detail;
+      if (!payload || payload.sessionId !== sessionId || typeof payload.text !== "string" ||
+          payload.text.length < 1 || payload.text.length > 8_000) return;
+      setInput(current => [current.trim(), payload.text as string].filter(Boolean).join("\n\n"));
+      requestAnimationFrame(resizeTextarea);
+    };
+    window.addEventListener("little-monkey:swarm-draft", onDraft);
+    return () => window.removeEventListener("little-monkey:swarm-draft", onDraft);
   }, [sessionId, resizeTextarea, setInput]);
 
   useEffect(() => {

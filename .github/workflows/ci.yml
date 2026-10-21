@@ -13,6 +13,13 @@ on:
 permissions:
   contents: read
 
+# A PR should test its newest head, not accumulate obsolete cross-platform
+# native build matrices competing for the same GitHub runner quota.
+# Branch push builds remain non-cancelling.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   frontend:
     # TS/JS checks are platform-independent — one OS is enough, no reason to
@@ -41,6 +48,81 @@ jobs:
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
+
+      - name: Syntax-check live real-model benchmark harness (no model mocks)
+        run: pnpm test:swarm-models:syntax
+
+      - name: Contract-check physical OS daemon memory accounting (no model mocks)
+        run: pnpm test:headless-resource:contract
+
+      - name: Verify live Linux process RSS and PSS from operating system
+        if: runner.os == 'Linux'
+        run: pnpm test:headless-resource:os
+
+      - name: Verify actual local CLI selfdev transactional activation and rollback
+        if: runner.os == 'Linux'
+        run: pnpm test:selfdev:contract
+
+      - name: Contract and Linux kernel gate for real paired JCode comparison
+        if: runner.os == 'Linux'
+        run: pnpm test:paired-headless:contract
+      - name: Real-evidence preflight contract (no fabricated evidence)
+        run: pnpm test:semantic-memory-live:contract
+
+      - name: Verify native vendor-CLI auth boundary and consent
+        if: runner.os == 'Linux'
+        run: pnpm test:native-auth:contract
+      - name: Real-evidence preflight contract (no fabricated evidence)
+        run: pnpm test:real-agent-exports:contract
+
+      - name: Contract-check real-task concurrency and independent oracle (mock CLI only)
+        run: pnpm test:swarm-headless:contract
+
+      - name: Syntax-check real two-installation acceptance harness (no peer mocks)
+        run: pnpm test:swarm-peer:syntax
+
+      - name: Exercise live two-peer harness contract (controlled CLI only)
+        run: pnpm test:swarm-peer:contract
+      - name: Verify physical recovery stress harness contracts (no real peers)
+        run: pnpm test:swarm-physical:contract
+      - name: Exercise authenticated cross-host telemetry contract (no physical peers)
+        run: pnpm test:swarm-telemetry:contract
+      - name: Contract-test continuous independent model quality and official billing readers
+        run: pnpm test:swarm-continuous:contract
+      - name: Contract-test real-device vector memory and cancellation gates (no network)
+        run: |
+          node --check scripts/swarm-two-peer-memory-live-acceptance.mjs
+          node --check scripts/swarm-two-peer-cancellation-live-acceptance.mjs
+          node --test scripts/swarm-two-peer-memory-acceptance.contract.test.mjs scripts/swarm-two-peer-cancellation-acceptance.contract.test.mjs
+
+      - name: Verify independent source oracles for all five specialist domains (no model calls)
+        run: |
+          node --check scripts/swarm-specialist-live-benchmark.mjs
+          node scripts/swarm-specialist-live-benchmark.mjs --self-check --domain all
+          node --test scripts/swarm-specialist-oracle.contract.test.mjs
+
+      - name: Contract-test safe resident restart and offline repair source oracle
+        run: |
+          node --check scripts/swarm-cluster-live-acceptance.mjs
+          node --check scripts/swarm-dag-network-recovery-live-acceptance.mjs
+          node scripts/swarm-dag-network-recovery-live-acceptance.mjs --self-check
+          node --test scripts/swarm-security-file-access.contract.test.mjs
+          node --test scripts/swarm-cluster-acceptance.contract.test.mjs
+          node --check scripts/swarm-resident-restart-live-acceptance.mjs
+          node --check scripts/swarm-resident-fallback-live-acceptance.mjs
+          node --check scripts/swarm-mlx-lora.mjs
+          node --check scripts/swarm-mlx-fused-inference-acceptance.mjs
+          node scripts/swarm-mlx-fused-inference-acceptance.mjs --self-check
+          node --test scripts/swarm-mlx-lora.contract.test.mjs
+          node --check scripts/swarm-mlx-auto-learning.mjs
+          node --test scripts/swarm-mlx-auto-learning.contract.test.mjs
+          node --check scripts/swarm-ruflo-mcp-acceptance.mjs
+          node --test scripts/swarm-ruflo-mcp-acceptance.contract.test.mjs
+          node scripts/swarm-resident-fallback-live-acceptance.mjs --self-check
+          node --check scripts/swarm-repository-repair-live-acceptance.mjs
+          node --test scripts/swarm-resident-restart-acceptance.contract.test.mjs
+          node scripts/swarm-repository-repair-live-acceptance.mjs --self-check
+          node --test scripts/swarm-repository-repair-acceptance.contract.test.mjs
 
       - name: Production build and bundle budget
         run: pnpm build:budget
@@ -108,6 +190,12 @@ jobs:
         # Linux and macOS ZIP runtime assets require `unzip`; GNU tar rejects
         # them. Keep the platform-specific selector covered before release.
         run: pnpm test:runtime-archive
+
+      - name: Signed updater dependency and release contract
+        run: pnpm test:updater-security
+
+      - name: Signed updater acceptance preflight contract
+        run: pnpm test:updater-acceptance
 
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
@@ -310,11 +398,38 @@ jobs:
               exit 1
             fi
             pnpm test:rust
+            # Three ACTUAL independently running daemon installations over
+            # signed/pinned TLS on loopback, private SQLite and OS keychain.
+            # This test owns only disposable GitHub-hosted runner state.
+            node --check scripts/swarm-three-process-live-acceptance.mjs
+            node scripts/swarm-three-process-live-acceptance.mjs --self-check
+            cargo build --manifest-path src-tauri/Cargo.toml --bin monkey-cli
+            cli="$(pwd)/src-tauri/target/debug/monkey-cli"
+            test -x "$cli"
+            node scripts/swarm-three-process-live-acceptance.mjs \
+              --monkey-bin "$cli" --confirm-disposable \
+              > "$RUNNER_TEMP/native-swarm-three-process-acceptance.json"
+            cat "$RUNNER_TEMP/native-swarm-three-process-acceptance.json"
           '
 
       - name: Rust tests
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
+
+      - name: Paired peer live TLS loopback E2E
+        if: startsWith(matrix.os, 'ubuntu')
+        timeout-minutes: 10
+        env:
+          LITTLE_MONKEY_REQUIRE_LIVE_PEER: "1"
+        # Exercise the real certificate-pinned HTTPS server, pairing, task
+        # admission, durable thread readback and unsigned-call rejection.
+        # This is a deterministic loopback transport test using a fake
+        # accepting runner, not a claimed two-machine model smoke test.
+        run: |
+          set -euo pipefail
+          command -v openssl
+          openssl version
+          cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli peer_live -- --ignored --nocapture
 
       - name: Build the real Docker autonomous runner
         if: startsWith(matrix.os, 'ubuntu')
@@ -693,6 +808,17 @@ jobs:
       # The SBOM covers both dependency trees (pnpm-lock.yaml and Cargo.lock are
       # both in the scanned tree), so one artifact describes the whole app.
       - name: Generate SBOM
+        id: generate-sbom
+        continue-on-error: true # Retry the pinned release download if GitHub returns a transient 5xx.
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: little-monkey-sbom.cyclonedx.json
+          output-file: little-monkey-sbom.cyclonedx.json
+
+      - name: Retry SBOM generation after a transient download failure
+        if: steps.generate-sbom.outcome == 'failure'
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .

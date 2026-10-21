@@ -19,17 +19,20 @@ Do not re-check these by hand; they run on every commit.
 | Security Doctor's peer findings | `daemon::peer_audit` |
 | Settings → Peers, driven as an operator drives it | `PeersPanel.test.tsx` |
 
-One more is automated but **opt in**, because it binds a listener and shells out
-to `openssl`:
+The live TLS loopback test is also a **required Linux CI gate** for changes
+to the peer transport and swarm bridge. Developers can run it locally:
 
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- --ignored peer_live
+LITTLE_MONKEY_REQUIRE_LIVE_PEER=1 cargo test --manifest-path src-tauri/Cargo.toml --bin monkey-cli peer_live -- --ignored --nocapture
 ```
 
-That one mints a self-signed certificate, starts the real TLS listener on
-loopback, and drives hello, a multi-megabyte artifact upload, a task request
-referencing it, and a thread read over a real socket with a real certificate
-pin. Run it after touching anything under `daemon/remote/`.
+The requirement flag prevents a missing or broken `openssl` certificate
+generator from being counted as a pass. This mints a self-signed certificate,
+starts the actual TLS listener on loopback, then checks hello, multi-megabyte
+artifact upload, task admission, readback over a signed pinned socket, and
+refusal of unsigned requests. It uses a deterministic fake run acceptor, not
+a real model; a two-installation network smoke is still mandatory for a full
+swarm release.
 
 ## What still needs two machines
 

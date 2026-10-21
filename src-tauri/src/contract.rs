@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "2.0.0";
+pub const CONTRACT_VERSION: &str = "2.3.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -436,6 +436,37 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         path: "/v1/remote/peer/threads/{thread_id}",
         gate: RemoteGate::PeerStanding,
     },
+    // A paired task sender can request cancellation only for a message it
+    // originally submitted to the same thread. No generic run authority.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/threads/{thread_id}/cancel",
+        gate: RemoteGate::Capability("PeerTaskRequest"),
+    },
+    // A task-granted paired peer may request an election vote, but the
+    // receiver separately validates its immutable cluster roster, term,
+    // candidate fingerprint and signed majority quorum before leasing.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/swarm-election/vote",
+        gate: RemoteGate::Capability("PeerTaskRequest"),
+    },
+    // A checkpoint is only an authenticated observation. It never grants
+    // execution authority or permission to import another host's jobs.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/swarm-state/checkpoints",
+        gate: RemoteGate::Capability("PeerTaskRequest"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "GET",
+        path: "/v1/remote/peer/swarm-state/{group}/{graph}",
+        gate: RemoteGate::Capability("PeerTaskRequest"),
+    },
     // Liveness and self-description in one call: a peer says who it is and
     // what it supports, and learns the same plus what it is actually granted.
     // Nothing it sends here changes what it may do.
@@ -452,6 +483,24 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         method: "POST",
         path: "/v1/remote/peer/artifacts",
         gate: RemoteGate::Capability("PeerArtifact"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "GET",
+        path: "/v1/remote/peer/memory/{namespace}",
+        gate: RemoteGate::Capability("PeerMemoryRead"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/memory/{namespace}/records",
+        gate: RemoteGate::Capability("PeerMemoryWrite"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/memory/{namespace}/search",
+        gate: RemoteGate::Capability("PeerMemoryRead"),
     },
 ];
 

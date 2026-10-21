@@ -42,6 +42,13 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use little_monkey_lib::peers::{PeerArtifactRef, PeerEnvelope, PeerMessageKind};
+use little_monkey_lib::run_ledger::RunLedger;
+use little_monkey_lib::run_protocol::{
+    ClientIdentity, ClientKind, ModelTargetSnapshot, OutputChannel, PermissionMode,
+    PermissionPolicySnapshot, RootAccess, RootGrant, RunBudgets, RunEvent, RunEventEnvelope,
+    RunKind, RunSpec, ToolPolicyDecision, UsageSnapshot, WorkspaceContext,
+    RUN_PROTOCOL_SCHEMA_VERSION,
+};
 
 use super::remote::api::RemoteApi;
 use super::remote::protocol::{
@@ -50,7 +57,7 @@ use super::remote::protocol::{
     REMOTE_PROTOCOL_VERSION,
 };
 use super::remote::store::{RemoteSecretStore, RemoteStore};
-use super::store::{DaemonConfig, DaemonPaths};
+use super::store::{DaemonConfig, DaemonPaths, DaemonStore, NewDaemonJob};
 
 /// Real wall-clock time, because the server this talks to uses its own — the
 /// signed-request skew window and the envelope's expiry are both judged against
@@ -117,6 +124,136 @@ impl super::channel_worker::RunQueue for FakeRuns {
     ) -> Result<String, String> {
         self.submitted.lock().unwrap().push(ingress.clone());
         Ok(ingress.deterministic_job_id())
+    }
+}
+
+/// Complete a queued peer task in the *real* daemon store and run ledger.
+///
+/// The language-model call is deterministic here, while job state, ledger
+/// events, result materialization, TLS transport, and peer auth are production
+/// paths. This verifies the whole accepted-task -> result round-trip.
+fn complete_live_peer_task(paths: &DaemonPaths, job_id: &str, answer: &str) {
+    let now = now_ms();
+    let run_id = format!("run-{}", &job_id[job_id.len().saturating_sub(20)..]);
+    let mut jobs = DaemonStore::open(paths).expect("daemon store");
+    jobs.insert_preparing(
+        &NewDaemonJob {
+            job_id: job_id.to_owned(),
+            recipe_snapshot: PathBuf::from("/tmp/peer-live-task.json"),
+            priority: 0,
+            max_attempts: 1,
+            created_at_ms: now,
+            max_runtime_ms: 60_000,
+            max_memory_bytes: None,
+            max_log_bytes: 1_024,
+            repository_policy_json: None,
+            worktree_json: None,
+            parent_run_id: None,
+        },
+        64,
+    )
+    .expect("persist the peer job");
+    jobs.mark_queued(job_id, &run_id, now)
+        .expect("associate the receiver-owned run");
+    drop(jobs);
+
+    let emitter = ClientIdentity {
+        client_id: "peer-live".into(),
+        instance_id: "instance-bob".into(),
+        kind: ClientKind::Daemon,
+        version: "1".into(),
+    };
+    let spec = RunSpec {
+        schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+        run_id: run_id.clone(),
+        idempotency_key: format!("idem-{run_id}"),
+        created_at_ms: now,
+        kind: RunKind::Workflow,
+        submitted_by: emitter.clone(),
+        task: "authorized peer investigation".into(),
+        instructions: None,
+        input_artifact_ids: vec![],
+        target: ModelTargetSnapshot::Provider {
+            target_id: "target".into(),
+            label: "test".into(),
+            provider_id: "test".into(),
+            endpoint: "http://127.0.0.1:1/v1".into(),
+            model: "test".into(),
+            credential_ref_id: "credential-none".into(),
+            capabilities: crate::task::cli_capabilities(),
+        },
+        workspace: Some(WorkspaceContext {
+            workspace_id: "workspace".into(),
+            primary_root_id: "root".into(),
+            roots: vec![RootGrant {
+                root_id: "root".into(),
+                canonical_path: "/tmp".into(),
+                access: RootAccess::ReadWrite,
+                allow_symlinks_within_root: false,
+            }],
+            repository_policy: None,
+        }),
+        permission_policy: PermissionPolicySnapshot {
+            mode: PermissionMode::Auto,
+            unattended: true,
+            approval_timeout_ms: 60_000,
+            default_tool_decision: ToolPolicyDecision::Prompt,
+            tool_rules: vec![],
+            allow_network: false,
+            allow_external_mutations: false,
+            egress_allowlist: None,
+            channel_send: None,
+        },
+        budgets: RunBudgets {
+            wall_time_ms: 60_000,
+            max_iterations: 4,
+            max_model_calls: 4,
+            max_tool_calls: 4,
+            max_input_tokens: 1_000,
+            max_output_tokens: 1_000,
+            max_cost_micros: None,
+            max_artifact_bytes: 1_024,
+            max_event_count: 100,
+        },
+        autonomous_task: None,
+        execution_target: None,
+        workspace_transfer: None,
+    };
+    let mut ledger = RunLedger::open(&paths.ledger_db).expect("run ledger");
+    ledger.submit_run(&spec).expect("submit run");
+    for (index, event) in [
+        RunEvent::ModelDelta {
+            message_id: "assistant-1".into(),
+            channel: OutputChannel::Assistant,
+            text: answer.to_string(),
+        },
+        RunEvent::Completed {
+            summary: None,
+            result_artifact_ids: vec![],
+            usage: UsageSnapshot {
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_input_tokens: 0,
+                model_calls: 1,
+                tool_calls: 0,
+                cost_micros: None,
+            },
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ledger.append_event(&RunEventEnvelope {
+            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+            event_id: format!("evt-{run_id}-{}", index + 1),
+            run_id: run_id.clone(),
+            sequence: (index + 1) as u64,
+            occurred_at_ms: now + index as u64 + 1,
+            actor_id: None,
+            emitter: emitter.clone(),
+            event,
+        })
+        .expect("append the terminal run event");
     }
 }
 
@@ -221,6 +358,9 @@ fn the_whole_peer_exchange_survives_a_real_tls_socket() {
     );
     std::fs::create_dir_all(&root.0).expect("test root");
     let Some((certificate_path, key_path)) = self_signed_certificate(&root.0) else {
+        if std::env::var_os("LITTLE_MONKEY_REQUIRE_LIVE_PEER").is_some() {
+            panic!("required live TLS peer validation could not create an OpenSSL test certificate");
+        }
         eprintln!("skipped: no usable `openssl` on this machine");
         return;
     };
@@ -239,6 +379,8 @@ fn the_whole_peer_exchange_survives_a_real_tls_socket() {
         DeviceCapability::PeerMessage,
         DeviceCapability::PeerTaskRequest,
         DeviceCapability::PeerArtifact,
+        DeviceCapability::PeerMemoryRead,
+        DeviceCapability::PeerMemoryWrite,
     ]);
     let mut store = RemoteStore::open(&paths.root).expect("remote store");
     let invitation = store
@@ -266,6 +408,12 @@ fn the_whole_peer_exchange_survives_a_real_tls_socket() {
         )
         .expect("accept");
     let device_secret = pairing.device_secret.as_bytes().to_vec();
+    // Explicit namespace sharing is a separate decision from pairing. It is
+    // never inherited by other namespaces or merely by peer standing.
+    super::peer_memory::grant(
+        &DaemonStore::open(&paths).expect("peer memory store"),
+        &pairing.device_id, "shared-test", true, true,
+    ).expect("operator namespace ACL");
     drop(store);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -426,8 +574,60 @@ fn the_whole_peer_exchange_survives_a_real_tls_socket() {
         let messages = thread["messages"].as_array().cloned().unwrap_or_default();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["correlation_id"], "corr-live");
+        assert_eq!(messages[0]["disposition"], "accepted");
+        assert!(messages.iter().all(|row| row["direction"] != "outbound"));
 
-        // 5. An unsigned request reaches nothing, over the same socket that
+        // 5. The receiver completes its authorized run in the durable daemon
+        // ledger. Alice reads the *result* over the same pinned TLS connection.
+        let job_id = queued[0].deterministic_job_id();
+        let expected_answer = "Verified: the build failed on the migration step.";
+        complete_live_peer_task(&paths, &job_id, expected_answer);
+        let response = signed(
+            &client,
+            &base,
+            &device_secret,
+            &device_id,
+            5,
+            reqwest::Method::GET,
+            "/v1/remote/peer/threads/thread-live",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let answered: serde_json::Value = response.json().await.expect("answered thread");
+        let rows = answered["messages"].as_array().expect("response list");
+        let result_rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row["direction"] == "outbound")
+            .collect();
+        // A peer thread rightly includes its original inbound request
+        // alongside the one materialized outbound result.
+        assert_eq!(result_rows.len(), 1, "exactly one result is materialized");
+        assert_eq!(result_rows[0]["correlation_id"], "corr-live");
+        assert_eq!(result_rows[0]["payload"]["state"], "succeeded");
+        assert_eq!(result_rows[0]["payload"]["in_reply_to"], "msg-live-1");
+        assert_eq!(result_rows[0]["payload"]["text"], expected_answer);
+
+        // 6. Polling again doesn't cause a duplicate result or re-execution.
+        let response = signed(
+            &client,
+            &base,
+            &device_secret,
+            &device_id,
+            6,
+            reqwest::Method::GET,
+            "/v1/remote/peer/threads/thread-live",
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let repeated: serde_json::Value = response.json().await.expect("repeated thread");
+        let repeated_results = repeated["messages"].as_array().expect("result list")
+            .iter().filter(|row| row["direction"] == "outbound").count();
+        assert_eq!(repeated_results, 1, "polling must never duplicate an outbound result");
+        assert_eq!(runs.submitted.lock().unwrap().len(), 1);
+
+        // 7. An unsigned request reaches nothing, over the same socket that
         //    just answered four signed ones.
         let bare = client
             .get(format!("{base}/v1/remote/peer/threads/thread-live"))
@@ -439,5 +639,89 @@ fn the_whole_peer_exchange_survives_a_real_tls_socket() {
             "an unsigned request must not be admitted, got {}",
             bare.status()
         );
+
+        // 8. The same live pinned TLS connection exercises cross-node
+        // writable vector memory, operator namespace ACLs, idempotent replay,
+        // conflicting revisions, readback and semantic vector search.
+        let namespace_url = "/v1/remote/peer/memory/shared-test";
+        let vector_doc = super::peer_memory::VectorDocument {
+            id: "memory-one".into(), revision: 1, model: "test-embedding-v1".into(),
+            text: "signed vector from alice".into(), vector: vec![0.01234568_f32; 2048],
+            deleted: false,
+        };
+        let payload = serde_json::to_vec(&vector_doc).unwrap();
+        assert!(payload.len() > 16 * 1024 && payload.len() <= super::peer_memory::MAX_WIRE_DOCUMENT_BYTES,
+            "full-size 2048-dimensional embedding must exercise the signed transport limit");
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 7,
+            reqwest::Method::POST,
+            "/v1/remote/peer/memory/shared-test/records",
+            payload.clone(),
+        ).await;
+        assert_eq!(response.status(), 201);
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 8,
+            reqwest::Method::POST,
+            "/v1/remote/peer/memory/shared-test/records",
+            payload.clone(),
+        ).await;
+        assert_eq!(response.status(), 200, "same writer/revision must be idempotent");
+        let altered = super::peer_memory::VectorDocument {
+            text: "conflicting vector revision".into(), ..vector_doc.clone()
+        };
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 9,
+            reqwest::Method::POST,
+            "/v1/remote/peer/memory/shared-test/records",
+            serde_json::to_vec(&altered).unwrap(),
+        ).await;
+        assert_eq!(response.status(), 409, "identical revision cannot overwrite memory");
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 10,
+            reqwest::Method::GET, namespace_url, Vec::new(),
+        ).await;
+        assert_eq!(response.status(), 200);
+        let exported: serde_json::Value = response.json().await.expect("memory export");
+        assert_eq!(exported["records"].as_array().unwrap().len(), 0,
+            "foreign-authored memory cannot be exported as if locally authored");
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 11,
+            reqwest::Method::POST,
+            "/v1/remote/peer/memory/shared-test/search",
+            serde_json::to_vec(&serde_json::json!({
+                "model":"test-embedding-v1", "vector":vector_doc.vector.clone(), "top_k":5
+            })).unwrap(),
+        ).await;
+        assert_eq!(response.status(), 200);
+        let searched: serde_json::Value = response.json().await.expect("vector search");
+        assert_eq!(searched["matches"][0]["entry"]["id"], "memory-one");
+        assert_eq!(searched["matches"][0]["entry"]["text"], "signed vector from alice");
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 12,
+            reqwest::Method::GET, "/v1/remote/peer/memory/not-shared", Vec::new(),
+        ).await;
+        assert_eq!(response.status(), 403, "a different namespace is never implicitly granted");
+        let tombstone = super::peer_memory::VectorDocument {
+            revision: 2, deleted: true, text: String::new(), vector: Vec::new(),
+            ..vector_doc
+        };
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 13,
+            reqwest::Method::POST,
+            "/v1/remote/peer/memory/shared-test/records",
+            serde_json::to_vec(&tombstone).unwrap(),
+        ).await;
+        assert_eq!(response.status(), 201);
+        let response = signed(
+            &client, &base, &device_secret, &device_id, 14,
+            reqwest::Method::POST,
+            "/v1/remote/peer/memory/shared-test/search",
+            serde_json::to_vec(&serde_json::json!({
+                "model":"test-embedding-v1", "vector":vector_doc.vector.clone(), "top_k":5
+            })).unwrap(),
+        ).await;
+        assert_eq!(response.status(), 200);
+        let after_delete: serde_json::Value = response.json().await.expect("search after tombstone");
+        assert_eq!(after_delete["matches"].as_array().unwrap().len(),0);
     });
 }

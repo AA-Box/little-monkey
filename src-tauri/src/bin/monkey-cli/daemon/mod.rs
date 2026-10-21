@@ -39,12 +39,23 @@ pub(crate) mod peer_audit;
 #[cfg(test)]
 mod peer_e2e;
 pub(crate) mod peer_ingress;
+pub(crate) mod peer_memory;
 mod peer_live;
 pub(crate) mod peer_store;
 pub(crate) mod peer_tool;
 pub(crate) mod remote;
 mod scheduler;
 mod service;
+mod swarm_coordinator;
+mod swarm_transfer;
+mod swarm_workers;
+mod swarm_ambient;
+mod swarm_replication;
+mod swarm_quorum;
+mod swarm_recovery_witness;
+mod swarm_failover;
+mod swarm_task_retry;
+pub(crate) mod swarm_cluster;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
 pub(crate) mod telecom_tool;
@@ -110,6 +121,14 @@ pub enum DaemonCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Enter/leave durable scheduling drain without cancelling queued jobs.
+    /// Active model tasks finish normally before a cold service upgrade.
+    Drain {
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long)]
+        disable: bool,
+    },
     /// Show recent scheduling decisions: what was chosen, over what, and which
     /// measurement decided it.
     Decisions {
@@ -129,6 +148,69 @@ pub enum DaemonCmd {
     },
     /// Queue an immutable recipe snapshot for resident execution.
     Run(DaemonRunArgs),
+    /// Register a bounded, frozen DAG of existing recipes with the resident
+    /// daemon. It restarts from SQLite without replaying completed jobs.
+    SwarmSubmit { spec: PathBuf },
+    /// Inspect active and completed resident swarm graphs.
+    SwarmStatus { #[arg(long)] id: Option<String> },
+    /// Request cancellation of an entire resident swarm graph.
+    SwarmCancel { id: String },
+    /// Write an integrity-checked, portable read-only DAG recovery bundle.
+    SwarmExport { id: String, output: PathBuf },
+    /// Explicitly re-run a transferred plan-only graph with NEW job identities.
+    SwarmImportReadOnly {
+        input: PathBuf,
+        #[arg(long)]
+        new_id: String,
+        #[arg(long)]
+        workspace: PathBuf,
+        /// A source completion is never reused; every agent can run again.
+        #[arg(long, required = true)]
+        confirm_read_only_reexecution: bool,
+    },
+    /// Publish an authenticated, bounded DAG observation to a specifically enrolled peer.
+    SwarmReplicate { group: String, id: String, peer: String },
+    /// Inspect identity-bound cluster checkpoints received from other peers.
+    SwarmReplicaStatus { group: String, id: String },
+    /// Explicitly stage a plan-only immutable bundle for one higher-term automatic failover.
+    SwarmFailoverArm {
+        id: String,
+        #[arg(long)] group: String,
+        /// Explicitly enrolled outbound peer alias of the original leader.
+        #[arg(long)] source_peer: String,
+        #[arg(long)] new_id: String,
+        #[arg(long)] bundle: PathBuf,
+        #[arg(long)] workspace: PathBuf,
+        #[arg(long, required=true)] confirm_read_only_reexecution: bool,
+    },
+    /// Inspect all preauthorized one-shot failover plans and their claim states.
+    SwarmFailoverStatus,
+    /// List the 12 opt-in background worker roles.
+    SwarmWorkerCatalog,
+    /// Install a frozen, plan-only native worker using existing durable cron or filesystem triggers.
+    SwarmWorkerInstall {
+        id: String,
+        #[arg(long)] role: String,
+        #[arg(long)] source_recipe: PathBuf,
+        #[arg(long)] workspace: PathBuf,
+        #[arg(long, conflicts_with="watch")] cron: Option<String>,
+        #[arg(long, conflicts_with="cron")] watch: Option<PathBuf>,
+    },
+    /// Enroll an opt-in adaptive ambient scout over prior durable sessions.
+    SwarmAmbientInstall {
+        id: String,
+        #[arg(long)] source_recipe: PathBuf,
+        #[arg(long)] workspace: PathBuf,
+        /// Opt-in to including bounded previous task titles in LOCAL model context.
+        #[arg(long)] include_history_titles: bool,
+        /// Explicit opt-in to reversible exact-duplicate housekeeping for
+        /// agent-authored memories in this canonical workspace only.
+        #[arg(long)] garden_agent_memories: bool,
+    },
+    /// List adaptive ambient policies and next due times.
+    SwarmAmbientStatus,
+    /// Prevent future ambient dispatch; running jobs use standard cancellation.
+    SwarmAmbientDisable { id: String },
     /// Print durable events for a run; optionally follow until terminal.
     Attach {
         run_id: String,
@@ -444,6 +526,10 @@ struct DaemonStatus {
     installed: bool,
     service_running: bool,
     heartbeat_fresh: bool,
+    maintenance_drain: bool,
+    /// Only true when this isolated Linux selfdev user service has a stable,
+    /// verified published manifest that actually retains child processes.
+    live_handoff_enabled: bool,
     pid: Option<u32>,
     kill_switch: bool,
     queued: u32,
@@ -451,6 +537,12 @@ struct DaemonStatus {
     waiting_approval: u32,
     paused: u32,
     managed_run_ids: Vec<String>,
+    /// Verifiable task workers, not a promise about unstarted queue entries.
+    handoff_candidates: u32,
+    handoff_attested: u32,
+    handoff_worker_ids: Vec<String>,
+    handoff_adopted_count: u32,
+    handoff_adopted_daemon_pid: Option<u32>,
     platform: service::ServicePlatform,
     /// The K8 backpressure signal. Added to *this* payload rather than given its
     /// own command because this is already the thing every producer polls — the
@@ -494,10 +586,143 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
             manager.start(&paths)
         }
         DaemonCmd::Status { json } => status(*json),
+        DaemonCmd::Drain { enable, disable } => {
+            if *enable == *disable {
+                return Err("Choose exactly one of --enable or --disable".into());
+            }
+            let paths=DaemonPaths::resolve()?;
+            let mut store=DaemonStore::open(&paths)?;
+            store.set_meta("maintenance_drain",if *enable {"1"}else{"0"})?;
+            println!("{}",serde_json::json!({"maintenance_drain":enable}));
+            Ok(())
+        },
         DaemonCmd::Decisions { limit, json } => decisions(*limit, *json),
         DaemonCmd::Stop => stop().await,
         DaemonCmd::Uninstall { purge_state } => uninstall(*purge_state),
         DaemonCmd::Run(args) => queue_command(cli, args),
+        DaemonCmd::SwarmSubmit { spec } => {
+            let paths = DaemonPaths::resolve()?;
+            println!("{}", swarm_coordinator::submit(&paths, spec)?);
+            Ok(())
+        }
+        DaemonCmd::SwarmStatus { id } => {
+            let paths = DaemonPaths::resolve()?;
+            println!("{}", swarm_coordinator::status(&paths, id.as_deref())?);
+            Ok(())
+        }
+        DaemonCmd::SwarmCancel { id } => {
+            let paths = DaemonPaths::resolve()?;
+            swarm_coordinator::request_cancel(&paths, id)?;
+            println!("Swarm cancellation requested: {id}");
+            Ok(())
+        },
+        DaemonCmd::SwarmExport { id, output } => {
+            let paths = DaemonPaths::resolve()?;
+            println!("{}", swarm_transfer::export(&paths, id, output)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmImportReadOnly {
+            input,new_id,workspace,confirm_read_only_reexecution
+        } => {
+            if !confirm_read_only_reexecution {
+                return Err("Explicit consent to re-run every imported plan-only agent required".into());
+            }
+            let paths = DaemonPaths::resolve()?;
+            println!("{}", swarm_transfer::import_read_only(&paths,input,new_id,workspace)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmReplicaStatus {group,id} => {
+            let paths=DaemonPaths::resolve()?;
+            let store=DaemonStore::open(&paths)?;
+            let snapshots=swarm_replication::list_local(&store,group,id)?;
+            println!("{}",serde_json::json!({"group":group,"graph":id,
+                "replicas":snapshots,"trusted_for_execution":false}));
+            Ok(())
+        },
+        DaemonCmd::SwarmReplicate {group,id,peer} => {
+            let paths=DaemonPaths::resolve()?;
+            let roster={
+                let store=DaemonStore::open(&paths)?;
+                swarm_cluster::roster(&store,group)?
+            };
+            let destination=roster.members.iter()
+                .find(|member|member.alias.as_deref()==Some(peer.as_str()))
+                .ok_or_else(||"Peer not enrolled in the local signed cluster".to_string())?;
+            let now=i64::try_from(now_ms()?).map_err(|_|"Replication time overflow")?;
+            let snapshot=swarm_replication::capture_local_leader(
+                &paths,group,id,peer,&destination.fingerprint,now
+            )?;
+            let bytes=serde_json::to_vec(&snapshot).map_err(|e|e.to_string())?;
+            let receipt=remote::signed_swarm_checkpoint(
+                &paths,peer,&destination.fingerprint,bytes,now as u64
+            ).await?;
+            if receipt["accepted"]!=true || receipt["group"]!=*group ||
+                receipt["graph_id"]!=*id || receipt["sequence"]!=snapshot.sequence {
+                return Err("Signed DAG receiver did not confirm exact checkpoint".into());
+            }
+            // A transport POST acknowledgment alone is not a durability
+            // attestation. A separate signed GET must read back the EXACT
+            // checkpoint from the receiver's SQLite replica table.
+            let readback=remote::signed_swarm_checkpoint_readback(
+                &paths,peer,&destination.fingerprint,group,id,now as u64
+            ).await?;
+            let expected=serde_json::to_value(&snapshot).map_err(|e|e.to_string())?;
+            if readback["group"]!=*group || readback["graph"]!=*id ||
+                !readback["replicas"].as_array().is_some_and(|replicas|
+                    replicas.iter().any(|entry|entry==&expected)){
+                return Err("Remote SQLite readback could not verify the exact DAG checkpoint".into());
+            }
+            println!("{}",serde_json::json!({"receipt":receipt,
+                "remote_readback_verified":true,"execution_authorized":false}));
+            Ok(())
+        },
+        DaemonCmd::SwarmFailoverArm {
+            id,group,source_peer,new_id,bundle,workspace,confirm_read_only_reexecution
+        } => {
+            if !confirm_read_only_reexecution {
+                return Err("Operator must explicitly consent to unattended re-execution of read-only model tasks".into());
+            }
+            let paths=DaemonPaths::resolve()?;
+            let now=i64::try_from(now_ms()?).map_err(|_|"Failover clock overflow")?;
+            println!("{}",swarm_failover::arm(&paths,id,group,source_peer,new_id,bundle,workspace,now)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmFailoverStatus => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_failover::status(&paths)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmWorkerCatalog => {
+            println!("{}", swarm_workers::catalog());
+            Ok(())
+        },
+        DaemonCmd::SwarmWorkerInstall {
+            id,role,source_recipe,workspace,cron,watch,
+        } => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_workers::install(&paths,id,role,source_recipe,workspace,
+                cron.as_deref(),watch.as_deref())?);
+            Ok(())
+        },
+        DaemonCmd::SwarmAmbientInstall {
+            id,source_recipe,workspace,include_history_titles,garden_agent_memories,
+        } => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_ambient::install(&paths,id,source_recipe,workspace,
+                *include_history_titles,*garden_agent_memories)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmAmbientStatus => {
+            let paths=DaemonPaths::resolve()?;
+            println!("{}",swarm_ambient::status(&paths)?);
+            Ok(())
+        },
+        DaemonCmd::SwarmAmbientDisable { id } => {
+            let paths=DaemonPaths::resolve()?;
+            swarm_ambient::disable(&paths,id)?;
+            println!("Ambient policy disabled: {id}");
+            Ok(())
+        },
         DaemonCmd::Attach {
             run_id,
             follow,
@@ -542,6 +767,21 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
     };
     let mut store = DaemonStore::open(&paths)?;
     store.set_meta("stop_requested", "0")?;
+    #[cfg(target_os="linux")]
+    if little_monkey_lib::app_paths::agent_config_roots()?.profile_id.starts_with("selfdev-")
+       && std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1") {
+        // Persistent opt-in is profile-local; later status/ensure/rollback
+        // must render the SAME systemd unit even without an env override.
+        let marker=paths.root.join(".selfdev-live-handoff");
+        if let Ok(meta)=std::fs::symlink_metadata(&marker){
+            if meta.file_type().is_symlink()||!meta.is_file(){
+                return Err("Refusing non-regular live handoff enrollment marker".into());
+            }
+        }
+        std::fs::write(&marker,b"selfdev-live-handoff-v1\n")
+           .map_err(|e|format!("Failed to persist selfdev live enrollment: {e}"))?;
+        store::restrict_file(&marker)?;
+    }
     let manifest = manager.install(&paths, &config)?;
     println!(
         "Installed {} user service at {}",
@@ -680,6 +920,11 @@ fn status(json: bool) -> Result<(), String> {
     let mut heartbeat = None;
     let mut pid = None;
     let mut managed_run_ids = Vec::new();
+    let mut handoff_candidates = 0u32;
+    let mut handoff_attested = 0u32;
+    let mut handoff_worker_ids = Vec::new();
+    let mut handoff_adopted_count = 0u32;
+    let mut handoff_adopted_daemon_pid = None;
     let mut held = 0;
     let mut nonterminal = 0;
     // The installed config when there is one, defaults otherwise: an uninstalled
@@ -698,6 +943,18 @@ fn status(json: bool) -> Result<(), String> {
             .get_meta("pid")?
             .and_then(|value| value.parse::<u32>().ok());
         managed_run_ids = store.managed_run_ids(512)?;
+        handoff_adopted_count = store.get_meta("last_live_handoff_adopted_count")?
+           .and_then(|v|v.parse::<u32>().ok()).unwrap_or(0);
+        handoff_adopted_daemon_pid = store.get_meta("last_live_handoff_daemon_pid")?
+           .and_then(|v|v.parse::<u32>().ok());
+        #[cfg(target_os="linux")]
+        for job in store.active_jobs()? {
+            handoff_candidates += 1;
+            if let Some((pid,start))=engine::attested_worker(&paths,&job)? {
+                handoff_attested+=1;
+                handoff_worker_ids.push(format!("{}:{pid}:{start}",job.job_id));
+            }
+        }
         for job in store.nonterminal_jobs()? {
             match job.state {
                 JobState::Preparing | JobState::Queued => queued += 1,
@@ -714,6 +971,14 @@ fn status(json: bool) -> Result<(), String> {
         installed,
         service_running,
         heartbeat_fresh: heartbeat.is_some_and(|value| now.saturating_sub(value) < 5_000),
+        maintenance_drain:paths.state_db.is_file() &&
+            DaemonStore::open(&paths)?.get_meta("maintenance_drain")?.as_deref()==Some("1"),
+        live_handoff_enabled:cfg!(target_os="linux")
+           && manager.platform()==service::ServicePlatform::SystemdUser
+           && little_monkey_lib::app_paths::agent_config_roots()?.profile_id.starts_with("selfdev-")
+           && std::fs::read_to_string(paths.root.join(".selfdev-live-handoff"))
+               .as_deref().is_ok_and(|m|m=="selfdev-live-handoff-v1\n")
+           && manager.manifest_is_current(&paths)?,
         pid,
         kill_switch,
         queued,
@@ -721,6 +986,11 @@ fn status(json: bool) -> Result<(), String> {
         waiting_approval,
         paused,
         managed_run_ids,
+        handoff_candidates,
+        handoff_attested,
+        handoff_worker_ids,
+        handoff_adopted_count,
+        handoff_adopted_daemon_pid,
         platform: manager.platform(),
         backpressure: scheduler::backpressure(
             kill_switch,
@@ -3099,7 +3369,9 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         SystemClock,
         owner_id,
     )
-    .with_profile_limits(profile_limits);
+    .with_profile_limits(profile_limits)
+    .with_live_handoff(roots.profile_id.starts_with("selfdev-") &&
+       std::env::var("LITTLE_MONKEY_DAEMON_LIVE_HANDOFF").as_deref()==Ok("1"));
     engine.recover()?;
     reap_dead_workflow_hosts(&engine.shared);
     // One machine-wide desktop-control runtime, shared with the remote API so
@@ -3122,6 +3394,17 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     // transition raises its notification whichever code path caused it — the
     // scheduler, a reporting child, or the crash reconciler.
     remote::watch::spawn(paths.clone());
+    // Opt-in paired vector-memory replication runs independently of queue
+    // scheduling. A slow or offline peer cannot stall this daemon's jobs.
+    peer_memory::spawn_sync_worker(paths.clone());
+    swarm_cluster::spawn_lease_worker(paths.clone());
+    // Only a CURRENT signed majority leader publishes its local read-only
+    // resident DAG checkpoints to separately enrolled peer identities.
+    swarm_replication::spawn_replica_worker(paths.clone());
+    // No automatic recovery unless the destination operator separately
+    // staged and approved a frozen plan-only bundle plus local workspace.
+    // Requires a fresh prior leader checkpoint and a NEW signed majority term.
+    swarm_failover::spawn_worker(paths.clone());
     // Messaging channels. Its own task rather than a step in the loop below: a
     // long-polling provider blocks for half a minute at a time, and the queue
     // must keep ticking while it does.
@@ -3183,6 +3466,19 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
                 .await
         {
             eprintln!("Persistent trigger delivery paused: {error}");
+        }
+        // The resident DAG coordinator uses ordinary immutable recipe jobs;
+        // when this OS service restarts, its graph/node states remain in the
+        // daemon SQLite database and only unsubmitted ready tasks are queued.
+        if let Err(error) = swarm_coordinator::tick(
+            cli, &paths, &roots.ordered(), &config, &mut engine.store, &mut engine.shared,
+        ) {
+            eprintln!("Resident swarm tick paused: {error}");
+        }
+        if let Err(error) = swarm_ambient::tick(
+            cli, &paths, &roots.ordered(), &config, &mut engine.store, &mut engine.shared,
+        ) {
+            eprintln!("Adaptive ambient tick paused: {error}");
         }
         engine.tick()?;
         // Enforce cross-process desktop-control stops: an engaged kill switch,

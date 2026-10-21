@@ -1,0 +1,56 @@
+name: Live daemon handoff regression gate
+on:
+  push:
+    branches: [feature/supervised-selfdev-daemon-upgrade-20261018]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  supervisor-contract:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Fail-closed cold and live supervisor integration contracts
+        run: |
+          node --check scripts/selfdev-supervised-daemon.mjs
+          python3 -m py_compile scripts/selfdev-live-provider-stream-acceptance.py
+          node --test scripts/selfdev-transaction.contract.test.mjs scripts/selfdev-supervised-daemon.contract.test.mjs
+  native-handoff:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+      - name: Native Linux SDKs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri
+          key: live-handoff-native-linux
+      - run: pnpm install --frozen-lockfile
+      - name: Stage required Tauri sidecar for Rust build scripts
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+      - name: Original worker PID, durable model events, lease transfer, and boot-ID tests
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli real_os_worker_is_reattached_with_same_pid_and_live_lease_after_daemon_replacement -- --nocapture
+      - name: Opt-in systemd unit cannot leak to ordinary profiles
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli linux_live_handoff_systemd_manifest_is_stable_from_durable_opt_in -- --nocapture

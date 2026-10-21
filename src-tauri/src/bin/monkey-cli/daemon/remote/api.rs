@@ -7,12 +7,12 @@ use little_monkey_lib::artifact_store::ArtifactStore;
 use little_monkey_lib::migration::{
     admit, MigrationVerdict, TargetNode, MAX_MIGRATION_PAYLOAD_BYTES,
 };
-use little_monkey_lib::run_ledger::{RunLedger, StoredApproval, StoredRun};
+use little_monkey_lib::run_ledger::{ChainVerification, RunLedger, StoredApproval, StoredRun};
 use little_monkey_lib::run_protocol::{
     ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RunEvent,
     RunEventEnvelope, RUN_PROTOCOL_SCHEMA_VERSION,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::daemon::ledger::SharedLedger;
 use crate::daemon::store::{DaemonPaths, DaemonStore};
@@ -1008,11 +1008,46 @@ impl RemoteApi {
                 require_any_peer_capability(device)
                     .and_then(|_| self.peer_thread_get(device, thread_id, now_ms))
             }
+            // Cancellation is not generic run control. Only the signed peer
+            // that submitted a granted task may cancel that exact message.
+            ("POST", ["v1", "remote", "peer", "threads", thread_id, "cancel"]) => {
+                require_capability(device, DeviceCapability::PeerTaskRequest)
+                    .and_then(|_| self.peer_cancel_task(device, thread_id, &request.body, now_ms))
+            }
+            ("POST", ["v1", "remote", "peer", "swarm-election", "vote"]) => {
+                require_capability(device, DeviceCapability::PeerTaskRequest)
+                    .and_then(|_| self.peer_swarm_vote(device, &request.body, now_ms))
+            },
+            // Replicated DAG checkpoints are observations, never remote job
+            // submissions. Existing authenticated peer task grant plus
+            // separate immutable local cluster membership are both checked.
+            ("POST", ["v1", "remote", "peer", "swarm-state", "checkpoints"]) => {
+                require_capability(device, DeviceCapability::PeerTaskRequest)
+                    .and_then(|_| self.peer_swarm_replica_ingest(device, &request.body, now_ms))
+            }
+            ("GET", ["v1", "remote", "peer", "swarm-state", group, graph]) => {
+                require_capability(device, DeviceCapability::PeerTaskRequest)
+                    .and_then(|_| self.peer_swarm_replica_list(device, group, graph))
+            },
             ("POST", ["v1", "remote", "peer", "hello"]) => require_any_peer_capability(device)
                 .and_then(|_| self.peer_hello_post(device, &request.body, now_ms)),
             ("POST", ["v1", "remote", "peer", "artifacts"]) => {
                 require_capability(device, DeviceCapability::PeerArtifact)
                     .and_then(|_| self.peer_artifact_post(device, &request.body, now_ms))
+            }
+            // Vector memory requires two gates: an explicit per-peer capability
+            // and a separate local operator ACL for this exact namespace.
+            ("GET", ["v1", "remote", "peer", "memory", namespace]) => {
+                require_capability(device, DeviceCapability::PeerMemoryRead)
+                    .and_then(|_| self.peer_memory_export(device, namespace))
+            }
+            ("POST", ["v1", "remote", "peer", "memory", namespace, "records"]) => {
+                require_capability(device, DeviceCapability::PeerMemoryWrite)
+                    .and_then(|_| self.peer_memory_write(device, namespace, &request.body))
+            }
+            ("POST", ["v1", "remote", "peer", "memory", namespace, "search"]) => {
+                require_capability(device, DeviceCapability::PeerMemoryRead)
+                    .and_then(|_| self.peer_memory_search(device, namespace, &request.body))
             }
             // Self-revocation needs no extra capability: a device may always
             // sever itself. The store path force-stops any live desktop
@@ -3830,6 +3865,67 @@ impl RemoteApi {
         }
     }
 
+    /// Request cancellation of the exact peer task this signed device
+    /// originally submitted. A request only marks the receiver-owned daemon
+    /// job; the reply never claims the worker already stopped.
+    fn peer_cancel_task(
+        &self,
+        device: &DeviceRecord,
+        thread_id: &str,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PeerCancelBody {
+            message_id: String,
+        }
+        if body.len() > 512 {
+            return Err((413, "Peer cancellation request too large".into()));
+        }
+        let request: PeerCancelBody = serde_json::from_slice(body)
+            .map_err(|_| (400, "Invalid peer cancellation request".to_string()))?;
+        let valid = |id: &str| {
+            !id.is_empty() && id.len() <= little_monkey_lib::peers::MAX_ID_LEN &&
+            id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        };
+        if !valid(thread_id) || !valid(&request.message_id) {
+            return Err((400, "Malformed peer task identifier".into()));
+        }
+        let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
+        let Some(job_id) = store
+            .peer_owned_task_job(&device.device_id, thread_id, &request.message_id)
+            .map_err(internal)? else {
+                // Do not distinguish an unknown task from another peer's task.
+                return Err((404, "Unknown task in this pairing's thread".into()));
+            };
+        let Some(job) = store.get_job(&job_id).map_err(internal)? else {
+            return Err((409, "Peer task was accepted but is not yet available for cancellation".into()));
+        };
+        if job.state.is_terminal() {
+            return Ok((200, serde_json::json!({"status":"already_terminal"}), Some(thread_id_target(thread_id))));
+        }
+        if job.cancel_requested {
+            return Ok((200, serde_json::json!({"status":"cancellation_already_requested"}), Some(thread_id_target(thread_id))));
+        }
+        store.request_cancel(&job_id, now_ms).map_err(internal)?;
+        // Queued jobs have no ledger run yet: the durable cancel flag is
+        // authoritative and the worker will honour it before starting.
+        // Never fake a run id from the job id just to emit a ledger event.
+        let ledger_warning = job.run_id.as_deref().and_then(|run_id| {
+            super::super::append_cancellation(
+                &self.paths,
+                run_id,
+                "Cancelled by the paired peer that submitted this task",
+            ).err()
+        });
+        Ok((202, serde_json::json!({
+            "status":"cancellation_requested",
+            "message_id":request.message_id,
+            "ledger_warning":ledger_warning.map(|_| "Cancellation is durable but ledger event could not be appended"),
+        }), Some(thread_id_target(thread_id))))
+    }
+
     /// One peer introducing itself, and learning what it may actually do here.
     ///
     /// The only route on this plane that changes nothing durable about
@@ -3871,6 +3967,115 @@ impl RemoteApi {
             serde_json::to_value(&response).map_err(internal)?,
             Some(format!("peer:{}", device.device_id)),
         ))
+    }
+
+    /// Explicit namespace authorization is never inherited from peer standing
+    /// or another namespace. This is enforced at every read/write boundary,
+    /// independently of the signed request's capability gate.
+    fn peer_swarm_vote(
+        &self, device: &DeviceRecord, body: &[u8], now_ms: u64,
+    ) -> Result<(u16,serde_json::Value,Option<String>),(u16,String)> {
+        if body.len()>2_048 {return Err((413,"Election request exceeds 2 KiB".into()));}
+        let request:crate::daemon::swarm_cluster::VoteRequest=
+            serde_json::from_slice(body).map_err(|_|(400,"Malformed cluster vote".into()))?;
+        let mut store=DaemonStore::open(&self.paths).map_err(internal)?;
+        if store.kill_switch().map_err(internal)? {
+            return Err((409,"Global kill switch prevents new election votes".into()));
+        }
+        let now=i64::try_from(now_ms).map_err(|_|(400,"Election clock overflow".into()))?;
+        let receipt=crate::daemon::swarm_cluster::vote(
+            &mut store,&request,&device.device_id,now
+        ).map_err(|error|(409,error))?;
+        Ok((200,serde_json::to_value(receipt).map_err(internal)?,
+            Some(format!("swarm-election:{}",request.group))))
+    }
+
+    fn peer_swarm_replica_ingest(
+        &self,device:&DeviceRecord,body:&[u8],now_ms:u64,
+    )->Result<(u16,serde_json::Value,Option<String>),(u16,String)>{
+        if body.len()>64*1024 {
+            return Err((413,"Swarm DAG checkpoint exceeds 64 KiB".into()));
+        }
+        let cp:crate::daemon::swarm_replication::ReplicaSnapshot=
+            serde_json::from_slice(body).map_err(|_|(400,"Malformed DAG checkpoint".into()))?;
+        let now=i64::try_from(now_ms).map_err(|_|(400,"DAG clock overflow".into()))?;
+        let mut store=DaemonStore::open(&self.paths).map_err(internal)?;
+        let changed=crate::daemon::swarm_replication::ingest(
+            &mut store,&device.device_id,&cp,now
+        ).map_err(|error|(409,error))?;
+        Ok((200,serde_json::json!({
+            "accepted":true,"changed":changed,"group":cp.group,
+            "graph_id":cp.graph_id,"sequence":cp.sequence,
+        }),Some(format!("swarm-replica:{}",cp.group))))
+    }
+    fn peer_swarm_replica_list(
+        &self,device:&DeviceRecord,group:&str,graph:&str,
+    )->Result<(u16,serde_json::Value,Option<String>),(u16,String)>{
+        let store=DaemonStore::open(&self.paths).map_err(internal)?;
+        let replicas=crate::daemon::swarm_replication::list_for_member(
+            &store,&device.device_id,group,graph
+        ).map_err(|error|(403,error))?;
+        Ok((200,serde_json::json!({"group":group,"graph":graph,"replicas":replicas}),
+            Some(format!("swarm-replica:{group}"))))
+    }
+
+    fn peer_memory_gate(
+        &self, device: &DeviceRecord, namespace: &str, write: bool,
+    ) -> Result<DaemonStore,(u16,String)> {
+        let store = DaemonStore::open(&self.paths).map_err(internal)?;
+        if !crate::daemon::peer_memory::authorized(&store,&device.device_id,namespace,write)
+            .map_err(internal)? {
+            return Err((403,"Memory namespace is not shared with this paired device".into()));
+        }
+        if store.kill_switch().map_err(internal)? && write {
+            return Err((409,"Global kill switch is engaged".into()));
+        }
+        Ok(store)
+    }
+
+    fn peer_memory_export(
+        &self,device:&DeviceRecord,namespace:&str,
+    ) -> Result<(u16,serde_json::Value,Option<String>),(u16,String)> {
+        let store=self.peer_memory_gate(device,namespace,false)?;
+        // Only this installation's own documents are exported. A peer may not
+        // impersonate a third writer by propagating someone else's signed data.
+        let records=crate::daemon::peer_memory::list(&store,namespace,true).map_err(internal)?;
+        Ok((200,serde_json::json!({"namespace":namespace,"records":records.iter()
+            .map(|entry|&entry.document).collect::<Vec<_>>()}),
+            Some(format!("memory:{namespace}"))))
+    }
+
+    fn peer_memory_write(
+        &self,device:&DeviceRecord,namespace:&str,body:&[u8],
+    ) -> Result<(u16,serde_json::Value,Option<String>),(u16,String)> {
+        if body.len()>crate::daemon::peer_memory::MAX_WIRE_DOCUMENT_BYTES { return Err((413,"Vector record exceeds 64 KiB".into())); }
+        let document:crate::daemon::peer_memory::VectorDocument=serde_json::from_slice(body)
+            .map_err(|_|(400,"Invalid vector memory document".to_string()))?;
+        let mut store=self.peer_memory_gate(device,namespace,true)?;
+        let changed=crate::daemon::peer_memory::put(
+            &mut store,namespace,&device.device_id,&document,
+        ).map_err(|error|(409,error))?;
+        Ok((if changed {201} else {200},serde_json::json!({
+            "accepted":true,"updated":changed,"id":document.id,"revision":document.revision,
+        }),Some(format!("memory:{namespace}"))))
+    }
+
+    fn peer_memory_search(
+        &self,device:&DeviceRecord,namespace:&str,body:&[u8],
+    ) -> Result<(u16,serde_json::Value,Option<String>),(u16,String)> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Query { model:String,vector:Vec<f32>,top_k:usize }
+        if body.len()>crate::daemon::peer_memory::MAX_WIRE_DOCUMENT_BYTES {return Err((413,"Vector query exceeds 64 KiB".into()));}
+        let query:Query=serde_json::from_slice(body)
+            .map_err(|_|(400,"Invalid vector search request".to_string()))?;
+        let store=self.peer_memory_gate(device,namespace,false)?;
+        let results=crate::daemon::peer_memory::search(
+            &store,namespace,&query.model,&query.vector,query.top_k,
+        ).map_err(|error|(400,error))?;
+        Ok((200,serde_json::json!({"namespace":namespace,"matches":results.iter()
+            .map(|(score,entry)|serde_json::json!({"score":score,"entry":entry})).collect::<Vec<_>>() }),
+            Some(format!("memory:{namespace}"))))
     }
 
     /// Take the bytes behind an artifact a peer is about to reference.
@@ -4042,6 +4247,11 @@ impl RemoteApi {
             let Some(outcome) = terminal_outcome(&events) else {
                 continue; // Still running.
             };
+            // The peer may receive redacted metering from a canonical
+            // hash-chain-verified run. A status-only reply is never treated
+            // as token evidence; the source report remains non-authoritative
+            // for answer correctness and external billing.
+            let metering=verified_peer_task_metering(&ledger,run_id);
             store
                 .record_peer_result(
                     &thread.thread_id,
@@ -4054,6 +4264,7 @@ impl RemoteApi {
                         "in_reply_to": message.message_id,
                         "state": outcome.state,
                         "text": outcome.text,
+                        "model_metering": metering,
                     })
                     .to_string(),
                     i64::try_from(now_ms).unwrap_or(i64::MAX),
@@ -4214,6 +4425,10 @@ impl RemoteApi {
                 ),
                 result: None,
             });
+        let model_metering=if state.terminal {
+            self.run_ledger().ok().and_then(|ledger|
+                verified_peer_task_metering(&ledger,&record.node_run_id))
+        } else {None};
         Ok((
             200,
             serde_json::to_value(little_monkey_lib::node_placement::PlacedRunStatus {
@@ -4226,6 +4441,7 @@ impl RemoteApi {
                 updated_at_ms: state.updated_at_ms,
                 last_error: state.last_error,
                 result: state.result,
+                model_metering,
             })
             .map_err(internal)?,
             Some(record.submitted_run_id),
@@ -4420,6 +4636,86 @@ struct PeerRunOutcome {
 /// the fallback, and a failure or a cancellation is reported as such rather
 /// than as an empty success. A run still going produces `None`, which is how
 /// the caller knows to leave the request waiting.
+/// A machine-independent peer task can execute any configured provider.
+ /// Report exactly the canonical terminal *metering*, not a self-asserted
+ /// model score, and only if the entire source run ledger chain verifies.
+ /// Values originate from the receiver's model runtime; this does not inspect
+ /// prompts, instructions, tool output, paths or provider credentials.
+fn verified_peer_task_metering(ledger:&RunLedger,run_id:&str)->Option<serde_json::Value>{
+    let run=ledger.load_run(run_id).ok()??;
+    if !run.status.is_terminal()||run.last_sequence==0||run.last_sequence>4000{
+        return None;
+    }
+    if !matches!(ledger.verify_run_chain(run_id).ok()?,
+        ChainVerification::Intact{
+            covered_from:Some(1),covered_through:Some(last),events_seen,..
+        } if last==run.last_sequence&&events_seen==last){return None;}
+    let mut cursor=0_u64;
+    let mut last_usage=None;
+    let mut started=None;
+    let mut ended=None;
+    let mut terminal_state=None;
+    while cursor<run.last_sequence{
+        let batch=ledger.load_events(run_id,cursor,200).ok()?;
+        if batch.is_empty(){return None;}
+        for item in batch{
+            if item.sequence!=cursor+1{return None;}
+            cursor=item.sequence;
+            match item.event {
+                RunEvent::Started{..}=>started=Some(item.occurred_at_ms),
+                RunEvent::UsageRecorded{usage}=>last_usage=Some(usage),
+                RunEvent::Completed{usage,..}=>{
+                    last_usage=Some(usage);
+                    terminal_state=Some("succeeded");
+                    ended=Some(item.occurred_at_ms);
+                },
+                RunEvent::Failed{..}=>{
+                    terminal_state=Some("failed");ended=Some(item.occurred_at_ms);
+                },
+                RunEvent::Cancelled{..}=>{
+                    terminal_state=Some("cancelled");ended=Some(item.occurred_at_ms);
+                },
+                _=>{},
+            }
+        }
+    }
+    let state=terminal_state?;
+    let expected=match run.status{
+        little_monkey_lib::run_protocol::RunStatus::Succeeded=>"succeeded",
+        little_monkey_lib::run_protocol::RunStatus::Failed=>"failed",
+        little_monkey_lib::run_protocol::RunStatus::Cancelled=>"cancelled",
+        _=>return None,
+    };
+    if state!=expected{return None;}
+    let usage=last_usage?;
+    if usage.model_calls==0 || usage.model_calls>100_000||
+       usage.input_tokens.saturating_add(usage.output_tokens)==0||
+       usage.cached_input_tokens>usage.input_tokens||
+       usage.input_tokens>100_000_000||usage.output_tokens>100_000_000{
+        return None;
+    }
+    let target_id=run.spec.target.target_id();
+    if target_id.is_empty()||target_id.len()>160||
+        !target_id.bytes().all(|b|b.is_ascii_alphanumeric()||
+            matches!(b,b'-'|b'_'|b'.'|b':'|b'/'|b'@'|b'+'|b'%')){
+        return None;
+    }
+    let duration_ms=ended?.checked_sub(started?)?;
+    if duration_ms>86_400_000{return None;}
+    Some(serde_json::json!({
+        "version":1,"source":"receiver_verified_run_ledger",
+        "run_id":run_id,"target_id":target_id,
+        "status":state,"duration_ms":duration_ms,
+        "input_tokens":usage.input_tokens,
+        "output_tokens":usage.output_tokens,
+        "cached_input_tokens":usage.cached_input_tokens,
+        "model_calls":usage.model_calls,
+        "cost_micros":usage.cost_micros,
+        "independently_quality_verified":false,
+        "provider_billing_reconciled":false,
+    }))
+}
+
 fn terminal_outcome(
     events: &[little_monkey_lib::run_protocol::RunEventEnvelope],
 ) -> Option<PeerRunOutcome> {

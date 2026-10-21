@@ -139,6 +139,7 @@ pub async fn tool_grep(
     pattern: String,
     path: Option<String>,
     workspace_root_override: Option<String>,
+    structure: Option<bool>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let regex = Regex::new(&pattern).map_err(|e| format!("Invalid regex '{}': {}", pattern, e))?;
 
@@ -192,11 +193,19 @@ pub async fn tool_grep(
 
         for (idx, line) in content.lines().enumerate() {
             if regex.is_match(line) {
-                matches.push(serde_json::json!({
+                let mut row = serde_json::json!({
                     "file": display_path,
                     "line": idx + 1,
                     "text": line,
-                }));
+                });
+                if structure.unwrap_or(false) {
+                    if let Some(hint) = crate::structural_grep::nearest_declaration(
+                        entry.path(), &content, idx + 1,
+                    ) {
+                        row["structure"] = hint;
+                    }
+                }
+                matches.push(row);
 
                 if matches.len() >= GREP_MAX_MATCHES {
                     break 'outer;
@@ -2495,8 +2504,11 @@ mod foreground_process_row {
         false
     }
 
-    /// Normal completion: the row exists, carries the pid and the effective
-    /// limits, and closes as `succeeded` with no breach.
+    /// A *live, observable* shell must preserve its kernel-verified process
+    /// identity and actual limits after completion. An instantaneous `printf`
+    /// can exit before the supervisor attaches on a loaded macOS runner;
+    /// inventing a pid/start time for that already-exited process is unsafe.
+    /// Keep the process alive long enough for an actual supervised attach.
     #[tokio::test]
     async fn a_completed_foreground_shell_is_a_row_with_its_pid_limits_and_exit() {
         if !confinement_available() {
@@ -2504,7 +2516,7 @@ mod foreground_process_row {
         }
         let harness = Harness::create();
         let capture = harness
-            .run("printf ok", ProcessLimits::default())
+            .run("sleep 2; printf ok", ProcessLimits::default())
             .await
             .expect("the command runs");
         assert!(capture.status.success());

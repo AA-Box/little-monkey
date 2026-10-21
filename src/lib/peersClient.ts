@@ -15,12 +15,16 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** What a peer may ask for. Each is granted on its own; none implies another,
  * and none of them reaches runs, approvals or the desktop. */
-export type PeerGrant = "message" | "task" | "artifact";
+export type PeerGrant = "message" | "task" | "artifact" | "memory-read" | "memory-write";
 
-export const PEER_GRANTS: { id: PeerGrant; labelKey: string; detailKey: string }[] = [
+export const PEER_GRANTS: { id: PeerGrant; labelKey: string; detailKey: string; label?: string; detail?: string }[] = [
   { id: "message", labelKey: "PeersPanel.grantMessage", detailKey: "PeersPanel.grantMessageDetail" },
   { id: "task", labelKey: "PeersPanel.grantTask", detailKey: "PeersPanel.grantTaskDetail" },
   { id: "artifact", labelKey: "PeersPanel.grantArtifact", detailKey: "PeersPanel.grantArtifactDetail" },
+  { id: "memory-read", labelKey: "PeersPanel.grantArtifact", detailKey: "PeersPanel.grantArtifactDetail",
+    label: "Vector memory · read", detail: "Only namespaces you explicitly share; never grants run or file access." },
+  { id: "memory-write", labelKey: "PeersPanel.grantArtifact", detailKey: "PeersPanel.grantArtifactDetail",
+    label: "Vector memory · write", detail: "Replicate revisions only to specifically authorized namespaces." },
 ];
 
 /** An installation paired *into* this one: it can ask, subject to its grants. */
@@ -146,6 +150,15 @@ export interface PeerOutboundMessage {
   /** `queued`, `accepted`, `duplicate`, `rejected`, `succeeded`, `failed` or `cancelled`. */
   state: string;
   result_text: string | null;
+  /** Verified original-host model usage, when available from an actual
+   * metered native run. No correctness or provider billing claim. */
+  model_metering?: {
+    version:1;source:'receiver_verified_run_ledger';run_id:string;
+    target_id:string;status:'succeeded'|'failed'|'cancelled';
+    duration_ms:number;input_tokens:number;output_tokens:number;
+    cached_input_tokens:number;model_calls:number;cost_micros:number|null;
+    independently_quality_verified:false;provider_billing_reconciled:false;
+  } | null;
   sent_at_ms: number;
   /** When this installation last asked the peer about it. */
   checked_at_ms: number | null;
@@ -157,6 +170,51 @@ export const peersOutbound = (alias: string | null = null, limit = 50) =>
 /** Ask one peer about one thread this installation opened. */
 export const peersRemoteThread = (alias: string, threadId: string) =>
   invoke<{ messages: PeerOutboundMessage[] }>("peers_remote_thread", { alias, threadId });
+
+/** Explicitly ask a paired peer to cancel a task this node originally sent.
+ * The receiver enforces sender ownership and task grant. A response means
+ * cancellation was requested, not necessarily that execution stopped. */
+export const peersCancelTask = (alias: string, threadId: string, messageId: string) =>
+  invoke<{ status: 'cancellation_requested' | 'cancellation_already_requested' | 'already_terminal'; message_id?: string }>(
+    "peers_cancel_task", { alias, threadId, messageId },
+  );
+
+/** Optional shared vector memory: both signed peer grants and the receiving
+ * node's explicit namespace ACL are required before any bytes cross nodes. */
+export interface SharedVectorDocument {
+  id: string; revision: number; model: string; text: string; vector: number[];
+  deleted?: boolean;
+}
+export const peersMemoryShare = (deviceId: string, namespace: string, read: boolean, write: boolean) =>
+  invoke<{ namespace: string; device_id: string; read: boolean; write: boolean }>(
+    "peers_memory_share", { deviceId, namespace, read, write },
+  );
+export const peersMemoryPut = (namespace: string, doc: SharedVectorDocument) =>
+  invoke<{ namespace: string; id: string; revision: number; updated: boolean }>(
+    "peers_memory_put", { namespace, ...doc, vector: doc.vector.join(','), deleted: doc.deleted ?? false },
+  );
+export const peersMemoryWatch = (alias: string, namespace: string, enabled: boolean) =>
+  invoke<{ alias: string; namespace: string; enabled: boolean }>(
+    "peers_memory_watch", { alias, namespace, enabled },
+  );
+export const peersMemorySync = (alias: string, namespace: string) =>
+  invoke<{ namespace: string; alias: string; pulled: number; pushed: number }>(
+    "peers_memory_sync", { alias, namespace },
+  );
+/** Uses the already configured Knowledge 2.0 backend for real document
+ * embeddings. This fails visibly when the selected backend is offline. */
+export const peersMemoryAddText = (namespace: string, id: string, stackId: string, text: string, revision = 1) =>
+  invoke<{ namespace: string; id: string; embedding_spec: string; updated: boolean }>(
+    "peers_memory_add_text", { namespace, id, stackId, text, revision },
+  );
+export const peersMemoryQueryText = (namespace: string, stackId: string, query: string, topK = 5) =>
+  invoke<{ namespace: string; embedding_spec: string; matches: { score: number; entry: SharedVectorDocument & { author: string } }[] }>(
+    "peers_memory_query_text", { namespace, stackId, query, topK },
+  );
+export const peersMemorySearch = (namespace: string, model: string, vector: number[], topK = 5) =>
+  invoke<{ namespace: string; matches: { score: number; entry: SharedVectorDocument & { author: string } }[] }>(
+    "peers_memory_search", { namespace, model, vector: vector.join(','), topK },
+  );
 
 /** Whether a sent message is still waiting on the far side. */
 export function isPending(message: PeerOutboundMessage): boolean {

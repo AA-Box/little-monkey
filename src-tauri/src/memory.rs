@@ -802,6 +802,420 @@ pub fn purge_expired_impl(path: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
+/// Conservative, opt-in background memory garden.
+///
+/// Only collapses EXACT duplicate, active, unpinned AGENT-created facts
+/// within the same verified canonical project. Does not guess equivalence,
+/// delete an original, change user-created facts, or touch expired memories.
+/// Instead, uses the existing reversible merged_from/merged_into ancestry.
+/// The exclusive cross-process lock makes this an atomic transaction with
+/// manual edits from desktop or another daemon.
+pub fn garden_exact_agent_duplicates_impl(path: &Path, root: &str) -> Result<usize, String> {
+    let _lock = write_lock(path)?;
+    let mut data = load_impl(path)?;
+    let now = now_rfc3339();
+    let Some(project) = data.projects.get_mut(root) else {return Ok(0)};
+    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for fact in &project.facts {
+        if fact.source != "agent" || fact.pinned || !fact.enabled ||
+           fact.retired_at.is_some() || fact.expires_at.is_some() ||
+           !fact.merged_from.is_empty() || fact.text.trim().is_empty() {
+            continue;
+        }
+        // Strict byte-for-byte equality after harmless outer whitespace
+        // trimming. Case-folding/paraphrase matching is not reliable truth.
+        groups.entry(fact.text.trim().to_owned())
+            .or_default().push(fact.id.clone());
+    }
+    let mut merged = 0usize;
+    for (text, ids) in groups.into_iter().filter(|(_, ids)| ids.len() > 1).take(8) {
+        if text.chars().count() > MAX_FACT_CHARS {continue;}
+        let id = uuid::Uuid::new_v4().to_string();
+        for fact in &mut project.facts {
+            if ids.contains(&fact.id) {
+                fact.retired_at = Some(now.clone());
+                fact.merged_into = Some(id.clone());
+            }
+        }
+        project.facts.push(Fact {
+            id, text, source: "agent".to_string(), created_at: now.clone(),
+            enabled: true, source_turn_id: None, pinned: false,
+            expires_at: None, last_used_at: None, merged_from: ids,
+            merged_into: None, retired_at: None,
+        });
+        merged += 1;
+    }
+    if merged > 0 {save_impl(path, &data)?;}
+    Ok(merged)
+}
+
+/// Deterministic second-pass curator for a narrow subset of semantically
+/// equivalent natural-language facts. Unlike model summarization this can
+/// prove equivalence syntactically; it MUST NOT infer preferences, drop
+/// negations, synthesize text, or choose which conflicting claim is true.
+///
+/// Only whitespace, ASCII sentence-final "." and Unicode letter case vary.
+/// Paths, URLs, markup, quote-laden instructions, code and control characters
+/// are ineligible for this normalization because their case can be semantic.
+fn conservative_natural_fact_key(text:&str)->Option<String>{
+    let trimmed=text.trim();
+    if trimmed.chars().count()<12 || trimmed.chars().count()>MAX_FACT_CHARS ||
+       trimmed.chars().any(|ch| ch.is_control()) ||
+       trimmed.chars().any(|ch| matches!(ch, '/' | '\\' | '`' | '@' | '=' |
+           '{' | '}' | '[' | ']' | '<' | '>' | '#' | '"' | ':')) {
+        return None;
+    }
+    let without_periods=trimmed.trim_end_matches('.');
+    if without_periods.is_empty() || without_periods.ends_with('?') || without_periods.ends_with('!') {return None;}
+    let words:Vec<String>=without_periods.split_whitespace()
+        .map(|word|word.to_lowercase()).collect();
+    if words.len()<3{return None;}
+    Some(words.join(" "))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GardenSemanticReview {
+    pub merged_groups:usize,
+    /// This is a warning, NOT a decision about which statement is true.
+    pub unresolved_contradictions:Vec<(String,String)>,
+}
+/// Compare a very narrow set of explicit language negations. A conflict is
+/// reported by stable fact IDs but NEVER automatically "resolved"; recency
+/// and model confidence cannot establish which memory is correct.
+fn contradiction_key(key:&str)->Option<(String,bool)> {
+    for (positive,negative) in [
+        ("user prefers ","user does not prefer "),
+        ("user wants ","user does not want "),
+        ("the project is ","the project is not "),
+    ] {
+        if let Some(tail)=key.strip_prefix(positive){
+            return Some((format!("{positive}{tail}"),false));
+        }
+        if let Some(tail)=key.strip_prefix(negative){
+            return Some((format!("{positive}{tail}"),true));
+        }
+    }
+    None
+}
+
+/// Atomic opt-in consolidation with soft-retired ancestry and reporting of
+/// unambiguous positive-vs-negative contradictions. Every edit is within a
+/// single workspace, agent-owned, enabled, unpinned and undoable.
+pub fn garden_conservative_semantic_review_impl(
+    path:&Path,root:&str,
+)->Result<GardenSemanticReview,String>{
+    let _guard=write_lock(path)?;
+    let mut data=load_impl(path)?;
+    let now=now_rfc3339();
+    let Some(project)=data.projects.get_mut(root) else {
+        return Ok(GardenSemanticReview{merged_groups:0,
+            unresolved_contradictions:Vec::new()});
+    };
+    let mut group:std::collections::BTreeMap<String,Vec<String>>=
+        std::collections::BTreeMap::new();
+    let mut conflicts:std::collections::BTreeMap<String,Vec<(String,bool)>>=
+        std::collections::BTreeMap::new();
+    for fact in &project.facts {
+        if fact.source!="agent"||fact.pinned||!fact.enabled||
+           fact.retired_at.is_some()||fact.expires_at.is_some(){continue;}
+        let Some(key)=conservative_natural_fact_key(&fact.text) else {continue};
+        // A previously merged summary is not eligible for ANOTHER automatic
+        // merge (ancestry must remain reversible), but it still reaches the
+        // prompt and can conflict with a separate fact.
+        if fact.merged_from.is_empty() {
+            group.entry(key.clone()).or_default().push(fact.id.clone());
+        }
+        if let Some((head,negative))=contradiction_key(&key){
+            conflicts.entry(head).or_default().push((fact.id.clone(),negative));
+        }
+    }
+    let mut unresolved=Vec::new();
+    for values in conflicts.into_values() {
+        if unresolved.len()>=20 {break;}
+        if let (Some(yes),Some(no))=(values.iter().find(|x|!x.1),
+            values.iter().find(|x|x.1)){
+            unresolved.push((yes.0.clone(),no.0.clone()));
+        }
+    }
+    let mut count=0;
+    for ids in group.into_values().filter(|ids|ids.len()>1).take(8) {
+        let original=project.facts.iter().find(|f|f.id==ids[0])
+            .ok_or("Garden source disappeared")?.text.clone();
+        let merged_id=uuid::Uuid::new_v4().to_string();
+        for fact in &mut project.facts {
+            if ids.contains(&fact.id){
+                fact.retired_at=Some(now.clone());
+                fact.merged_into=Some(merged_id.clone());
+            }
+        }
+        project.facts.push(Fact{
+            id:merged_id,text:original,source:"agent".into(),
+            created_at:now.clone(),enabled:true,source_turn_id:None,
+            pinned:false,expires_at:None,last_used_at:None,
+            merged_from:ids,merged_into:None,retired_at:None,
+        });
+        count+=1;
+    }
+    if count>0 {save_impl(path,&data)?;}
+    Ok(GardenSemanticReview{merged_groups:count,
+        unresolved_contradictions:unresolved})
+}
+
+/// Read-only review candidate. A proposal is never permission to change facts:
+/// the operator uses Memory Studio's guarded merge after reviewing evidence.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AmbientMemoryCandidate {
+    pub fact_ids: [String; 2],
+    pub source_turn_ids: [String; 2],
+    pub text_sha256: [String; 2],
+    pub token_overlap_permille: u16,
+    pub trigram_similarity_permille: u16,
+    pub requires_user_approval: bool,
+}
+
+/// Two independent, deterministic *lexical* evaluators (word overlap and
+/// character trigrams) must both agree before a candidate is even proposed.
+/// This is not model-based semantic adjudication. Proposals are in-memory,
+/// bounded, project-scoped, provenance-backed, and NEVER auto-applied.
+pub fn garden_evidence_candidates_impl(path:&Path,root:&str)
+    -> Result<Vec<AmbientMemoryCandidate>,String>{
+    use sha2::{Digest,Sha256};
+    use std::collections::BTreeSet;
+    let data=load_impl(path)?;
+    let Some(project)=data.projects.get(root) else {return Ok(vec![])};
+    let eligible:Vec<_>=project.facts.iter().filter(|fact|
+        fact.source=="agent" && fact.enabled && !fact.pinned &&
+        fact.retired_at.is_none() && fact.expires_at.is_none() &&
+        fact.merged_from.is_empty() && fact.source_turn_id.as_ref()
+            .is_some_and(|turn|!turn.trim().is_empty()) &&
+        conservative_natural_fact_key(&fact.text).is_some()
+    ).take(100).collect();
+    let mut candidates=Vec::new();
+    for (index,a) in eligible.iter().enumerate() {
+        for b in eligible.iter().skip(index+1) {
+            let ka=conservative_natural_fact_key(&a.text).unwrap_or_default();
+            let kb=conservative_natural_fact_key(&b.text).unwrap_or_default();
+            if ka==kb {continue;} // handled by proven-equality curator
+            // Explicit negation conflicts require separate manual adjudication.
+            if let (Some((head_a,neg_a)),Some((head_b,neg_b)))=
+                (contradiction_key(&ka),contradiction_key(&kb)){
+                if head_a==head_b && neg_a!=neg_b {continue;}
+            }
+            let wa:BTreeSet<_>=ka.split_whitespace().collect();
+            let wb:BTreeSet<_>=kb.split_whitespace().collect();
+            // Words asserting negation or changed truth conditions are not
+            // safe paraphrase candidates even if most other words overlap.
+            if ["not","never","no","without","except","only","always"].iter()
+                .any(|word|wa.contains(word)!=wb.contains(word)){continue;}
+            let common=wa.intersection(&wb).count();
+            let union=wa.union(&wb).count();
+            if union==0 {continue;}
+            let overlap=(1000*common/union) as u16;
+            if overlap<480 {continue;}
+            let grams=|key:&str| -> BTreeSet<String> {
+                let chars:Vec<char>=key.chars().collect();
+                chars.windows(3).map(|win|win.iter().collect::<String>()).collect()
+            };
+            let ga=grams(&ka);let gb=grams(&kb);
+            let denominator=ga.len()+gb.len();
+            if denominator==0 {continue;}
+            let score=(2000*ga.intersection(&gb).count()/denominator) as u16;
+            if score<620 {continue;}
+            let hash=|text:&str|format!("{:x}",Sha256::digest(text.as_bytes()));
+            candidates.push(AmbientMemoryCandidate{
+                fact_ids:[a.id.clone(),b.id.clone()],
+                source_turn_ids:[
+                    a.source_turn_id.clone().unwrap_or_default(),
+                    b.source_turn_id.clone().unwrap_or_default(),
+                ],
+                text_sha256:[hash(&a.text),hash(&b.text)],
+                token_overlap_permille:overlap,
+                trigram_similarity_permille:score,
+                requires_user_approval:true,
+            });
+        }
+    }
+    // Strongest agreement first with deterministic tie-breaking by fact id.
+    candidates.sort_by(|a,b|
+        (u32::from(b.token_overlap_permille)+u32::from(b.trigram_similarity_permille))
+            .cmp(&(u32::from(a.token_overlap_permille)+u32::from(a.trigram_similarity_permille)))
+            .then_with(||a.fact_ids.cmp(&b.fact_ids))
+    );
+    candidates.truncate(12);
+    Ok(candidates)
+}
+
+#[cfg(test)]
+mod semantic_garden_tests {
+    use super::*;
+    fn fact(id:&str,text:&str)->Fact{
+        Fact{id:id.into(),text:text.into(),source:"agent".into(),
+            created_at:now_rfc3339(),enabled:true,source_turn_id:None,
+            pinned:false,expires_at:None,last_used_at:None,
+            merged_from:vec![],merged_into:None,retired_at:None}
+    }
+    #[test]
+    fn review_candidates_are_scoped_evidenced_and_never_mutate_memory() {
+        let dir=std::env::temp_dir().join(format!("lm-evidence-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("memories.json");
+        let mut data=MemoriesFile::default();
+        let mut first=fact("one","The user prefers concise written explanations with examples");
+        first.source_turn_id=Some("turn-a".into());
+        let mut second=fact("two","The user prefers concise explanations with written examples");
+        second.source_turn_id=Some("turn-b".into());
+        let mut sensitive=fact("secret","The user prefers concise passwords with examples");
+        sensitive.source_turn_id=None;
+        let third=fact("other","The user prefers concise explanations with written examples");
+        data.projects.insert("/demo".into(),ProjectMemory{facts:vec![
+            first.clone(),second.clone(),sensitive,third,
+        ]});
+        save_impl(&path,&data).unwrap();
+        let before=std::fs::read(&path).unwrap();
+        let result=garden_evidence_candidates_impl(&path,"/demo").unwrap();
+        assert_eq!(result.len(),1);
+        assert_eq!(result[0].fact_ids,["one","two"]);
+        assert_eq!(result[0].source_turn_ids,["turn-a","turn-b"]);
+        assert!(result[0].requires_user_approval);
+        assert_eq!(result[0].text_sha256[0].len(),64);
+        assert!(garden_evidence_candidates_impl(&path,"/unrelated").unwrap().is_empty());
+        assert_eq!(before,std::fs::read(&path).unwrap(),"Background proposal must be read-only");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn approved_model_merge_rejects_stale_text_under_cross_process_lock() {
+        let dir=std::env::temp_dir().join(format!("lm-guarded-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("memories.json");
+        let scope="/scope/a";
+        let a=add_fact_impl(&path,scope,"User prefers brief updates","agent",None).unwrap();
+        let b=add_fact_impl(&path,scope,"User likes concise summaries","agent",None).unwrap();
+        let ids=vec![a.id.clone(),b.id.clone()];
+        let originals=vec![a.text.clone(),b.text.clone()];
+        // A separate chat corrected the first fact AFTER the human approved
+        // the model proposal. Atomic CAS rejects rather than merging old
+        // assumptions into a newly corrected source of truth.
+        update_fact_impl(&path,scope,&a.id,"User now prefers detailed reports").unwrap();
+        assert!(merge_guarded_impl(&path,scope,&ids,
+            Some("User prefers short reports"),Some(&originals)).is_err());
+        let facts=list_impl(&path,Some(scope)).unwrap();
+        assert_eq!(facts.len(),2);
+        assert!(facts.iter().all(|f|f.retired_at.is_none()));
+
+        update_fact_impl(&path,scope,&a.id,&a.text).unwrap();
+        let merged=merge_guarded_impl(&path,scope,&ids,
+            Some("User prefers concise updates"),Some(&originals)).unwrap();
+        assert_eq!(merged.merged_from,ids);
+        assert_eq!(list_impl(&path,Some(scope)).unwrap().len(),1);
+        assert_eq!(unmerge_impl(&path,scope,&merged.id).unwrap(),2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn normalized_equivalent_sentences_merge_with_reversible_provenance() {
+        let dir=std::env::temp_dir().join(format!("lm-semantic-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("memories.json");
+        let mut data=MemoriesFile::default();
+        data.projects.insert("/demo".into(),ProjectMemory{
+            facts:vec![
+                fact("a","User prefers shorter written updates."),
+                fact("b","USER   PREFERS shorter written updates"),
+                fact("c","User does not prefer shorter written updates."),
+                fact("d","Use src/Main.rs for the configuration"),
+                fact("e","Use src/main.rs for the configuration"),
+            ],
+        });
+        save_impl(&path,&data).unwrap();
+        let review=garden_conservative_semantic_review_impl(&path,"/demo").unwrap();
+        assert_eq!(review.merged_groups,1);
+        assert_eq!(review.unresolved_contradictions.len(),1);
+        let second=garden_conservative_semantic_review_impl(&path,"/demo").unwrap();
+        assert_eq!(second.merged_groups,0);
+        assert_eq!(second.unresolved_contradictions.len(),1,
+            "An outstanding contradiction must remain visible after dedupe");
+        let data=load_impl(&path).unwrap();
+        let merged=data.projects["/demo"].facts.iter().find(|f|f.merged_from.len()==2).unwrap();
+        assert_eq!(merged.merged_from,vec!["a","b"]);
+        assert!(data.projects["/demo"].facts.iter().find(|f|f.id=="c")
+            .unwrap().retired_at.is_none(),"negation must never auto-resolve");
+        assert!(data.projects["/demo"].facts.iter().find(|f|f.id=="d")
+            .unwrap().retired_at.is_none(),"case-sensitive paths may differ");
+        assert_eq!(unmerge_impl(&path,"/demo",&merged.id).unwrap(),2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ambient_exact_garden_tests {
+    use super::*;
+
+    fn fact(id: &str, text: &str, source: &str, pinned: bool) -> Fact {
+        Fact {
+            id: id.to_owned(), text: text.to_owned(), source: source.to_owned(),
+            created_at: now_rfc3339(), enabled: true, source_turn_id: None,
+            pinned, expires_at: None, last_used_at: None,
+            merged_from: Vec::new(), merged_into: None, retired_at: None,
+        }
+    }
+
+    #[test]
+    fn reversible_garden_is_scoped_agent_only_and_idempotent() {
+        let folder=std::env::temp_dir().join(format!(
+            "little-monkey-ambient-garden-{}",uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path=folder.join("memories.json");
+        let scope="/workspace/one";
+        let mut file=MemoriesFile::default();
+        let mut project=ProjectMemory::default();
+        project.facts.push(fact("a","Use Cargo test","agent",false));
+        project.facts.push(fact("b","Use Cargo test","agent",false));
+        project.facts.push(fact("pin","Use Cargo test","agent",true));
+        project.facts.push(fact("human","Use Cargo test","user",false));
+        project.facts.push(fact("different","USE cargo test","agent",false));
+        file.projects.insert(scope.to_owned(),project);
+        file.projects.insert("/workspace/another".to_owned(),ProjectMemory {
+            facts: vec![fact("third","Use Cargo test","agent",false)],
+        });
+        save_impl(&path,&file).unwrap();
+
+        assert_eq!(garden_exact_agent_duplicates_impl(&path,scope).unwrap(),1);
+        assert_eq!(garden_exact_agent_duplicates_impl(&path,scope).unwrap(),0);
+        let actual=load_impl(&path).unwrap();
+        let entries=&actual.projects[scope].facts;
+        let survivor=entries.iter().find(|f|f.merged_from.len()==2).unwrap();
+        assert_eq!(survivor.text,"Use Cargo test");
+        assert_eq!(survivor.source,"agent");
+        assert_eq!(survivor.merged_from,vec!["a","b"]);
+        assert!(entries.iter().find(|f|f.id=="a").unwrap().retired_at.is_some());
+        assert!(entries.iter().find(|f|f.id=="b").unwrap().retired_at.is_some());
+        assert!(entries.iter().find(|f|f.id=="pin").unwrap().retired_at.is_none());
+        assert!(entries.iter().find(|f|f.id=="human").unwrap().retired_at.is_none());
+        assert!(entries.iter().find(|f|f.id=="different").unwrap().retired_at.is_none());
+        assert_eq!(actual.projects["/workspace/another"].facts.len(),1);
+        assert_eq!(unmerge_impl(&path,scope,&survivor.id).unwrap(),2);
+        let restored=load_impl(&path).unwrap();
+        assert!(restored.projects[scope].facts.iter()
+            .find(|f|f.id=="a").unwrap().retired_at.is_none());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn empty_scope_and_expiring_facts_do_not_change_store() {
+        let folder=std::env::temp_dir().join(format!(
+            "little-monkey-ambient-empty-{}",uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path=folder.join("memories.json");
+        assert_eq!(garden_exact_agent_duplicates_impl(&path,"/missing").unwrap(),0);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+}
+
 /// Core merge logic behind `memory_studio_merge`: combine two or more facts
 /// in one scope into a single new fact that records its parents' ids in
 /// `merged_from`, and soft-retire the parents (`merged_into` + `retired_at`,
@@ -832,6 +1246,19 @@ pub fn merge_impl(
     root: &str,
     ids: &[String],
     text: Option<&str>,
+) -> Result<Fact, String> {
+    merge_guarded_impl(path,root,ids,text,None)
+}
+
+/// Atomic compare-and-merge: the human reviewed THESE exact agent fact texts,
+/// so a concurrent desktop/daemon edit must fail inside the same filesystem
+/// lock which applies the reversible merged_from/merged_into transaction.
+pub fn merge_guarded_impl(
+    path: &Path,
+    root: &str,
+    ids: &[String],
+    text: Option<&str>,
+    expected_old_texts: Option<&[String]>,
 ) -> Result<Fact, String> {
     let mut unique: Vec<&String> = Vec::new();
     for id in ids {
@@ -864,6 +1291,14 @@ pub fn merge_impl(
             );
         }
         parents.push(fact.clone());
+    }
+    if let Some(expected)=expected_old_texts {
+        if expected.len()!=parents.len() || parents.iter().zip(expected.iter())
+            .any(|(actual,old)|actual.text.as_str()!=old.as_str() ||
+                 actual.source!="agent" ||actual.pinned ||
+                 actual.retired_at.is_some()||!actual.enabled){
+            return Err("Memory changed since model review; no merge was applied.".into());
+        }
     }
 
     let merged_text = match text {
@@ -1558,6 +1993,87 @@ pub fn memory_add(
     )
 }
 
+/// Post-turn automatic memory, explicitly opted into in desktop settings.
+///
+/// New memories have agent provenance and the originating turn id. An automatic
+/// correction may only update an existing *agent-created*, enabled, unpinned
+/// fact in this SAME scope, and requires an exact old-text compare (optimistic
+/// concurrency). User-entered/pinned/retired facts are never overwritten.
+/// No workspace -> global scope, matching ordinary chats without a root.
+/// A caller cannot write another workspace's memories or escalate a scope.
+#[tauri::command]
+pub fn memory_auto_apply(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    text: String,
+    turn_id: String,
+    operation: String,
+    existing_id: Option<String>,
+    expected_old_text: Option<String>,
+    existing_ids: Option<Vec<String>>,
+    expected_old_texts: Option<Vec<String>>,
+    expected_workspace: Option<String>,
+) -> Result<Fact, String> {
+    if turn_id.is_empty() || turn_id.len() > 120 ||
+        !turn_id.bytes().all(|c| c.is_ascii_alphanumeric() ||
+            matches!(c, b'-' | b'_' | b'.' | b'#')) {
+        return Err("Invalid automatic-memory turn id".into());
+    }
+    let active = workspace::primary_root_canon(state.inner()).ok()
+        .map(|root| root.to_string_lossy().to_string());
+    let expected = expected_workspace
+        .map(|root| std::fs::canonicalize(&root)
+            .map(|path| path.to_string_lossy().to_string())
+            .map_err(|_| "Conversation workspace is no longer accessible".to_string()))
+        .transpose()?;
+    if expected != active {
+        return Err("Conversation workspace changed before memory capture".into());
+    }
+    let scope = active.unwrap_or_else(|| GLOBAL_SCOPE_KEY.to_string());
+    let path = memories_file_path(&app)?;
+    let _lock = state.memory_lock.lock()
+        .map_err(|_| "Memory lock poisoned".to_string())?;
+    match operation.as_str() {
+        "add" if existing_id.is_none() && expected_old_text.is_none() &&
+            existing_ids.is_none() && expected_old_texts.is_none() =>
+            add_fact_impl(&path, &scope, &text, "agent", Some(&turn_id)),
+        "merge" => {
+            let ids = existing_ids.ok_or("Missing source memory IDs")?;
+            let expected = expected_old_texts.ok_or("Missing source memory texts")?;
+            if ids.len() < 2 || ids.len() > 4 || ids.len() != expected.len() ||
+                ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len() {
+                return Err("Automatic merge needs 2–4 distinct source memories".into());
+            }
+            let store = load_impl(&path)?;
+            let facts = store.projects.get(&scope)
+                .ok_or("Automatic merge source scope not found")?;
+            for (id, old) in ids.iter().zip(expected.iter()) {
+                let fact = facts.facts.iter().find(|fact| &fact.id == id)
+                    .ok_or("Automatic merge source memory not found")?;
+                if fact.source != "agent" || fact.pinned || !fact.enabled ||
+                    fact.retired_at.is_some() || fact.text != *old {
+                    return Err("Automatic merge refused: changed, user-owned or pinned source".into());
+                }
+            }
+            merge_impl(&path, &scope, &ids, Some(&text))
+        },
+        "replace" if existing_ids.is_none() && expected_old_texts.is_none() => {
+            let id = existing_id.as_deref().ok_or("Missing old memory ID")?;
+            let expected = expected_old_text.as_deref().ok_or("Missing expected old text")?;
+            let store = load_impl(&path)?;
+            let fact = store.projects.get(&scope).and_then(|project|
+                project.facts.iter().find(|fact| fact.id == id))
+                .ok_or("Old automatic memory not found in the current scope")?;
+            if fact.source != "agent" || fact.pinned || !fact.enabled ||
+                fact.retired_at.is_some() || fact.text != expected {
+                return Err("Automatic memory correction refused: changed, user-owned or pinned fact".into());
+            }
+            update_fact_impl(&path, &scope, id, &text)
+        },
+        _ => Err("Invalid automatic memory operation".into()),
+    }
+}
+
 /// Delete a fact by id — used by the transcript's "Forget" button (see
 /// `MessageList.tsx`'s `MemoryRow`) and, in slice 4, the Settings fact list.
 /// Searches [`GLOBAL_SCOPE_KEY`] and the current primary root (whichever
@@ -1737,6 +2253,26 @@ pub fn memory_studio_merge(
         .lock()
         .map_err(|_| "Memory lock poisoned".to_string())?;
     merge_impl(&path, &studio_scope(project_root), &ids, text.as_deref())
+}
+
+/// Memory Studio's explicitly approved model review: compare the original
+/// source text inside the same cross-process lock as the actual merge.
+/// An in-flight concurrent correction invalidates approval rather than
+/// accidentally merging different statements.
+#[tauri::command]
+pub fn memory_studio_merge_guarded(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+    expected_old_texts: Vec<String>,
+    project_root: Option<String>,
+    text: String,
+) -> Result<Fact, String> {
+    let path=memories_file_path(&app)?;
+    let _lock=state.memory_lock.lock().map_err(|_|
+        "Memory lock poisoned".to_string())?;
+    merge_guarded_impl(&path,&studio_scope(project_root),
+        &ids,Some(&text),Some(&expected_old_texts))
 }
 
 /// Undo a merge: restore the originals and drop the merged memory — see

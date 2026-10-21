@@ -61,6 +61,9 @@ export interface SettingsState {
   checkpointRetention: number;
   /** Whether the `remember` tool is offered to the model this turn (see `agentLoop.ts`'s `TOOLS` filter). Default true. Turning this off is not amnesia: rules and previously-saved facts are still injected into every system prompt regardless — it only stops the agent from saving *new* facts on its own. Facts remain manually addable/editable/deletable in the Rules tab either way. */
   memoryEnabled: boolean;
+  /** Explicit opt-in for post-turn model extraction of user-provided stable
+   * facts and conservative correction of existing agent memories. */
+  autoMemoryEnabled: boolean;
   /** Whether the `web_fetch`/`web_search` tools are offered to the model this turn (see `agentLoop.ts`'s `toolsForSettings` filter). Default true — DuckDuckGo search needs no key, so web research works out of the box, and the permission prompt shown for every call is the real gate. Turning this off makes both tools invisible to the model (not merely denied), mirroring `memoryEnabled`'s "disabled = not offered" treatment of `remember`. */
   webToolsEnabled: boolean;
   /** Whether `runAgentTurnBody` auto-runs the current workspace's enabled verification commands (see `src-tauri/src/verify.rs`) after a turn that wrote files. Default false — running arbitrary configured shell automatically should be opt-in, mirroring `memoryEnabled`'s posture. This slice is report-only: results are appended as `[Verify]` notices, nothing is fed back to the model yet (that's a later slice's `verifyMaxRounds`). */
@@ -82,6 +85,9 @@ export interface SettingsState {
    * the model (not merely denied), mirroring `memoryEnabled`'s "disabled =
    * not offered" treatment of `remember`. */
   subagentsEnabled: boolean;
+  /** Opt-in local desktop peer communication only within the exact same
+   * originally selected workspace. No remote, daemon or cross-profile bus. */
+  sessionCollaborationEnabled: boolean;
   /** Whether the model can invoke an installed skill on its own initiative
    * (see `tools.ts`'s `SKILL_INVOKE_TOOL` and `agentLoop.ts`'s
    * `toolsForSettings` filter), in addition to a user explicitly typing
@@ -169,6 +175,7 @@ export interface SettingsState {
   setProcessWallBudgetEnabled: (value: boolean) => void;
   setProcessWallBudgetHours: (value: number) => void;
   setMemoryEnabled: (value: boolean) => void;
+  setAutoMemoryEnabled: (value: boolean) => void;
   setWebToolsEnabled: (value: boolean) => void;
   setVerifyEnabled: (value: boolean) => void;
   setVerifyMaxRounds: (value: number) => void;
@@ -176,6 +183,7 @@ export interface SettingsState {
   setArtifactScriptsEnabled: (value: boolean) => void;
   setArtifactAutoPreview: (value: boolean) => void;
   setSubagentsEnabled: (value: boolean) => void;
+  setSessionCollaborationEnabled: (value: boolean) => void;
   setSkillAutoInvokeEnabled: (value: boolean) => void;
   setMaxConcurrentSubagents: (value: number) => void;
   setSubagentProfileModel: (profile: 'explore' | 'code', override: SubagentModelOverride) => void;
@@ -261,6 +269,7 @@ interface PersistedShape {
   processWallBudgetEnabled: boolean;
   processWallBudgetHours: number;
   memoryEnabled: boolean;
+  autoMemoryEnabled: boolean;
   webToolsEnabled: boolean;
   verifyEnabled: boolean;
   verifyMaxRounds: number;
@@ -268,6 +277,7 @@ interface PersistedShape {
   artifactScriptsEnabled: boolean;
   artifactAutoPreview: boolean;
   subagentsEnabled: boolean;
+  sessionCollaborationEnabled: boolean;
   skillAutoInvokeEnabled: boolean;
   maxConcurrentSubagents: number;
   subagentProfileModels: Partial<Record<'explore' | 'code', SubagentModelOverride>>;
@@ -295,6 +305,7 @@ function defaults(): PersistedShape {
     processWallBudgetEnabled: true,
     processWallBudgetHours: DEFAULT_PROCESS_WALL_BUDGET_HOURS,
     memoryEnabled: true,
+    autoMemoryEnabled: false,
     webToolsEnabled: true,
     verifyEnabled: false,
     verifyMaxRounds: DEFAULT_VERIFY_MAX_ROUNDS,
@@ -302,6 +313,7 @@ function defaults(): PersistedShape {
     artifactScriptsEnabled: true,
     artifactAutoPreview: false,
     subagentsEnabled: false,
+    sessionCollaborationEnabled: false,
     skillAutoInvokeEnabled: false,
     maxConcurrentSubagents: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
     subagentProfileModels: {},
@@ -405,6 +417,7 @@ function hydrate(): PersistedShape {
           ? Math.round(parsed.processWallBudgetHours)
           : fallback.processWallBudgetHours,
       memoryEnabled: typeof parsed.memoryEnabled === "boolean" ? parsed.memoryEnabled : fallback.memoryEnabled,
+      autoMemoryEnabled: typeof parsed.autoMemoryEnabled === "boolean" ? parsed.autoMemoryEnabled : false,
       webToolsEnabled: typeof parsed.webToolsEnabled === "boolean" ? parsed.webToolsEnabled : fallback.webToolsEnabled,
       verifyEnabled: typeof parsed.verifyEnabled === "boolean" ? parsed.verifyEnabled : fallback.verifyEnabled,
       verifyMaxRounds:
@@ -420,6 +433,8 @@ function hydrate(): PersistedShape {
       artifactAutoPreview:
         typeof parsed.artifactAutoPreview === "boolean" ? parsed.artifactAutoPreview : fallback.artifactAutoPreview,
       subagentsEnabled: typeof parsed.subagentsEnabled === "boolean" ? parsed.subagentsEnabled : fallback.subagentsEnabled,
+      sessionCollaborationEnabled: typeof parsed.sessionCollaborationEnabled === "boolean"
+        ? parsed.sessionCollaborationEnabled : false,
       skillAutoInvokeEnabled:
         typeof parsed.skillAutoInvokeEnabled === "boolean" ? parsed.skillAutoInvokeEnabled : fallback.skillAutoInvokeEnabled,
       maxConcurrentSubagents:
@@ -608,6 +623,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set({ memoryEnabled: value });
     persist({ ...get() });
   },
+  setAutoMemoryEnabled: (value) => {
+    set({ autoMemoryEnabled: value });
+    persist({ ...get() });
+  },
 
   setWebToolsEnabled: (value) => {
     set({ webToolsEnabled: value });
@@ -642,6 +661,10 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
   setSubagentsEnabled: (value) => {
     set({ subagentsEnabled: value });
+    persist({ ...get() });
+  },
+  setSessionCollaborationEnabled: (value) => {
+    set({ sessionCollaborationEnabled: value });
     persist({ ...get() });
   },
 

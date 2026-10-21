@@ -4,11 +4,25 @@ import { Button } from "../ui";
 import { chooseAndParseChatExport, writeChatImport } from "../../lib/chatExportImport";
 import { useKnowledgeV2Store } from "../../store/knowledgeV2Store";
 import { errorMessage } from "../../lib/errors";
+import { chooseAndContinueHarnessSession } from "../../lib/harnessSessionContinue";
 
 export function ChatExportImportCard({ stackId }: { stackId: string }) {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [continuing,setContinuing]=useState(false);
+  const [continueStatus,setContinueStatus]=useState<string | null>(null);
+  const [continueError,setContinueError]=useState<string | null>(null);
+  const continueHarness = async () => {
+    setContinuing(true);setContinueStatus(null);setContinueError(null);
+    try {
+      const created=await chooseAndContinueHarnessSession();
+      if(created) setContinueStatus('Opened a new, saved '+created.harness+' chat with '+
+        created.messages.length+' historical messages. Tool calls are read-only history and cannot be replayed automatically.'+
+        (created.truncated?' The import was bounded/truncated.':''));
+    }catch(e){setContinueError(errorMessage(e));}
+    finally{setContinuing(false);}
+  };
   const addSource = useKnowledgeV2Store((state) => state.addSource);
   const refreshStack = useKnowledgeV2Store((state) => state.refreshStack);
   const run = async () => {
@@ -34,5 +48,17 @@ export function ChatExportImportCard({ stackId }: { stackId: string }) {
     </div>
     {status && <p className="mt-2 text-[11px] text-success">{status}</p>}
     {error && <p role="alert" className="mt-2 text-[11px] text-danger">{error}</p>}
+    <div className="mt-3 border-t border-border pt-3">
+      <p className="text-xs font-medium text-foreground">Continue from a coding-agent session</p>
+      <p className="mt-1 text-[11px] leading-4 text-muted">
+        Import a single Claude Code, Codex CLI, Pi, or OpenCode JSON/JSONL transcript into a new Little Monkey chat.
+        Historical tool calls and outputs are inert context; no prior shell commands or permissions are resumed.
+        The selected workspace and model remain under Little Monkey control.
+      </p>
+      <Button size="sm" variant="secondary" disabled={continuing}
+        onClick={() => void continueHarness()}>{continuing?'Importing…':'Import coding session'}</Button>
+      {continueStatus && <p className="mt-2 text-[11px] text-success">{continueStatus}</p>}
+      {continueError && <p role="alert" className="mt-2 text-[11px] text-danger">{continueError}</p>}
+    </div>
   </div>;
 }

@@ -1,0 +1,426 @@
+//! Bounded structural hints shared by desktop and CLI grep implementations.
+//!
+//! Rust, Python, JavaScript, TypeScript and TSX use actual syntax trees to
+//! identify declaration containment; other supported languages still use
+//! explicitly labeled conservative lexical hints.
+//! The caller retains the actual regex match and workspace permission policy.
+use regex::Regex;
+use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::OnceLock;
+
+const MAX_SCAN_BACK_LINES: usize = 250;
+const MAX_DECLARATION_CHARS: usize = 180;
+
+fn declaration_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(
+        r"^\s*(?:(?:export|default|public|private|protected|static|final|override|open|internal|pub|unsafe|async|abstract|declare|inline|suspend)\s+)*(?:(?:pub\([^)]*\))\s*)?(?:(fn|def|class|struct|enum|trait|interface|function|impl|type|mod|object|namespace|module)\s+)([\p{L}_$][\p{L}\p{N}_$]*)"
+    ).expect("valid static structural search regex"))
+}
+
+fn arrow_pattern() -> &'static Regex {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN.get_or_init(|| Regex::new(
+        r"^\s*(?:(?:export|default|public|private|protected|static|const|let|var|async)\s+)*([\p{L}_$][\p{L}\p{N}_$]*)\s*(?::[^=]+)?=\s*(?:async\s*)?(?:\([^;]*?\)|[\p{L}_$][\p{L}\p{N}_$]*)\s*=>"
+    ).expect("valid static arrow declaration regex"))
+}
+
+fn has_supported_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).unwrap_or_default(),
+        "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" |
+        "go" | "java" | "kt" | "kts" | "swift" | "c" | "cc" | "cpp" |
+        "h" | "hpp" | "cs" | "php"
+    )
+}
+
+/// Parse complete Rust source with `syn` before attributing any match to a
+/// declaration. Unlike a preceding-line guess this excludes unrelated items
+/// and selects the narrowest true AST ancestor, including methods.
+fn rust_ast_declaration(source:&str,line_number:usize)->Option<Value>{
+    use syn::spanned::Spanned;
+    use syn::visit::{self,Visit};
+    struct Finder {line:usize,choice:Option<(usize,usize,String,String)>}
+    impl Finder {
+        fn consider(&mut self,start:usize,end:usize,kind:&str,name:String){
+            if start==0 || start>self.line || end<self.line{return;}
+            let smaller=self.choice.as_ref().is_none_or(|(a,b,_,_)|
+                end.saturating_sub(start)<b.saturating_sub(*a));
+            if smaller {self.choice=Some((start,end,kind.to_string(),name));}
+        }
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_item_fn(&mut self,item:&'ast syn::ItemFn){
+            self.consider(item.sig.fn_token.span.start().line,
+                item.block.brace_token.span.close().end().line,
+                "fn",item.sig.ident.to_string());
+            visit::visit_item_fn(self,item);
+        }
+        fn visit_impl_item_fn(&mut self,item:&'ast syn::ImplItemFn){
+            self.consider(item.sig.fn_token.span.start().line,
+                item.block.brace_token.span.close().end().line,
+                "method",item.sig.ident.to_string());
+            visit::visit_impl_item_fn(self,item);
+        }
+        fn visit_trait_item_fn(&mut self,item:&'ast syn::TraitItemFn){
+            self.consider(item.sig.fn_token.span.start().line,
+                item.span().end().line,"trait_method",item.sig.ident.to_string());
+            visit::visit_trait_item_fn(self,item);
+        }
+        fn visit_item_mod(&mut self,item:&'ast syn::ItemMod){
+            if item.content.is_some() {
+                self.consider(item.mod_token.span.start().line,item.span().end().line,
+                    "mod",item.ident.to_string());
+            }
+            visit::visit_item_mod(self,item);
+        }
+        fn visit_item_impl(&mut self,item:&'ast syn::ItemImpl){
+            self.consider(item.impl_token.span.start().line,item.span().end().line,
+                "impl",format!("impl @{}",item.impl_token.span.start().line));
+            visit::visit_item_impl(self,item);
+        }
+    }
+    // Syn refuses invalid source instead of attributing a false AST region.
+    let parsed:syn::File=syn::parse_file(source).ok()?;
+    let mut finder=Finder{line:line_number,choice:None};
+    finder.visit_file(&parsed);
+    let (start,end,kind,name)=finder.choice?;
+    let declaration=source.lines().nth(start-1)?.trim();
+    Some(json!({
+        "kind":kind,"name":name,"declaration_line":start,
+        "distance":line_number-start,
+        "declaration":declaration.chars().take(MAX_DECLARATION_CHARS).collect::<String>(),
+        "confidence":"ast_containment",
+        "region":{"start_line":start,"end_line":end,"method":"syn_ast"}
+    }))
+}
+
+/// Grammar-backed AST containment for Python, JavaScript, TypeScript and TSX.
+/// The entire file must parse without errors: returning None is safer than
+/// claiming a nearby unrelated declaration on malformed source.
+fn grammar_ast_declaration(path:&Path,source:&str,line_number:usize)->Option<Value>{
+    use tree_sitter::{Parser,Point};
+    if source.len()>1_000_000||line_number==0{return None;}
+    let ext=path.extension()?.to_str()?;
+    let language=match ext {
+        "py"=>tree_sitter_python::LANGUAGE.into(),
+        "js"|"jsx"|"mjs"|"cjs"=>tree_sitter_javascript::LANGUAGE.into(),
+        "ts"=>tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "tsx"=>tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "go"=>tree_sitter_go::LANGUAGE.into(),
+        "java"=>tree_sitter_java::LANGUAGE.into(),
+        "c"|"h"=>tree_sitter_c::LANGUAGE.into(),
+        "cc"|"cpp"|"hpp"=>tree_sitter_cpp::LANGUAGE.into(),
+        "cs"=>tree_sitter_c_sharp::LANGUAGE.into(),
+        "php"=>tree_sitter_php::LANGUAGE_PHP.into(),
+        "swift"=>tree_sitter_swift::LANGUAGE.into(),
+        "kt"|"kts"=>tree_sitter_kotlin_ng::LANGUAGE.into(),
+        _=>return None,
+    };
+    let mut parser=Parser::new();
+    parser.set_language(&language).ok()?;
+    let tree=parser.parse(source,None)?;
+    if tree.root_node().has_error(){return None;}
+    let line=source.lines().nth(line_number-1)?;
+    // Tree-sitter points use byte columns (not UTF-16 code units).
+    let column=line.len()-line.trim_start().len();
+    let point=Point::new(line_number-1,column);
+    let mut node=Some(tree.root_node().named_descendant_for_point_range(point,point)?);
+    while let Some(current)=node {
+        let kind=current.kind();
+        let named=matches!(kind,
+          "function_definition"|"class_definition"|
+          "function_declaration"|"generator_function_declaration"|
+          "class_declaration"|"method_definition"|
+          "interface_declaration"|"type_alias_declaration"|"enum_declaration"|
+          "abstract_class_declaration"|"function_definition"|
+          "method_declaration"|"class_specifier"|"struct_specifier"|
+          "interface_declaration"|"type_spec"|"struct_declaration"|
+          "enum_specifier"|"namespace_definition"|
+          "protocol_declaration"|"extension_declaration"|
+          "property_declaration"|"object_declaration");
+        let is_arrow=kind=="variable_declarator" && current
+            .child_by_field_name("value")
+            .is_some_and(|value|matches!(value.kind(),
+              "arrow_function"|"function_expression"|"generator_function"));
+        if named||is_arrow {
+            let start=current.start_position().row+1;
+            let end_point=current.end_position();
+            let end=if end_point.column==0 {end_point.row}
+                else{end_point.row+1};
+            if start<=line_number && line_number<=end {
+                // C and C++ place identifiers inside nested declarators;
+                // other grammars usually expose a direct 'name' field.
+                let mut name_node=current.child_by_field_name("name");
+                if name_node.is_none(){
+                    let mut declarator=current.child_by_field_name("declarator");
+                    for _ in 0..12 {
+                        let Some(d)=declarator else{break};
+                        if matches!(d.kind(),"identifier"|"field_identifier"|
+                            "type_identifier"|"qualified_identifier"|"operator_name"){
+                            name_node=Some(d);break;
+                        }
+                        declarator=d.child_by_field_name("declarator")
+                          .or_else(||d.child_by_field_name("name"));
+                    }
+                }
+                if name_node.is_none() && matches!(ext,"kt"|"kts"){
+                    // Kotlin's grammar may nest the declared simple
+                    // identifier beneath a function/value subtree rather
+                    // than providing the standard 'name' field.
+                    let mut cursor=current.walk();
+                    for child in current.named_children(&mut cursor){
+                        if matches!(child.kind(),"simple_identifier"|"identifier"){
+                            name_node=Some(child);break;
+                        }
+                    }
+                }
+                let name=name_node
+                    .and_then(|node|node.utf8_text(source.as_bytes()).ok())?
+                    .trim();
+                if name.is_empty(){return None;}
+                let declaration=source.lines().nth(start-1)?.trim();
+                return Some(json!({
+                  "kind":if is_arrow{"arrow_function"}else{kind},
+                  "name":name,
+                  "declaration_line":start,
+                  "distance":line_number-start,
+                  "declaration":declaration.chars().take(MAX_DECLARATION_CHARS).collect::<String>(),
+                  "confidence":"ast_containment",
+                  "region":{"start_line":start,"end_line":end,"method":"tree_sitter_ast"}
+                }));
+            }
+        }
+        node=current.parent();
+    }
+    None
+}
+
+/// Conservative lexical region bounds. This is intentionally NOT an AST:
+/// indentation closes Python suites and balanced delimiters close brace
+/// languages. Strings/comments are skipped when counting braces. Unsupported
+/// or unbalanced inputs fall back to an explicitly weaker lexical hint.
+fn region_bounds(path:&Path,lines:&[&str],declaration:usize)->Option<(usize,usize)> {
+    let extension=path.extension()?.to_str()?;
+    if extension=="py" {
+        if !lines[declaration].trim_end().ends_with(':') {return None;}
+        let baseline=lines[declaration].len()-lines[declaration].trim_start().len();
+        let mut end=declaration;
+        for (index,line) in lines.iter().enumerate().skip(declaration+1) {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {continue;}
+            let indent=line.len()-line.trim_start().len();
+            if indent<=baseline {break;}
+            end=index;
+        }
+        return (end>declaration).then_some((declaration+1,end+1));
+    }
+    let mut depth=0i32;
+    let mut opened=false;
+    let mut block_comment=false;
+    let mut quote:Option<char>=None;
+    let mut escaped=false;
+    // Bound work per match; large/malformed source must not stall grep.
+    for (idx,line) in lines.iter().enumerate().skip(declaration).take(2000) {
+        let chars:Vec<char>=line.chars().collect();
+        let mut pos=0;
+        while pos<chars.len() {
+            let ch=chars[pos];
+            let next=chars.get(pos+1).copied();
+            if block_comment {
+                if ch=='*' && next==Some('/') {block_comment=false;pos+=2;} else {pos+=1;}
+                continue;
+            }
+            if let Some(delimiter)=quote {
+                if escaped {escaped=false;}
+                else if ch=='\\' {escaped=true;}
+                else if ch==delimiter {quote=None;}
+                pos+=1;
+                continue;
+            }
+            if ch=='/' && next==Some('/') {break;}
+            if ch=='/' && next==Some('*') {block_comment=true;pos+=2;continue;}
+            if matches!(ch,'"'|'\''|'\x60') {quote=Some(ch);pos+=1;continue;}
+            if ch=='{' {depth+=1;opened=true;}
+            if ch=='}' && opened {
+                depth-=1;
+                if depth==0{return Some((declaration+1,idx+1));}
+                if depth<0{return None;}
+            }
+            if !opened && ch==';' {return None;}
+            pos+=1;
+        }
+        if !opened && idx>declaration+8 {return None;}
+        // Unterminated single-quoted strings are not a reliable parse.
+        if quote==Some('\'') {return None;}
+    }
+    None
+}
+
+/// For a matching one-based line, return at most one nearby named declaration.
+/// `distance` is an honest line displacement, NOT a semantic containment claim.
+/// Unknown languages, binary data and matches without nearby declarations get
+/// no invented symbols. Call only for real regex matches from bounded grep.
+pub fn nearest_declaration(path: &Path, source: &str, line_number: usize) -> Option<Value> {
+    if !has_supported_extension(path) || line_number == 0 {
+        return None;
+    }
+    if path.extension().and_then(|e|e.to_str())==Some("rs"){
+        return rust_ast_declaration(source,line_number);
+    }
+    if matches!(path.extension().and_then(|e|e.to_str()),
+       Some("py"|"js"|"jsx"|"mjs"|"cjs"|"ts"|"tsx"|
+            "go"|"java"|"c"|"h"|"cc"|"cpp"|"hpp"|
+            "cs"|"php"|"swift"|"kt"|"kts")){
+        return grammar_ast_declaration(path,source,line_number);
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.len() < line_number || lines.len()>100_000 { return None; }
+    let first = line_number.saturating_sub(MAX_SCAN_BACK_LINES + 1);
+    for index in (first..line_number).rev() {
+        let line = lines[index];
+        if line.len() > 4096 { continue; }
+        if let Some(captures) = declaration_pattern().captures(line) {
+            let kind = captures.get(1)?.as_str();
+            let name = captures.get(2)?.as_str();
+            let region=region_bounds(path,&lines,index);
+            if region.is_some_and(|(_,end)|line_number>end) {continue;}
+            let mut result=json!({
+                "kind": kind,
+                "name": name,
+                "declaration_line": index + 1,
+                "distance": line_number - (index + 1),
+                "declaration": line.trim().chars().take(MAX_DECLARATION_CHARS).collect::<String>(),
+                "confidence": "lexical_nearest_preceding"
+            });
+            if let Some((start,end))=region {
+                result["region"]=json!({"start_line":start,"end_line":end,"method":
+                    if path.extension().and_then(|e|e.to_str())==Some("py") {
+                        "python_indentation"
+                    } else {"balanced_braces"}
+                });
+            }
+            return Some(result);
+        }
+        if matches!(path.extension().and_then(|e| e.to_str()), Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")) {
+            if let Some(captures) = arrow_pattern().captures(line) {
+                let region=region_bounds(path,&lines,index);
+                if region.is_some_and(|(_,end)|line_number>end) {continue;}
+                let mut result=json!({
+                    "kind": "arrow_function",
+                    "name": captures.get(1)?.as_str(),
+                    "declaration_line": index + 1,
+                    "distance": line_number - (index + 1),
+                    "declaration": line.trim().chars().take(MAX_DECLARATION_CHARS).collect::<String>(),
+                    "confidence": "lexical_nearest_preceding"
+                });
+                if let Some((start,end))=region {
+                    result["region"]=json!({"start_line":start,"end_line":end,"method":"balanced_braces"});
+                }
+                return Some(result);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_ast_contains_real_methods_and_rejects_nearest_unrelated_items(){
+        let code="struct A;\nimpl A {\n fn first(&self) {\n  let inside=1;\n }\n fn second(&self) {\n  let inside=2;\n }\n}\n";
+        let inside=nearest_declaration(Path::new("x.rs"),code,7).unwrap();
+        assert_eq!(inside["name"],"second");
+        assert_eq!(inside["confidence"],"ast_containment");
+        assert_eq!(inside["region"]["method"],"syn_ast");
+        assert_eq!(inside["region"]["start_line"],6);
+        assert_eq!(inside["region"]["end_line"],8);
+        let unrelated="fn only() {}\nconst NOTHING: i32 = 1;\n";
+        assert!(nearest_declaration(Path::new("x.rs"),unrelated,2).is_none());
+        assert!(nearest_declaration(Path::new("x.rs"),"fn broken( {",1).is_none());
+    }
+
+    #[test]
+    fn grammar_ast_identifies_python_nested_functions_and_excludes_unrelated_lines(){
+        let source="def outer():\n    def inner():\n        return 42\n    return inner()\n\nvalue = 10\n";
+        let inner=nearest_declaration(Path::new("file.py"),source,3).unwrap();
+        assert_eq!(inner["name"],"inner");
+        assert_eq!(inner["confidence"],"ast_containment");
+        assert_eq!(inner["region"]["method"],"tree_sitter_ast");
+        let outer=nearest_declaration(Path::new("file.py"),source,4).unwrap();
+        assert_eq!(outer["name"],"outer");
+        assert!(nearest_declaration(Path::new("file.py"),source,6).is_none());
+        assert!(nearest_declaration(Path::new("file.py"),"def broken(:\n",1).is_none());
+    }
+    #[test]
+    fn grammar_ast_covers_js_ts_tsx_and_ignores_comments_as_code(){
+        let js="function earlier(){return 1;}\nclass Box {\n method() {\n  return 2;\n }\n}\n";
+        let found=nearest_declaration(Path::new("x.js"),js,4).unwrap();
+        assert_eq!(found["name"],"method");
+        assert_eq!(found["region"]["start_line"],3);
+        let ts="type Flag = boolean;\nconst getFlag = (value: Flag): Flag => {\n return value;\n};\n";
+        assert_eq!(nearest_declaration(Path::new("x.ts"),ts,3).unwrap()["name"],"getFlag");
+        let tsx="export function View() {\n  return <span>ok</span>;\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.tsx"),tsx,2).unwrap()["name"],"View");
+        let unrelated="// function imaginary() {}\nconst count=1;\n";
+        assert!(nearest_declaration(Path::new("x.js"),unrelated,2).is_none());
+    }
+
+    #[test]
+    fn additional_grammars_provide_ast_symbol_containment(){
+        let go="package demo\nfunc add(a int,b int) int {\n return a+b\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.go"),go,3).unwrap()["name"],"add");
+        let java="class Demo {\n int add(int a,int b){\n  return a+b;\n }\n}\n";
+        assert_eq!(nearest_declaration(Path::new("Demo.java"),java,3).unwrap()["name"],"add");
+        let c="int add(int a,int b) {\n return a+b;\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.c"),c,2).unwrap()["name"],"add");
+        let cpp="int add(int a,int b) {\n return a+b;\n}\n";
+        assert_eq!(nearest_declaration(Path::new("x.cpp"),cpp,2).unwrap()["name"],"add");
+        let cs="class Demo {\n int Add(int a,int b){\n  return a+b;\n }\n}\n";
+        assert_eq!(nearest_declaration(Path::new("Demo.cs"),cs,3).unwrap()["name"],"Add");
+        let kotlin="class Demo {\n fun add(a: Int, b: Int): Int {\n  return a+b\n }\n}\n";
+        assert_eq!(nearest_declaration(Path::new("Demo.kt"),kotlin,3).unwrap()["name"],"add");
+    }
+
+    #[test]
+    fn rust_function_offset_is_grounded_in_actual_lines() {
+        let code = "use std::fmt;\npub fn parse() {\n let x = 1;\n process(x);\n}\n";
+        let v = nearest_declaration(Path::new("src/main.rs"), code, 4).unwrap();
+        assert_eq!(v["kind"], "fn");
+        assert_eq!(v["name"], "parse");
+        assert_eq!(v["declaration_line"], 2);
+        assert_eq!(v["distance"], 2);
+    }
+
+    #[test]
+    fn supports_ts_arrow_and_python_def_but_not_unrelated_markdown() {
+        let arrow = "const fetchUser = async (id) => {\n return lookup(id);\n};";
+        assert_eq!(nearest_declaration(Path::new("lib.ts"), arrow, 2).unwrap()["name"], "fetchUser");
+        assert_eq!(nearest_declaration(Path::new("pkg/m.py"), "def process(value):\n  return value", 2).unwrap()["name"], "process");
+        assert!(nearest_declaration(Path::new("README.md"), arrow, 2).is_none());
+    }
+
+    #[test]
+    fn bounded_regions_respect_python_dedent_and_rust_braces() {
+        let rust="fn earlier() {\n let here = 1;\n}\nfn later() {\n let inside = 2;\n}\n";
+        let in_later=nearest_declaration(Path::new("lib.rs"),rust,5).unwrap();
+        assert_eq!(in_later["name"],"later");
+        assert_eq!(in_later["region"]["start_line"],4);
+        assert_eq!(in_later["region"]["end_line"],6);
+        let python="def one():\n  return 1\ndef two():\n  value = 2\n  return value\n";
+        let in_two=nearest_declaration(Path::new("main.py"),python,5).unwrap();
+        assert_eq!(in_two["name"],"two");
+        assert_eq!(in_two["region"]["method"],"tree_sitter_ast");
+        assert_eq!(in_two["region"]["end_line"],5);
+    }
+
+    #[test]
+    fn no_unbounded_scan_or_fake_symbol_context() {
+        let many = format!("fn ancient() {{}}\n{}hit\n", "\n".repeat(300));
+        assert!(nearest_declaration(Path::new("lib.rs"), &many, 302).is_none());
+        assert!(nearest_declaration(Path::new("lib.rs"), "let x = 2;\n", 1).is_none());
+        assert!(nearest_declaration(Path::new("lib.rs"), "", 1).is_none());
+    }
+}
