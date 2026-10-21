@@ -9,6 +9,7 @@ const [provider, action, ...options] = process.argv.slice(2);
 const binaries = {
   codex: process.env.LITTLE_MONKEY_CODEX_BIN ?? 'codex',
   claude: process.env.LITTLE_MONKEY_CLAUDE_BIN ?? 'claude',
+  cursor: process.env.LITTLE_MONKEY_CURSOR_BIN ?? 'cursor-agent',
 };
 const messages = {
   CONSENT_REQUIRED: 'Explicit --consent required',
@@ -39,7 +40,7 @@ const option = (name) => {
 };
 
 if (!Object.hasOwn(binaries, provider) || !['status', 'login', 'run', 'open'].includes(action)) {
-  console.error('Usage: subscription-native-auth.mjs codex|claude status|login|run|open [--prompt TEXT] [--timeout-ms N] --consent');
+  console.error('Usage: subscription-native-auth.mjs codex|claude|cursor status|login|run|open [--prompt TEXT] [--timeout-ms N] --consent');
   process.exit(2);
 }
 const bin = binaries[provider];
@@ -54,6 +55,7 @@ function vendorEnvironment() {
     'CODEX_API_BASE_URL', 'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID',
     'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
     'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+    'CURSOR_API_KEY', 'CURSOR_BASE_URL', 'CURSOR_ENDPOINT',
   ]) delete env[name];
   return env;
 }
@@ -68,7 +70,8 @@ function approved() {
   if (!options.includes('--consent')) fail('CONSENT_REQUIRED');
 }
 function sessionStatus() {
-  const command = provider === 'codex' ? ['login', 'status'] : ['auth', 'status'];
+  const command = provider === 'codex' ? ['login', 'status'] :
+    provider === 'claude' ? ['auth', 'status'] : ['status'];
   const result = spawnSync(bin, command, {
     encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
     stdio: ['ignore', 'pipe', 'pipe'], env: vendorEnvironment(),
@@ -84,6 +87,17 @@ function sessionStatus() {
     if (/logged\s+in[^\r\n]*chatgpt/i.test(output)) return { authenticated: true };
     if (/api[ -]?key/i.test(output)) return { authenticated: false, code: 'API_KEY_SESSION' };
     return { authenticated: false, code: 'SESSION_UNVERIFIED' };
+  }
+  if(provider==='cursor'){
+    // The official Cursor CLI exposes browser login/status. Never read its
+    // credential files or infer a subscription from an API-key environment.
+    // Status output is human-readable and not stable; ambiguous text fails.
+    if(/api[ -]?key/i.test(output))return {authenticated:false,code:'API_KEY_SESSION'};
+    if(/unauthenticated|not authenticated|not logged in|logged out|login required/i.test(output))
+      return {authenticated:false,code:'SESSION_EXPIRED'};
+    if(/authenticated|logged in|signed in/i.test(output))
+      return {authenticated:true};
+    return {authenticated:false,code:'SESSION_UNVERIFIED'};
   }
   try {
     const status = JSON.parse(result.stdout);
@@ -204,7 +218,7 @@ try {
     fail('UNSUPPORTED_ACTION');
   } else {
     approved();
-    await runClient(action === 'open' ? [] : provider === 'codex' ? ['login'] : ['auth', 'login'],
+    await runClient(action === 'open' ? [] : provider === 'claude' ? ['auth', 'login'] : ['login'],
       { interactive: true, timeout: timeoutMs() });
     console.log(JSON.stringify({ ok: true, provider, action, usedOfficialClient: true }));
   }

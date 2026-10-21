@@ -13,7 +13,7 @@ import {
 } from "../store/sessionStore";
 
 type Obj = Record<string, unknown>;
-export type CodingFormat = "claude-code" | "codex" | "pi" | "opencode";
+export type CodingFormat = "claude-code" | "codex" | "pi" | "opencode" | "cursor";
 export interface CodingTranscript {
   format: CodingFormat;
   title: string;
@@ -158,6 +158,67 @@ function fromOpenCode(payload: Obj): CodingTranscript | null {
   }
   return finish("opencode",messages,time(obj(info.time)?.created ?? info.createdAt),str(info.title));
 }
+/**
+ * Cursor Agent CLI --print --output-format stream-json.
+ * Only the documented CLI event stream is recognized; Cursor IDE SQLite
+ * databases and unrelated third-party exports are deliberately unsupported.
+ * Terminal "result" aggregates an assistant response, not another turn.
+ */
+function fromCursor(items: Obj[]): CodingTranscript | null {
+  const init = items.find(row => row.type === "system" && row.subtype === "init" &&
+    typeof row.session_id === "string" && !!row.session_id);
+  if (!init) return null;
+  const id = str(init.session_id);
+  const messages: ChatMessage[] = [];
+  let pending = "";
+  let hasUser = false;
+  let awaitingTerminal = false;
+  let completedTurns = 0;
+  const flush = () => {
+    if (pending.trim() && hasUser) append(messages, "assistant", pending);
+    pending = "";
+  };
+  for (const row of items) {
+    // A concatenated or interleaved stream from a different session must never
+    // silently stitch an unrelated transcript into this one.
+    if (row.session_id !== id) return null;
+    if (row.type === "user") {
+      // Cursor streams end each print invocation with a success record.
+      // Incomplete earlier invocations cannot be silently imported as valid.
+      if (awaitingTerminal) return null;
+      const message = obj(row.message);
+      if (message?.role !== "user") continue;
+      const before = messages.length;
+      append(messages, "user", message.content, row.timestamp);
+      if (messages.length > before) {
+        hasUser = true;
+        awaitingTerminal = true;
+      }
+    } else if (row.type === "assistant") {
+      const message = obj(row.message);
+      if (message?.role === "assistant") {
+        // Cursor documents incremental text deltas, not cumulative snapshots.
+        pending += visibleText(message.content);
+        if (pending.length > 1_000_000) throw new Error("Cursor response exceeds text limit");
+      }
+    } else if (row.type === "result") {
+      if (!awaitingTerminal || row.subtype !== "success" || row.is_error === true) return null;
+      const aggregated = str(row.result);
+      // The terminal result is the canonical aggregate for this invocation.
+      // Replacing the pending stream prevents doubling delta and final text.
+      if (aggregated.trim()) pending = aggregated.slice(0, 1_000_000);
+      flush();
+      awaitingTerminal = false;
+      completedTurns++;
+    }
+    // Never follow tool_call args/results, model settings or login metadata.
+  }
+  if (awaitingTerminal || completedTurns === 0) return null;
+  return hasUser && messages.some(m => m.role === "assistant")
+    ? finish("cursor", messages, time(init.timestamp), "Cursor Agent session")
+    : null;
+}
+
 export function parseCodingSession(source: string): CodingTranscript | null {
   if (new TextEncoder().encode(source).length > MAX_BYTES) throw new Error("Session exceeds 32 MiB limit");
   if (!source.trim()) return null;
@@ -167,6 +228,7 @@ export function parseCodingSession(source: string): CodingTranscript | null {
     if (doc) { const imported = fromOpenCode(doc); if (imported) return imported; }
   } catch { /* try JSONL */ }
   const rows = jsonl(source);
+  if (rows.some(r=>r.type==="system" && r.subtype==="init" && r.session_id)) return fromCursor(rows);
   if (rows.some(r=>r.type==="session_meta")) return fromCodex(rows);
   if (rows.some(r=>r.type==="session" && typeof r.cwd==="string")) return fromPi(rows);
   if (rows.some(r=>(r.type==="assistant" || r.type==="user") && obj(r.message))) return fromClaude(rows);

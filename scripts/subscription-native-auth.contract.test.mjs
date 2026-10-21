@@ -19,7 +19,8 @@ writeFileSync(process.env.LM_TEST_LOG,JSON.stringify({args,pid:process.pid,
   apiKey:!!process.env.OPENAI_API_KEY,accessToken:!!process.env.CODEX_ACCESS_TOKEN,
   baseUrl:!!process.env.OPENAI_BASE_URL,org:!!process.env.OPENAI_ORG_ID,
   anthropicKey:!!process.env.ANTHROPIC_API_KEY,
-  anthropicBase:!!process.env.ANTHROPIC_BASE_URL}));
+  anthropicBase:!!process.env.ANTHROPIC_BASE_URL,
+  cursorApiKey:!!process.env.CURSOR_API_KEY}));
 if(args[0]==='login'&&args[1]==='status') {
   if(scenario==='status-hang') setInterval(()=>{},1000);
   if(scenario==='expired') {console.error('Session expired');process.exit(1)}
@@ -32,6 +33,12 @@ if(args[0]==='auth'&&args[1]==='status') {
   if(scenario==='api-key') {console.log(JSON.stringify({loggedIn:true,authMethod:'api-key'}));process.exit(0)}
   if(scenario==='unknown') {console.log('not-json');process.exit(0)}
   console.log(JSON.stringify({loggedIn:true,authMethod:'claude.ai',email:'secret@example.invalid'}));
+  process.exit(0);
+}
+if(args[0]==='status') {
+  if(scenario==='expired') {console.error('not authenticated');process.exit(1);}
+  console.log(scenario==='api-key'?'Authenticated using API key':
+    scenario==='unknown'?'unknown account state':'Authenticated via browser');
   process.exit(0);
 }
 if(args[0]==='exec') {
@@ -50,9 +57,11 @@ process.exit(0);
   chmodSync(bin, 0o700);
   const env = {
     ...process.env, LITTLE_MONKEY_CODEX_BIN: bin, LITTLE_MONKEY_CLAUDE_BIN: bin,
+    LITTLE_MONKEY_CURSOR_BIN: bin,
     LM_TEST_LOG: logfile, OPENAI_API_KEY: 'SECRET', CODEX_ACCESS_TOKEN: 'SECRET',
     OPENAI_BASE_URL: 'https://secret.invalid', OPENAI_ORG_ID: 'SECRET',
     ANTHROPIC_API_KEY: 'SECRET', ANTHROPIC_BASE_URL: 'https://secret.invalid',
+    CURSOR_API_KEY: 'SECRET',
   };
   const invoke = (provider, args, extra = {}) => spawnSync(process.execPath,
     [script, provider, ...args], { encoding: 'utf8', timeout: 20000, env: { ...env, ...extra } });
@@ -79,6 +88,12 @@ test('official session status distinguishes sign-in, billing mode, expiry, and m
       assert.equal(errorCode(mock.invoke('claude', ['status'], { LM_TEST_SCENARIO: 'expired' })), 'SESSION_EXPIRED');
       assert.equal(errorCode(mock.invoke('claude', ['status'], { LM_TEST_SCENARIO: 'api-key' })), 'API_KEY_SESSION');
       assert.equal(errorCode(mock.invoke('claude', ['status'], { LM_TEST_SCENARIO: 'unknown' })), 'SESSION_UNVERIFIED');
+      const cursor=JSON.parse(mock.invoke('cursor',['status']).stdout);
+      assert.equal(cursor.authenticated,true);
+      assert.equal(cursor.credentialsHandledBy,'vendor CLI');
+      assert.equal(errorCode(mock.invoke('cursor',['status'],{LM_TEST_SCENARIO:'api-key'})),'API_KEY_SESSION');
+      assert.equal(errorCode(mock.invoke('cursor',['status'],{LM_TEST_SCENARIO:'unknown'})),'SESSION_UNVERIFIED');
+      assert.equal(errorCode(mock.invoke('cursor',['status'],{LM_TEST_SCENARIO:'expired'})),'SESSION_EXPIRED');
     } finally { mock.cleanup(); }
   });
 
@@ -132,6 +147,14 @@ test('timeouts stop hung execution and interactive login; unsupported delegation
       assert.equal(errorCode(mock.invoke('claude', ['login', '--consent', '--timeout-ms', '150'],
         { LM_TEST_SCENARIO: 'hang' })), 'CLIENT_TIMEOUT');
       assert.equal(errorCode(mock.invoke('claude', ['run', '--prompt', 'Hello', '--consent'])), 'UNSUPPORTED_ACTION');
+      assert.equal(errorCode(mock.invoke('cursor',['run','--prompt','Modify repo','--consent'])),'UNSUPPORTED_ACTION');
+      assert.equal(errorCode(mock.invoke('cursor',['login'])),'CONSENT_REQUIRED');
+      const cursorLogin=mock.invoke('cursor',['login','--consent']);
+      assert.equal(cursorLogin.status,0,cursorLogin.stderr);
+      const recorded=JSON.parse(readFileSync(mock.logfile,'utf8'));
+      assert.deepEqual(recorded.args,['login']);
+      assert.equal(recorded.cursorApiKey,false);
+
       assert.equal(errorCode(mock.invoke('claude', ['open'])), 'CONSENT_REQUIRED');
     } finally { mock.cleanup(); }
   });

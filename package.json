@@ -28,6 +28,7 @@
     "test:selfdev:contract": "node --check scripts/selfdev-transaction.mjs && node --test scripts/selfdev-transaction.contract.test.mjs",
     "test:paired-headless:contract": "python3 -m py_compile scripts/paired-jcode-littlemonkey-live.py scripts/bench-jcode-parity.py scripts/test-bench-jcode-parity.py && python3 scripts/paired-jcode-littlemonkey.contract.test.py && python3 scripts/test-bench-jcode-parity.py",
     "test:native-auth:contract": "node --check scripts/subscription-native-auth.mjs && node --test scripts/subscription-native-auth.contract.test.mjs",
+    "test:real-agent-exports:contract": "node --check scripts/accept-real-agent-exports.mjs && node --test scripts/accept-real-agent-exports.contract.test.mjs",
     "test:semantic-memory-live:contract": "python3 -m py_compile scripts/semantic-memory-live-quality.py && python3 scripts/test-semantic-memory-live-quality.py",
     "test:swarm-models:syntax": "node --check scripts/swarm-model-benchmark.mjs",
     "test:swarm-headless:contract": "node --check scripts/swarm-headless-performance.mjs && node --test scripts/swarm-headless-performance.test.mjs scripts/lib/swarmResidentRss.test.mjs",
@@ -126,7 +127,7 @@
     "tailwindcss": "^4.3.2",
     "tauri-liquid-icon": "^1.1.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4",
+    "vite": "^7.3.7",
     "vitest": "^4.1.11"
   }
 }
