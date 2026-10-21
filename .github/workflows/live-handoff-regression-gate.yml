@@ -46,6 +46,8 @@ jobs:
           workspaces: src-tauri
           key: live-handoff-native-linux
       - run: pnpm install --frozen-lockfile
+      - name: Stage required Tauri sidecar for Rust build scripts
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
       - name: Original worker PID, durable model events, lease transfer, and boot-ID tests
         run: |
           cargo test --locked --manifest-path src-tauri/Cargo.toml --bin monkey-cli real_os_worker_is_reattached_with_same_pid_and_live_lease_after_daemon_replacement -- --nocapture
