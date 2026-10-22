@@ -219,7 +219,25 @@ export interface GenerationModel {
   fitsInMemory: boolean;
 }
 
+export type VideoJobStatus = "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled";
+export type VideoJobStage = "waiting_for_dependencies" | "rendering" | "published";
+
+export interface VideoJob {
+  id: string;
+  dependsOn: string[];
+  modelId: string;
+  prompt: string;
+  status: VideoJobStatus;
+  stage: VideoJobStage;
+  attempts: number;
+  resultEntryIds: string[];
+  error: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
 export interface GenerationEntry {
+  videoJobId?: string | null;
   entryId: string;
   artifactId: string;
   modelId: string;
@@ -589,6 +607,11 @@ export const studioClient = {
     invoke<RemoteBackend[]>("generation_remove_backend", { backendId }),
   /** Resolves to every artifact the run produced: one for a clip or an
    *  utterance, `batchCount` of them for a batch of images. */
+  videoSubmit: (request: GenerationRequest, idempotencyKey: string, dependsOn: string[] = []) =>
+    invoke<VideoJob>("generation_video_submit", { request, idempotencyKey, dependsOn }),
+  videoJobs: () => invoke<VideoJob[]>("generation_video_jobs"),
+  videoResume: (jobId: string) => invoke<VideoJob>("generation_video_resume", { jobId }),
+  videoCancel: (jobId: string) => invoke<VideoJob>("generation_video_cancel", { jobId }),
   run: (request: GenerationRequest) =>
     invoke<GenerationEntry[]>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),
