@@ -117,6 +117,7 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+pub mod oom_recovery;
 pub mod mlx_ownership;
 // Local Agent Integration Launcher (ROADMAP.md, Phase 8, item 13): generates
 // safe external-tool (Continue.dev/aider/OpenAI-SDK-compatible) config
@@ -1713,6 +1714,7 @@ pub fn run() {
             m3_commands::m3_runtime_inventory,
             m3_commands::m3_runtime_plan_model_load,
             m3_commands::m3_runtime_load_model,
+            m3_commands::m3_runtime_load_recovery_history,
             m3_commands::m3_runtime_unload_model,
             m3_commands::m3_runtime_logs,
             m3_commands::m3_runtime_metrics,

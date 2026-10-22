@@ -91,7 +91,9 @@ import { UsagePanel } from "./UsagePanel";
 import { PortabilityPanel } from "./PortabilityPanel";
 import { EcosystemPanel } from "./EcosystemPanel";
 import { ExecutableExtensionsPanel } from "./ExecutableExtensionsPanel";
-import { RuntimeHubPanel } from "./RuntimeHubPanel";
+// The Runtime Hub's many diagnostic and model-management panels are only
+// needed when that settings tab opens. Do not charge the Settings chunk.
+const RuntimeHubPanel = lazy(() => import("./RuntimeHubPanel"));
 import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
 import { PeersPanel } from "./PeersPanel";
@@ -499,7 +501,11 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "portability" && <PortabilityPanel />}
               {tab === "extensions" && <ExecutableExtensionsPanel />}
               {tab === "ecosystem" && <EcosystemPanel />}
-              {tab === "runtimehub" && <RuntimeHubPanel />}
+              {tab === "runtimehub" && (
+                <Suspense fallback={<PanelFallback />}>
+                  <RuntimeHubPanel />
+                </Suspense>
+              )}
               {tab === "browser" && <BrowserVerificationPanel />}
               {tab === "gitdelivery" && <GitDeliveryPanel />}
               {tab === "triage" && <TriagePanel />}
