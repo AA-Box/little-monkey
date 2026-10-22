@@ -167,7 +167,21 @@ export function CreatorHubPanel() {
   };
 
   const pickWorkflow = async () => { const picked = await open({ directory: false, multiple: false, filters: [{ name: "ComfyUI API workflow", extensions: ["json"] }] }); if (typeof picked === "string") setWorkflow(JSON.parse(await readTextFile(picked))); };
-  const pickMedia = async (type: "image" | "video" | "last_image" | "audio") => { const picked = await open({ directory: false, multiple: false }); if (typeof picked !== "string") return; const upload = { name: picked.split(/[/\\]/).pop() ?? `${type}.bin`, dataBase64: toBase64(await readFile(picked)) }; if (type === "image") setInputImage(upload); else if (type === "video") setInputVideo(upload); else if (type === "audio") setInputAudio(upload); else setLastFrameImage(upload); };
+  const pickMedia = async (type: "image" | "video" | "last_image" | "audio") => {
+    const picked = await open({ directory: false, multiple: false });
+    if (typeof picked !== "string") return;
+    const upload = {
+      name: picked.split(/[/\\]/).pop() ?? `${type}.bin`,
+      dataBase64: toBase64(await readFile(picked)),
+    };
+    if (type === "image") {
+      setInputImage(upload); setGalleryImageEntryId("");
+    } else if (type === "video") {
+      setInputVideo(upload); setGalleryVideoEntryId("");
+    } else if (type === "audio") {
+      setInputAudio(upload); setGalleryAudioEntryId("");
+    } else setLastFrameImage(upload);
+  };
   const runWorkflow = async () => {
     if (!workflow) return;
     setBusy("workflow");

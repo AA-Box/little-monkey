@@ -966,6 +966,16 @@ fn gallery_upload(
 
 /// Reject a missing *media* reference up front instead of handing ComfyUI a
 /// literal {{input_video}} filename and reporting an unrelated loader failure.
+fn workflow_uses_binding(value: &Value, name: &str) -> bool {
+    let marker = format!("{{{{{name}}}}}");
+    match value {
+        Value::String(text) => text.contains(&marker),
+        Value::Array(items) => items.iter().any(|item| workflow_uses_binding(item, name)),
+        Value::Object(items) => items.values().any(|item| workflow_uses_binding(item, name)),
+        _ => false,
+    }
+}
+
 fn unresolved_media_binding(value: &Value) -> Option<&'static str> {
     const NAMES: [&str; 4] = ["input_image", "last_frame_image", "input_video", "input_audio"];
     match value {
@@ -1013,7 +1023,11 @@ pub async fn studio_workflow_run(
     // separate last frame. This is a first-class Studio → FreeVideo handoff.
     if let Some(entry_id) = &request.gallery_video_entry_id {
         let (upload, bytes, mime) = gallery_upload(&app, entry_id, &["video/mp4", "video/webm"])?;
-        let final_png = if request.last_frame_image.is_none() {
+        // Some FreeVideo and video-extension graphs take the clip directly
+        // without a separate last-frame loader. Don't require a decoder or
+        // do extra work unless the imported graph actually uses that slot.
+        let needs_last = workflow_uses_binding(&request.workflow, "last_frame_image");
+        let final_png = if request.last_frame_image.is_none() && needs_last {
             Some(crate::studio_video_jobs::extract_final_frame(&app, &bytes, &mime).await?)
         } else { None };
         values.insert("input_video".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
@@ -1225,6 +1239,8 @@ mod gallery_binding_tests {
     fn required_media_workflow_placeholders_must_be_bound() {
         let mut workflow = serde_json::json!({"inputs":{"video":"{{input_video}}","other": ["{{last_frame_image}}"]}});
         assert_eq!(super::unresolved_media_binding(&workflow), Some("input_video"));
+        assert!(super::workflow_uses_binding(&workflow, "last_frame_image"));
+        assert!(!super::workflow_uses_binding(&workflow, "input_audio"));
         let mut data = std::collections::BTreeMap::new();
         data.insert("input_video".to_string(), serde_json::json!("source.mp4"));
         data.insert("last_frame_image".to_string(), serde_json::json!("last.png"));
