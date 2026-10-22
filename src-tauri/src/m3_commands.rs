@@ -1810,12 +1810,12 @@ pub async fn m3_component_activate_version(
 // Runtime Telemetry and Memory Trace Viewer
 // -------------------------------------------------------------------------
 
-/// Records a per-load trace. The caller (the Runtime Hub's load flow)
-/// already measured `startedAtMs`/`readyAtMs` around its own
-/// `m3_runtime_load_model` call and already computed an offload plan via
-/// `m3_offload_plan` before loading — this only stores what the caller
-/// already has, applying redaction to `errorMessage` before it is ever held
-/// in memory.
+/// Records a per-load trace. The desktop caller measures start/end timestamps
+/// and uses the effective offload plan returned *after* successful loading by
+/// `m3_runtime_load_model`. A separate preview via `m3_offload_plan` or
+/// `m3_runtime_plan_model_load` must not be recorded as execution evidence.
+/// This only stores the caller-supplied evidence, redacting error text before
+/// it is ever retained in memory.
 #[tauri::command]
 pub fn m3_telemetry_record_load(
     state: tauri::State<'_, M3CommandState>,
