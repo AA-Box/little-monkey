@@ -168,6 +168,7 @@ beforeEach(() => {
     busy: {},
     errors: {},
     activeOperations: {},
+    offloadPlans: {},
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
