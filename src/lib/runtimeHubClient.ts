@@ -587,10 +587,21 @@ export interface BenchmarkReport {
   unavailable: BenchmarkFieldNote[];
 }
 
+/** Captured on the Rust side while the measured stream was executing. */
+export interface BenchmarkEvidence {
+  workloadSha256: string;
+  modelDigest: string | null;
+  modelSizeBytes: number;
+  runtimeProcessId: number | null;
+  configuredSettingsSha256: string;
+  completedMeasuredRepeats: number;
+}
+
 /** Mirrors the Rust `M3BenchmarkResponse`. */
 export interface BenchmarkRunResponse {
   report: BenchmarkReport;
   hardware: HardwareSnapshot;
+  evidence: BenchmarkEvidence;
 }
 
 /** Mirrors `benchmark::MachineIdentity` — the stable parts a stored report is valid for. */
@@ -616,6 +627,8 @@ export interface BenchmarkHistoryEntry {
   report: BenchmarkReport;
   machine: BenchmarkMachineIdentity;
   measuredAtMs: number;
+  /** Legacy history lacks this field and is never labelled verified. */
+  evidence: BenchmarkEvidence | null;
   freshness: BenchmarkFreshness;
 }
 

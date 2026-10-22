@@ -118,13 +118,21 @@ impl TimingSink {
             }
         };
 
+        // A partial stream can emit text without ever completing. Those
+        // tokens really arrived, but its apparent timing must not be folded
+        // into a successful benchmark or persisted as verified evidence.
+        let error = self.error.or_else(|| {
+            self.usage.is_none().then(|| {
+                "the stream ended without a ResponseCompleted event".to_string()
+            })
+        });
         SampleTimings {
             total_ms: elapsed_ms(self.started_at, ended_at),
             time_to_first_token_ms,
             decode_ms,
             input_tokens,
             output_tokens,
-            error: self.error,
+            error,
             unavailable,
         }
     }
@@ -645,6 +653,20 @@ pub fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_stream_with_text_does_not_count_as_success() {
+        let mut sink = TimingSink::started_now();
+        sink.emit(CanonicalStreamEvent::TextDelta {
+            index: 0,
+            text: "partial".to_string(),
+        })
+        .unwrap();
+        let sample = sink.finish();
+        assert!(sample.error.as_deref().unwrap().contains("ResponseCompleted"));
+        assert!(!sample.is_usable());
+        assert!(sample.time_to_first_token_ms.is_some());
+    }
 
     fn delta(text: &str) -> CanonicalStreamEvent {
         CanonicalStreamEvent::TextDelta {
