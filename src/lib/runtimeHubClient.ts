@@ -1011,12 +1011,30 @@ export interface M3LoadModelRequest {
 }
 
 /** Returned by the real load command after the backend accepted these settings. */
+export type M3LoadAttemptOutcome = "success" | "out_of_memory" | "other_failure" | "unsafe_to_retry";
+
+export interface M3LoadAttempt {
+  ordinal: number;
+  contextTokens: number;
+  gpuLayers: number;
+  outcome: M3LoadAttemptOutcome;
+}
+
+export interface M3LoadRecoveryRecord {
+  atMs: number;
+  runtimeId: string;
+  assetId: string;
+  recovered: boolean;
+  attempts: M3LoadAttempt[];
+}
+
 export interface M3LoadExecutionPlan {
   runtimeId: string;
   assetId: string;
   effectiveSettings: Record<string, SettingValue>;
   offload: OffloadPlan | null;
   decisions: string[];
+  recoveryAttempts: M3LoadAttempt[];
 }
 
 export interface M3UnloadModelRequest {
@@ -1364,6 +1382,8 @@ export const runtimeHubClient = {
     invoke<M3LoadExecutionPlan>("m3_runtime_plan_model_load", { request }),
   runtimeLoadModel: (args: OperationArgs & { request: M3LoadModelRequest }) =>
     invoke<M3LoadExecutionPlan>("m3_runtime_load_model", args),
+  runtimeLoadRecoveryHistory: () =>
+    invoke<M3LoadRecoveryRecord[]>("m3_runtime_load_recovery_history"),
   runtimeUnloadModel: (args: OperationArgs & { request: M3UnloadModelRequest }) =>
     invoke<void>("m3_runtime_unload_model", args),
   runtimeLogs: (args: OperationArgs & { runtimeId: string; maxBytes: number }) =>
