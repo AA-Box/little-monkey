@@ -314,11 +314,15 @@ fn parent_artifact(parent: &VideoJob, entries: &[GenerationEntry]) -> Result<Gen
 /// FFmpeg's image2 -update 1 overwrites one PNG for every decoded input frame.
 /// The final PNG is therefore the decoded last frame rather than a thumbnail.
 async fn extract_final_frame(app: &AppHandle, media: &[u8], mime: &str) -> Result<String, String> {
+    let root = app.profile_data_dir().map_err(|error| error.to_string())?
+        .join("studio-v1").join("video-handoff");
+    extract_final_frame_in(&root, media, mime).await
+}
+
+async fn extract_final_frame_in(root: &Path, media: &[u8], mime: &str) -> Result<String, String> {
     if media.is_empty() || media.len() > MAX_HANDOFF_VIDEO_BYTES {
         return Err("Source video is empty or too large".into());
     }
-    let root = app.profile_data_dir().map_err(|error| error.to_string())?
-        .join("studio-v1").join("video-handoff");
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     if fs::symlink_metadata(&root).map_err(|error| error.to_string())?.file_type().is_symlink() {
         return Err("Unsafe video handoff directory".into());
@@ -708,6 +712,40 @@ mod tests {
         let mut busy = job.clone();
         busy.status = VideoJobStatus::Running;
         assert!(parent_artifact(&busy, &[]).is_err());
+    }
+
+    /// Runs FFmpeg on a generated four-frame MP4 and proves that the result is
+    /// the *fourth* frame, not merely a video thumbnail/first frame. CI installs
+    /// FFmpeg for its Ubuntu Rust job; other platform runners may lack it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn real_mp4_decoder_hands_off_the_true_final_frame() {
+        use base64::Engine as _;
+        let root = std::env::temp_dir().join(format!("lm-handoff-test-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let input = root.join("source.mp4");
+        let expected = root.join("expected.png");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error",
+                   "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=2:duration=2",
+                   "-c:v", "mpeg4", "-q:v", "3", "-y"])
+            .arg(&input).status().expect("Linux CI must install ffmpeg");
+        assert!(made.success(), "FFmpeg fixture must render a 4-frame video");
+        let actual = super::extract_final_frame_in(
+            &root, &fs::read(&input).unwrap(), "video/mp4",
+        ).await.unwrap();
+        let expected_status = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&input)
+            .args(["-vf", "select=eq(n\\,3)", "-frames:v", "1", "-y"])
+            .arg(&expected).status().unwrap();
+        assert!(expected_status.success());
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(actual).unwrap(),
+            fs::read(&expected).unwrap(),
+            "Continuation must use the *final* decoded frame"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
