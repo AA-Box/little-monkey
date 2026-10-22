@@ -1525,6 +1525,41 @@ mod tests {
     }
 
     #[test]
+    fn sniffs_actual_architecture_block_count_without_a_filesize_guess() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0); // no tensor payload needed to test metadata
+        write_u64(&mut bytes, 2); // architecture and its block count
+        write_string(&mut bytes, "general.architecture");
+        write_u32(&mut bytes, GGUF_TYPE_STRING);
+        write_string(&mut bytes, "qwen2");
+        write_string(&mut bytes, "qwen2.block_count");
+        write_u32(&mut bytes, GGUF_TYPE_UINT32);
+        write_u32(&mut bytes, 48);
+        let header = sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF metadata");
+        assert_eq!(header.block_count, Some(48));
+        assert_eq!(header.architecture.as_deref(), Some("qwen2"));
+        assert_eq!(header.context_length, None);
+    }
+
+    #[test]
+    fn ignores_zero_gguf_block_count_as_unusable_for_offload_planning() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 1);
+        write_string(&mut bytes, "llama.block_count");
+        write_u32(&mut bytes, GGUF_TYPE_UINT32);
+        write_u32(&mut bytes, 0);
+        assert_eq!(
+            sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF").block_count,
+            None
+        );
+    }
+
+    #[test]
     fn sniffs_context_length_keyed_by_architecture() {
         let bytes = build_minimal_gguf_full("qwen2", None, None, Some(32_768));
         let header = sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF fixture must parse");
