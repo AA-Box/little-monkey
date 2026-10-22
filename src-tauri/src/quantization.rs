@@ -1539,7 +1539,7 @@ mod tests {
     #[test]
     fn sniffs_actual_architecture_block_count_without_a_filesize_guess() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(GGUF_MAGIC);
+        bytes.extend_from_slice(&GGUF_MAGIC);
         write_u32(&mut bytes, 3);
         write_u64(&mut bytes, 0); // no tensor payload needed to test metadata
         write_u64(&mut bytes, 2); // architecture and its block count
@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn ignores_zero_gguf_block_count_as_unusable_for_offload_planning() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(GGUF_MAGIC);
+        bytes.extend_from_slice(&GGUF_MAGIC);
         write_u32(&mut bytes, 3);
         write_u64(&mut bytes, 0);
         write_u64(&mut bytes, 1);
