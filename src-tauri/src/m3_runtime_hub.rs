@@ -3932,14 +3932,16 @@ impl M3RuntimeHub {
                             "Model loaded after {attempt_number} verified launch attempts with reduced implicit memory settings."
                         ));
                     }
-                    let record = LoadRecoveryRecord {
-                        at_ms: self.clock.now_ms()?,
-                        runtime_id: request.runtime_id.clone(),
-                        asset_id: request.asset_id.clone(),
-                        recovered,
-                        attempts: execution.recovery_attempts.clone(),
-                    };
-                    if let Err(error) = self.append_load_recovery_record(record) {
+                    let persistence = self.clock.now_ms().and_then(|at_ms| {
+                        self.append_load_recovery_record(LoadRecoveryRecord {
+                            at_ms,
+                            runtime_id: request.runtime_id.clone(),
+                            asset_id: request.asset_id.clone(),
+                            recovered,
+                            attempts: execution.recovery_attempts.clone(),
+                        })
+                    });
+                    if let Err(error) = persistence {
                         // Do not report a successfully loaded model as failed.
                         execution.decisions.push(format!(
                             "The load succeeded, but the attempt history could not be saved: {error}"
@@ -3989,14 +3991,15 @@ impl M3RuntimeHub {
                             last.outcome = LoadAttemptOutcome::UnsafeToRetry;
                         }
                     }
-                    let record = LoadRecoveryRecord {
-                        at_ms: self.clock.now_ms()?,
-                        runtime_id: request.runtime_id.clone(),
-                        asset_id: request.asset_id.clone(),
-                        recovered: false,
-                        attempts: execution.recovery_attempts.clone(),
-                    };
-                    let persistence = self.append_load_recovery_record(record).err();
+                    let persistence = self.clock.now_ms().and_then(|at_ms| {
+                        self.append_load_recovery_record(LoadRecoveryRecord {
+                            at_ms,
+                            runtime_id: request.runtime_id.clone(),
+                            asset_id: request.asset_id.clone(),
+                            recovered: false,
+                            attempts: execution.recovery_attempts.clone(),
+                        })
+                    }).err();
                     let suffix = if execution.recovery_attempts.len() > 1 {
                         format!("; model-load recovery made {} bounded attempts (contexts/GPU layers: {})",
                             execution.recovery_attempts.len(),
@@ -4229,11 +4232,18 @@ impl M3RuntimeHub {
 
     fn read_load_recovery_history(&self) -> M3HubResult<Vec<crate::oom_recovery::LoadRecoveryRecord>> {
         let path = self.state_root.join("load-recovery-history.json");
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(io_at("read load recovery history", &path, source)),
+            Err(source) => return Err(io_at("inspect load recovery history", &path, source)),
         };
+        if !metadata.file_type().is_file() || metadata.len() > 256 * 1024 {
+            return Err(M3HubError::State(
+                "load recovery history must be a regular file below its size cap".into(),
+            ));
+        }
+        let bytes = fs::read(&path)
+            .map_err(|source| io_at("read load recovery history", &path, source))?;
         if bytes.len() > 256 * 1024 {
             return Err(M3HubError::State("load recovery history exceeds its size cap".into()));
         }
@@ -4262,6 +4272,11 @@ impl M3RuntimeHub {
         &self,
         request: &M3SetRuntimeConfigRequest,
     ) -> M3HubResult<BTreeMap<String, SettingValue>> {
+        // Sync setter cannot wait for an ongoing launch. Refuse to alter
+        // the settings underneath an in-flight recovery sequence.
+        let _mutation = self.mutation_lock.try_lock().map_err(|_| {
+            M3HubError::Conflict("runtime mutation or model load is in progress".into())
+        })?;
         validate_identifier(&request.runtime_id, "runtimeId")?;
         self.runtime(&request.runtime_id)?
             .validate_config(&request.values)?;

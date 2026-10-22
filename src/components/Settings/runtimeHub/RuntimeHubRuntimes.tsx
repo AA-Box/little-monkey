@@ -519,7 +519,7 @@ function LoadRecoveryHistory({ runtimeId, loading }: { runtimeId: string; loadin
       {!historyError && records.length === 0 && <p className="mt-2 text-xs text-muted">No recorded loads yet.</p>}
       {records.map((record, index) => (
         <div key={`${record.atMs}-${record.assetId}-${index}`} className="mt-2 border-t border-border pt-2 text-xs text-muted">
-          <p className="break-all text-foreground">{record.assetId} · {formatDate(record.atMs)} · {record.recovered ? "Recovered after OOM" : "No successful recovery recorded"}</p>
+          <p className="break-all text-foreground">{record.assetId} · {formatDate(record.atMs)} · {record.recovered ? "Recovered after OOM" : record.attempts.at(-1)?.outcome === "success" ? "Loaded normally" : "Load failed"}</p>
           <ol className="mt-1 list-inside list-decimal space-y-1">
             {record.attempts.map((attempt) => (
               <li key={attempt.ordinal}>
