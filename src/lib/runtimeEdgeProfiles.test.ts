@@ -121,6 +121,7 @@ describe("resolveEdgeRuntimeProfile", () => {
         model?: string;
         decodeTokensPerSecond?: BenchmarkReport["decodeTokensPerSecond"];
         freshness?: BenchmarkHistoryEntry["freshness"];
+        legacy?: boolean;
       } = {},
     ): BenchmarkHistoryEntry {
       const median = overrides.median ?? 42;
@@ -155,7 +156,14 @@ describe("resolveEdgeRuntimeProfile", () => {
           accelerators: [],
         },
         measuredAtMs: 1,
-        evidence: null,
+        evidence: overrides.legacy ? null : {
+          workloadSha256: "a".repeat(64),
+          modelDigest: "sha256:fixture",
+          modelSizeBytes: 2_048,
+          runtimeProcessId: 123,
+          configuredSettingsSha256: "b".repeat(64),
+          completedMeasuredRepeats: overrides.n ?? 4,
+        },
         freshness: overrides.freshness ?? { state: "thisMachine" },
       };
     }
@@ -193,6 +201,20 @@ describe("resolveEdgeRuntimeProfile", () => {
         }),
       ]);
       expect(result.expectedSpeed).not.toContain("900");
+      expect(result.expectedSpeed).not.toContain("Measured here");
+    });
+
+    it("does not promote a legacy record into a verified speed claim", () => {
+      const result = resolveEdgeRuntimeProfile(snapshot(), profile, compatibility(), [
+        entry({ median: 1000, legacy: true }),
+      ]);
+      expect(result.expectedSpeed).not.toContain("Measured here");
+    });
+
+    it("does not promote a single measured repeat into a verified speed claim", () => {
+      const result = resolveEdgeRuntimeProfile(snapshot(), profile, compatibility(), [
+        entry({ median: 1000, n: 1 }),
+      ]);
       expect(result.expectedSpeed).not.toContain("Measured here");
     });
 
