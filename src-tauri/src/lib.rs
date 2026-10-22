@@ -1714,6 +1714,7 @@ pub fn run() {
             m3_commands::m3_runtime_inventory,
             m3_commands::m3_runtime_plan_model_load,
             m3_commands::m3_runtime_load_model,
+            m3_commands::m3_runtime_load_recovery_history,
             m3_commands::m3_runtime_unload_model,
             m3_commands::m3_runtime_logs,
             m3_commands::m3_runtime_metrics,
