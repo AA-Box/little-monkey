@@ -3870,11 +3870,14 @@ impl M3RuntimeHub {
         self.runtime(runtime_id)?.inventory(context).await
     }
 
-    pub async fn load_model(
+    /// Loads a model and returns the settings that the backend actually received.
+    /// Keeping the plan as part of the success value makes runtime telemetry
+    /// reflect the *executed* placement, not an earlier UI preview.
+    pub async fn load_model_with_plan(
         &self,
         request: &M3LoadModelRequest,
         context: &M3OperationContext,
-    ) -> M3HubResult<()> {
+    ) -> M3HubResult<M3LoadExecutionPlan> {
         validate_identifier(&request.runtime_id, "runtimeId")?;
         validate_identifier(&request.asset_id, "assetId")?;
         let runtime = self.runtime(&request.runtime_id)?;
@@ -3899,7 +3902,17 @@ impl M3RuntimeHub {
                 request.replace_existing,
                 context,
             )
-            .await
+            .await?;
+        Ok(execution)
+    }
+
+    /// Backward-compatible hub API for callers that only need success/failure.
+    pub async fn load_model(
+        &self,
+        request: &M3LoadModelRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<()> {
+        self.load_model_with_plan(request, context).await.map(|_| ())
     }
 
     /// Preview the same per-load settings that the authoritative load path
