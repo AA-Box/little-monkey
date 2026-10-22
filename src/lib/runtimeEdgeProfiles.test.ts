@@ -155,6 +155,7 @@ describe("resolveEdgeRuntimeProfile", () => {
           accelerators: [],
         },
         measuredAtMs: 1,
+        evidence: null,
         freshness: overrides.freshness ?? { state: "thisMachine" },
       };
     }
