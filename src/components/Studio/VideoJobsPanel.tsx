@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Button } from "../ui";
 import { studioClient, type VideoJob } from "../../lib/studioClient";
 import { useStudioRunStore } from "../../store/studioRunStore";
+import { VideoTimelinePanel } from "./VideoTimelinePanel";
 
 export function VideoJobsPanel() {
   const [jobs, setJobs] = useState<VideoJob[]>([]);
@@ -109,6 +110,7 @@ export function VideoJobsPanel() {
           </div>
         ))}
       </div>
+      <VideoTimelinePanel jobs={jobs} />
     </section>
   );
 }

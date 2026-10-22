@@ -239,6 +239,24 @@ export interface VideoJob {
   updatedAtMs: number;
 }
 
+export interface VideoTimelineSegment {
+  jobId: string;
+  trimStartMs: number;
+  trimEndMs: number | null;
+}
+export type VideoTimelineStatus = "queued" | "rendering" | "interrupted" | "completed" | "failed" | "cancelled";
+export interface VideoTimeline {
+  id: string;
+  title: string;
+  segments: VideoTimelineSegment[];
+  soundtrackPath: string | null;
+  status: VideoTimelineStatus;
+  outputEntryId: string | null;
+  error: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
 export interface GenerationEntry {
   videoJobId?: string | null;
   entryId: string;
@@ -617,6 +635,11 @@ export const studioClient = {
   videoJobs: () => invoke<VideoJob[]>("generation_video_jobs"),
   videoResume: (jobId: string) => invoke<VideoJob>("generation_video_resume", { jobId }),
   videoCancel: (jobId: string) => invoke<VideoJob>("generation_video_cancel", { jobId }),
+  videoTimelineSubmit: (title: string, segments: VideoTimelineSegment[], soundtrackPath: string | null) =>
+    invoke<VideoTimeline>("generation_video_timeline_submit", { title, segments, soundtrackPath }),
+  videoTimelines: () => invoke<VideoTimeline[]>("generation_video_timelines"),
+  videoTimelineRetry: (timelineId: string) =>
+    invoke<VideoTimeline>("generation_video_timeline_retry", { timelineId }),
   run: (request: GenerationRequest) =>
     invoke<GenerationEntry[]>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),
