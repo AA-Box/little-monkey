@@ -212,6 +212,13 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "lifecycle commands for that same server",
     ),
     (
+        "studio_video_jobs.rs",
+        Class::HostUtility,
+        "Studio uses FFmpeg with fixed, app-composed argv and private, generated paths
+         to extract a published clip's final frame and assemble user-owned video;
+         input is validated gallery media, never a model-authored command",
+    ),
+    (
         "quantization.rs",
         Class::ManagedService,
         "a bundled quantization tool run against a model the user selected",
