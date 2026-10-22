@@ -2160,27 +2160,48 @@ mod tests {
         }
     }
 
-    /// Two reports for one model on one runtime differ only by when they ran, so
-    /// keeping both would invite a reader to compare numbers that were never
-    /// meant to be a time series.
+    /// Every real run is retained even when two runs use the same model. A
+    /// changed workload/configuration is not comparable to an earlier run.
     #[test]
-    fn re_benchmarking_a_pair_replaces_its_entry_rather_than_appending() {
+    fn re_benchmarking_retains_both_runs_in_newest_first_order() {
         let history = remember_benchmark(Vec::new(), stored("llama-local", "qwen3-4b", 1));
         let history = remember_benchmark(history, stored("llama-local", "gemma3-4b", 2));
         let history = remember_benchmark(history, stored("llama-local", "qwen3-4b", 3));
-
-        assert_eq!(
-            history.len(),
-            2,
-            "the qwen entry was replaced, not appended"
-        );
-        assert_eq!(history[0].report.model, "qwen3-4b");
-        assert_eq!(history[0].measured_at_ms, 3, "most recent first");
-        assert_eq!(history[1].report.model, "gemma3-4b");
-
-        // Same model on a different runtime is a different measurement.
-        let history = remember_benchmark(history, stored("ollama", "qwen3-4b", 4));
         assert_eq!(history.len(), 3);
+        assert_eq!(history[0].report.model, "qwen3-4b");
+        assert_eq!(history[0].measured_at_ms, 3);
+        assert_eq!(history[1].report.model, "gemma3-4b");
+        assert_eq!(history[2].measured_at_ms, 1);
+        let history = remember_benchmark(history, stored("ollama", "qwen3-4b", 4));
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    fn evidence_round_trips_and_old_records_remain_unverified() {
+        let original = stored("llama-local", "qwen3-4b", 1);
+        let json = serde_json::to_value(&original).unwrap();
+        let mut legacy = json.clone();
+        legacy.as_object_mut().unwrap().remove("evidence");
+        let imported: StoredBenchmark = serde_json::from_value(legacy).unwrap();
+        assert!(imported.evidence.is_none(), "legacy records have no trusted provenance");
+
+        let mut proven = original;
+        proven.evidence = Some(BenchmarkEvidence {
+            workload_sha256: "a".repeat(64),
+            model_digest: Some("sha256:abc".into()),
+            model_size_bytes: 1_000,
+            runtime_process_id: Some(123),
+            configured_settings_sha256: "b".repeat(64),
+            completed_measured_repeats: 3,
+        });
+        assert_eq!(
+            serde_json::from_value::<StoredBenchmark>(serde_json::to_value(&proven).unwrap()).unwrap(),
+            proven
+        );
+        assert_ne!(
+            sha256_hex_serialized(&("hello", 128u32, 5u32)).unwrap(),
+            sha256_hex_serialized(&("hello", 256u32, 5u32)).unwrap(),
+        );
     }
 
     #[test]
