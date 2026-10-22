@@ -348,7 +348,15 @@ async fn extract_final_frame_in(root: &Path, media: &[u8], mime: &str) -> Result
     let output = scratch.join("last.png");
     let result = async {
         fs::write(&input, media).map_err(|error| error.to_string())?;
-        let mut cmd = Command::new("ffmpeg");
+        // A Finder-launched macOS app does not inherit Homebrew's shell PATH.
+        // Prefer the normal installation locations before falling back to PATH.
+        #[cfg(target_os = "macos")]
+        let ffmpeg_path = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
+            .iter().map(Path::new).find(|path| path.is_file())
+            .map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("ffmpeg"));
+        #[cfg(not(target_os = "macos"))]
+        let ffmpeg_path = PathBuf::from("ffmpeg");
+        let mut cmd = Command::new(ffmpeg_path);
         cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
             .arg(&input)
             .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-vsync", "0",

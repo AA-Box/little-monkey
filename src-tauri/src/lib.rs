@@ -1105,9 +1105,6 @@ pub fn run() {
             // cross-window updates. Workspace restoration below triggers a
             // second sync once the primary root is known.
             native_skill_commands::sync_native_skill_watchers(app.handle());
-            // Resume queued native video jobs at process startup without
-            // requiring any Studio panel mount or listing IPC.
-            studio_video_jobs::start_background_recovery(app.handle().clone());
 
             // Listens for `littlemonkey://` deep links (macOS/mobile live
             // events; Windows/Linux fresh-launch CLI-arg parsing — a
@@ -1343,6 +1340,11 @@ pub fn run() {
             // afterward, `knowledge_service`'s add/update/remove-source
             // commands keep it in sync as the catalog changes.
             knowledge_service::sync_watched_folder_watchers(app.handle());
+
+            // Recover Studio's persistent video journal *after* managed
+            // runtimes were materialized and profile restore was recovered.
+            // No Studio window, tab, or listing IPC is needed to dispatch.
+            studio_video_jobs::start_background_recovery(app.handle().clone());
 
             Ok(())
         })

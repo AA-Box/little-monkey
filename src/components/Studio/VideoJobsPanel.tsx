@@ -84,6 +84,9 @@ export function VideoJobsPanel() {
               {job.status} · seed {job.seed}{job.status === "running" ? " · rendering" : ""}
             </span>
             {job.sourceJobId && <span className="text-[11px] text-muted" title={job.sourceJobId}>↳ clip</span>}
+            {job.error && <span className="max-w-48 truncate text-[11px] text-danger" title={job.error}>
+              {job.error}
+            </span>}
             {(job.status === "interrupted" || job.status === "failed") && (
               <Button size="sm" variant="secondary" disabled={busy === job.id}
                 onClick={() => void act(job, "resume")}>Resume</Button>
