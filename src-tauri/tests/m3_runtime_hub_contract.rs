@@ -1108,7 +1108,18 @@ async fn live_load_plan_changes_the_real_driver_settings_without_mutating_user_c
 
     let mut constrained = hardware_with_cuda();
     constrained.available_ram_bytes = 5 * GIB;
-    constrained.platform.accelerators[0].available_memory_bytes = Some(GIB);
+    // PlatformCapabilities::from_host injects a CPU entry, sorted before CUDA.
+    // Select by kind; index zero silently capped the CPU entry instead and
+    // left the CUDA budget at 20 GiB, invalidating the memory-pressure test.
+    let cuda = constrained
+        .platform
+        .accelerators
+        .iter_mut()
+        .find(|accelerator| {
+            accelerator.kind == little_monkey_lib::runtime_adapter::AcceleratorKind::Cuda
+        })
+        .expect("test snapshot must contain a CUDA accelerator");
+    cuda.available_memory_bytes = Some(GIB);
 
     let root = TestDirectory::new("adaptive-real-load-settings");
     let runtime_state = Arc::new(MockRuntimeState::default());
