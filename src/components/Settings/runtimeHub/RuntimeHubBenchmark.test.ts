@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import type { BenchmarkSample, BenchmarkSpread } from "../../../lib/runtimeHubClient";
+import type { BenchmarkHistoryEntry, BenchmarkSample, BenchmarkSpread } from "../../../lib/runtimeHubClient";
 import {
+  benchmarkDecodeChange,
+  comparableBenchmarkRuns,
   measuredPeakMemory,
   measuredRate,
   measuredSpread,
@@ -189,5 +191,79 @@ describe("unavailableReason", () => {
   it("never returns an empty string, even for a note with a blank reason", () => {
     expect(unavailableReason([{ field: "decodeMs", reason: "   " }], "decodeMs")).toContain("decodeMs");
     expect(unavailableReason([], "decodeMs")).not.toBe("");
+  });
+});
+
+function verifiedHistoryEntry(rate: number): BenchmarkHistoryEntry {
+  return {
+    report: {
+      schemaVersion: 1,
+      runtimeId: "llama",
+      model: "llama3",
+      quantization: null,
+      maxOutputTokens: 128,
+      repeatsRequested: 3,
+      warmupDiscarded: 1,
+      samples: [sample()],
+      timeToFirstTokenMs: spread,
+      decodeTokensPerSecond: { n: 2, min: rate, median: rate, max: rate, stddev: 0 },
+      peakMemory: {
+        processLifetimePeakBytes: null,
+        beforeBytes: null,
+        runPeakBytes: null,
+        unavailable: [],
+      },
+      unavailable: [],
+    },
+    machine: {
+      os: "linux",
+      arch: "x86_64",
+      totalRamBytes: 32 * 1024 ** 3,
+      logicalCpuCount: 16,
+      accelerators: ["NVIDIA RTX"],
+    },
+    measuredAtMs: 100,
+    evidence: {
+      workloadSha256: "a".repeat(64),
+      modelDigest: "sha256:abcd",
+      modelSizeBytes: 1234,
+      runtimeProcessId: 44,
+      configuredSettingsSha256: "b".repeat(64),
+      completedMeasuredRepeats: 2,
+    },
+    freshness: { state: "thisMachine" },
+  };
+}
+
+describe("verified benchmark comparison", () => {
+  it("compares real medians only between evidence-matched runs", () => {
+    const previous = verifiedHistoryEntry(100);
+    const current = verifiedHistoryEntry(125);
+    expect(comparableBenchmarkRuns(previous, current)).toBe(true);
+    expect(benchmarkDecodeChange(current, previous)).toBe(25);
+    expect(benchmarkDecodeChange(previous, current)).toBe(-20);
+  });
+
+  it("fails closed when model, settings, workload, hardware or evidence changes", () => {
+    const original = verifiedHistoryEntry(100);
+    const cases: BenchmarkHistoryEntry[] = [
+      { ...original, evidence: null },
+      { ...original, evidence: { ...original.evidence!, modelDigest: null } },
+      { ...original, evidence: { ...original.evidence!, modelDigest: "sha256:other" } },
+      { ...original, evidence: { ...original.evidence!, configuredSettingsSha256: "c".repeat(64) } },
+      { ...original, evidence: { ...original.evidence!, workloadSha256: "d".repeat(64) } },
+      { ...original, machine: { ...original.machine, totalRamBytes: 64 * 1024 ** 3 } },
+      { ...original, freshness: { state: "differentMachine", changed: ["installed RAM"] } },
+    ];
+    for (const changed of cases) {
+      expect(comparableBenchmarkRuns(original, changed)).toBe(false);
+      expect(benchmarkDecodeChange(original, changed)).toBeNull();
+    }
+  });
+
+  it("does not divide by missing or zero decode rates", () => {
+    const original = verifiedHistoryEntry(100);
+    expect(benchmarkDecodeChange(original, verifiedHistoryEntry(0))).toBeNull();
+    expect(benchmarkDecodeChange({ ...original, report: { ...original.report, decodeTokensPerSecond: null } }, original)).toBeNull();
   });
 });
