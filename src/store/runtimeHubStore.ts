@@ -1055,11 +1055,10 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const operationId = createM3OperationId("runtime-load");
       begin(key, operationId);
       const startedAtMs = Date.now();
-      // Reuses whatever offload plan `previewOffloadPlan` already computed
-      // for this runtime (the Runtime Hub's load flow always previews one
-      // before offering the load action) — this trace never computes its
-      // own placement/memory numbers, only reports the planner's.
-      const offloadPlan = get().offloadPlans[request.runtimeId] ?? null;
+      // A stored preview is an estimate, not evidence of what the backend
+      // loaded. Replace it with the authoritative plan returned by the load
+      // command before writing telemetry.
+      let offloadPlan = get().offloadPlans[request.runtimeId] ?? null;
       const recordTrace = (loadError: unknown) => {
         // Wrapped in `Promise.resolve` (rather than chaining `.catch`
         // directly off the client call) so this stays safe even if the
@@ -1079,7 +1078,13 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         });
       };
       try {
-        await runtimeHubClient.runtimeLoadModel({ operationId, timeoutMs: 120_000, request });
+        const loaded = await runtimeHubClient.runtimeLoadModel({ operationId, timeoutMs: 120_000, request });
+        // A real response comes only after backend load succeeded. Test mocks
+        // and older IPC clients may return undefined; do not invent execution
+        // evidence when no authoritative plan was returned.
+        if (loaded && "offload" in loaded) {
+          offloadPlan = loaded.offload ?? null;
+        }
         await get().refreshRuntime(request.runtimeId);
         recordTrace(undefined);
       } catch (error) {
