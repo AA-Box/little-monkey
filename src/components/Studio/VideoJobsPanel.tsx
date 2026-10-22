@@ -67,7 +67,9 @@ export function VideoJobsPanel() {
     }
   };
 
-  if (jobs.length === 0 && !error) return null;
+  // ComfyUI/FreeVideo clips can be published without a native Studio video
+  // job. Their timeline editor must remain reachable on a fresh installation.
+  if (jobs.length === 0 && !error) return <VideoTimelinePanel jobs={[]} />;
   return (
     <section className="mx-1 rounded-lg border border-border bg-surface p-3" aria-label="Durable video jobs">
       <h3 className="mb-1 text-xs font-semibold">Video jobs</h3>
