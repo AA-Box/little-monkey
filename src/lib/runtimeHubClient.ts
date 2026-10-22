@@ -997,6 +997,15 @@ export interface M3LoadModelRequest {
   replaceExisting: boolean;
 }
 
+/** Returned by the real load command after the backend accepted these settings. */
+export interface M3LoadExecutionPlan {
+  runtimeId: string;
+  assetId: string;
+  effectiveSettings: Record<string, SettingValue>;
+  offload: OffloadPlan | null;
+  decisions: string[];
+}
+
 export interface M3UnloadModelRequest {
   runtimeId: string;
   modelId: string;
@@ -1338,8 +1347,10 @@ export const runtimeHubClient = {
     invoke<M3RuntimeStatusView>("m3_runtime_status", args),
   runtimeInventory: (args: OperationArgs & { runtimeId: string }) =>
     invoke<RuntimeInventory>("m3_runtime_inventory", args),
+  runtimePlanModelLoad: (request: M3LoadModelRequest) =>
+    invoke<M3LoadExecutionPlan>("m3_runtime_plan_model_load", { request }),
   runtimeLoadModel: (args: OperationArgs & { request: M3LoadModelRequest }) =>
-    invoke<void>("m3_runtime_load_model", args),
+    invoke<M3LoadExecutionPlan>("m3_runtime_load_model", args),
   runtimeUnloadModel: (args: OperationArgs & { request: M3UnloadModelRequest }) =>
     invoke<void>("m3_runtime_unload_model", args),
   runtimeLogs: (args: OperationArgs & { runtimeId: string; maxBytes: number }) =>
