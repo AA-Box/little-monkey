@@ -17,8 +17,8 @@ The frontend polls that record and can find it again on reopening Studio.
   The original prompts are shortened and inline input images are not exposed
   to this listing.
 - \`generation_video_resume(jobId)\`: explicit, bounded replay of the saved
-  request from its beginning after a failed/interrupted job. Requires a pinned
-  nonnegative seed. It does not replay automatically after a process crash.
+  request from its beginning after a failed/interrupted job. Blank/random
+  seeds are pinned once when the journal is created. It does not replay automatically after a process crash.
 - \`generation_video_cancel(jobId)\`: cancel queued work or stop the process
   that owns active work. No need to release other jobs' active generations.
 - Dependencies are explicit completed-job IDs, never inferred from prompt

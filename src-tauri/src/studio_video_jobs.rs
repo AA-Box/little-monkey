@@ -5,7 +5,7 @@
 //! interrupted sampling is *not* represented as resumable mid-frame state.
 //! Resuming explicitly starts a new render of the persisted, fixed-seed request.
 
-use crate::generation::{GenerationRequest, GenerationTask};
+use crate::generation::GenerationRequest;
 use crate::generation_commands::{self, GenerationEntry};
 use crate::profiles::ProfileScopedPaths;
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,7 @@ pub struct VideoJobView {
     depends_on: Vec<String>,
     model_id: String,
     prompt: String,
+    seed: i64,
     status: VideoJobStatus,
     stage: VideoJobStage,
     attempts: u32,
@@ -80,6 +81,7 @@ impl From<&VideoJob> for VideoJobView {
             depends_on: job.depends_on.clone(),
             model_id: job.request.model_id.clone(),
             prompt: job.request.prompt.chars().take(240).collect(),
+            seed: job.request.seed,
             status: job.status,
             stage: job.stage,
             attempts: job.attempts,
@@ -118,6 +120,12 @@ fn directory(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?
         .join("studio-v1").join("video-jobs");
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
     if fs::symlink_metadata(&dir).map_err(|error| error.to_string())?.file_type().is_symlink() {
         return Err("Studio video journal may not be a symlink".to_string());
     }
@@ -228,6 +236,24 @@ fn reconcile(app: &AppHandle, dir: &Path, jobs: &mut [VideoJob]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// Pin one random seed at submission. A persisted random request would have
+/// no reproducible replay, and duplicate idempotency submissions must not
+/// draw another random seed.
+fn pin_seed(mut request: GenerationRequest) -> GenerationRequest {
+    if request.seed < 0 {
+        request.seed = (Uuid::new_v4().as_u128() as i64) & i64::MAX;
+    }
+    request
+}
+
+fn same_effective_request(saved: &GenerationRequest, incoming: &GenerationRequest) -> bool {
+    let mut normalized = incoming.clone();
+    if normalized.seed < 0 {
+        normalized.seed = saved.seed;
+    }
+    serde_json::to_value(saved).ok() == serde_json::to_value(normalized).ok()
 }
 
 fn dependencies_complete(job: &VideoJob, jobs: &[VideoJob]) -> bool {
@@ -342,9 +368,7 @@ pub fn generation_video_submit(
         let mut jobs = read_all(&dir)?;
         reconcile(&app, &dir, &mut jobs)?;
         if let Some(old) = jobs.iter().find(|job| job.idempotency_key == idempotency_key) {
-            if serde_json::to_value(&old.request).map_err(|error| error.to_string())?
-                != serde_json::to_value(&request).map_err(|error| error.to_string())?
-                || old.depends_on != depends_on {
+            if !same_effective_request(&old.request, &request) || old.depends_on != depends_on {
                 return Err("Video idempotency key already belongs to a different request".to_string());
             }
             VideoJobView::from(old)
@@ -362,7 +386,7 @@ pub fn generation_video_submit(
                 id: Uuid::new_v4().to_string(),
                 idempotency_key,
                 depends_on,
-                request,
+                request: pin_seed(request),
                 status: VideoJobStatus::Queued,
                 stage: VideoJobStage::WaitingForDependencies,
                 attempts: 0,
@@ -415,15 +439,17 @@ pub fn generation_video_resume(app: AppHandle, job_id: String) -> Result<VideoJo
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn generation_video_cancel(app: AppHandle, job_id: String) -> Result<VideoJobView, String> {
+    let mut was_rendering = false;
     let job = transition(&app, &job_id, |job| {
         if !matches!(job.status, VideoJobStatus::Queued | VideoJobStatus::Running | VideoJobStatus::Interrupted) {
             return Err("Video job is already terminal".to_string());
         }
+        was_rendering = job.status == VideoJobStatus::Running;
         job.status = VideoJobStatus::Cancelled;
         job.error = None;
         Ok(())
     })?;
-    if job.status == VideoJobStatus::Cancelled
+    if was_rendering
         && active().lock().map_err(|error| error.to_string())?.contains(&job_id) {
         // Stop only when the job actually owns the native generation process.
         // A queued job waiting for the gate must not stop somebody else's run.
@@ -470,6 +496,18 @@ mod tests {
         assert_eq!(restored[0].depends_on, vec!["parent"]);
         assert_eq!(restored[0].status, VideoJobStatus::Queued);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn random_seeds_are_pinned_once_and_deduplicate_retries() {
+        let mut incoming = example("input", VideoJobStatus::Queued, vec![]).request;
+        incoming.seed = -1;
+        let fixed = pin_seed(incoming.clone());
+        assert!(fixed.seed >= 0);
+        assert!(same_effective_request(&fixed, &incoming));
+        let mut changed = incoming;
+        changed.prompt = "different request".into();
+        assert!(!same_effective_request(&fixed, &changed));
     }
 
     #[test]

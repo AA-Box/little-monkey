@@ -227,6 +227,7 @@ export interface VideoJob {
   dependsOn: string[];
   modelId: string;
   prompt: string;
+  seed: number;
   status: VideoJobStatus;
   stage: VideoJobStage;
   attempts: number;

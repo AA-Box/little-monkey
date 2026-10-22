@@ -60,7 +60,7 @@ export function VideoJobsPanel() {
           <div key={job.id} className="flex items-center gap-2 text-xs">
             <span className="min-w-0 flex-1 truncate" title={job.prompt}>{job.prompt || job.modelId}</span>
             <span className="shrink-0 font-mono text-[11px] text-muted">
-              {job.status}{job.status === "running" ? " · rendering" : ""}
+              {job.status} · seed {job.seed}{job.status === "running" ? " · rendering" : ""}
             </span>
             {(job.status === "interrupted" || job.status === "failed") && (
               <Button size="sm" variant="secondary" disabled={busy === job.id}
