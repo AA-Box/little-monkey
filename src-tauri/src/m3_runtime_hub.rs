@@ -1480,6 +1480,9 @@ pub struct M3LoadExecutionPlan {
     pub effective_settings: BTreeMap<String, SettingValue>,
     pub offload: Option<OffloadPlan>,
     pub decisions: Vec<String>,
+    /// Actual ordered launch attempts. Empty for a preview.
+    #[serde(default)]
+    pub recovery_attempts: Vec<crate::oom_recovery::LoadAttempt>,
 }
 
 /// Apply only backend-supported controls to a llama.cpp load. Never override
@@ -3878,8 +3881,12 @@ impl M3RuntimeHub {
         request: &M3LoadModelRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<M3LoadExecutionPlan> {
+        use crate::oom_recovery::{self, LoadAttempt, LoadAttemptOutcome, LoadRecoveryRecord};
         validate_identifier(&request.runtime_id, "runtimeId")?;
         validate_identifier(&request.asset_id, "assetId")?;
+        // Serialize with uninstall, refresh, and unload. A second load may not
+        // race the status check between an OOM and its recovery attempt.
+        let _mutation = self.mutation_lock.lock().await;
         let runtime = self.runtime(&request.runtime_id)?;
         let model = self.resolve_installed_model(&request.asset_id)?;
         if runtime.descriptor().kind != model.runtime {
@@ -3887,23 +3894,130 @@ impl M3RuntimeHub {
                 "selected runtime cannot load this model format".to_string(),
             ));
         }
-        let settings = self
-            .runtime_config(&request.runtime_id)?
-            .unwrap_or_default();
+        let settings = self.runtime_config(&request.runtime_id)?.unwrap_or_default();
         self.enforce_draft_model_gate(&model, &settings)?;
         runtime.validate_config(&settings)?;
-        let execution = self.build_load_execution_plan(&model, &request.runtime_id, &settings, request.replace_existing)?;
-        runtime.validate_config(&execution.effective_settings)?;
-        runtime
-            .load(
+        let mut execution = self.build_load_execution_plan(&model, &request.runtime_id, &settings, request.replace_existing)?;
+        let can_recover = model.runtime == M3RuntimeKind::LlamaCpp && request.keep_alive.is_none();
+        let verified_blocks = if can_recover {
+            crate::quantization::sniff_gguf_file(&model.artifact_path)
+                .ok().and_then(|header| header.block_count)
+        } else {
+            None
+        };
+        let gpu_offload_available = execution.offload.as_ref().is_some_and(|plan|
+            plan.accelerator != AcceleratorKind::Cpu
+        );
+        let mut effective = execution.effective_settings.clone();
+
+        for attempt_number in 1..=oom_recovery::MAX_LOAD_ATTEMPTS {
+            context.preflight("load model with OOM recovery")?;
+            runtime.validate_config(&effective)?;
+            let load_result = runtime.load(
                 &model,
-                &execution.effective_settings,
-                request.keep_alive,
+                &effective,
+                request.keep_alive.clone(),
                 request.replace_existing,
                 context,
-            )
-            .await?;
-        Ok(execution)
+            ).await;
+            match load_result {
+                Ok(()) => {
+                    execution.recovery_attempts.push(LoadAttempt::from_settings(
+                        attempt_number, &effective, LoadAttemptOutcome::Success,
+                    ));
+                    execution.effective_settings = effective;
+                    let recovered = attempt_number > 1;
+                    if recovered {
+                        execution.decisions.push(format!(
+                            "Model loaded after {attempt_number} verified launch attempts with reduced implicit memory settings."
+                        ));
+                    }
+                    let record = LoadRecoveryRecord {
+                        at_ms: self.clock.now_ms()?,
+                        runtime_id: request.runtime_id.clone(),
+                        asset_id: request.asset_id.clone(),
+                        recovered,
+                        attempts: execution.recovery_attempts.clone(),
+                    };
+                    if let Err(error) = self.append_load_recovery_record(record) {
+                        // Do not report a successfully loaded model as failed.
+                        execution.decisions.push(format!(
+                            "The load succeeded, but the attempt history could not be saved: {error}"
+                        ));
+                    }
+                    return Ok(execution);
+                }
+                Err(error) => {
+                    let is_oom = can_recover && matches!(&error,
+                        M3HubError::Runtime(message) if oom_recovery::classify_managed_llama_oom(message)
+                    );
+                    execution.recovery_attempts.push(LoadAttempt::from_settings(
+                        attempt_number, &effective,
+                        if is_oom { LoadAttemptOutcome::OutOfMemory } else { LoadAttemptOutcome::OtherFailure },
+                    ));
+
+                    // The original error is never hidden by recovery machinery.
+                    // Retry only once we can prove that this specific owned
+                    // process has exited, and the caller's settings are stable.
+                    let next = if is_oom && attempt_number < oom_recovery::MAX_LOAD_ATTEMPTS {
+                        oom_recovery::next_lower_memory_settings(
+                            &settings, &effective, verified_blocks, gpu_offload_available,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(lower) = next {
+                        let unchanged = self.runtime_config(&request.runtime_id)?.unwrap_or_default() == settings;
+                        let stopped = match runtime.status(context).await {
+                            Ok(M3RuntimeStatusView::Adapter { status, running_models }) =>
+                                running_models.is_empty()
+                                && matches!(status.state,
+                                    crate::runtime_adapter::RuntimeLifecycleState::Stopped
+                                    | crate::runtime_adapter::RuntimeLifecycleState::Error
+                                ),
+                            _ => false,
+                        };
+                        if unchanged && stopped && self.resolve_installed_model(&request.asset_id)? == model {
+                            runtime.validate_config(&lower)?;
+                            execution.decisions.push(format!(
+                                "Load attempt {attempt_number} failed with an allocator-confirmed OOM. Retrying with lower implicit context/GPU layers."
+                            ));
+                            effective = lower;
+                            continue;
+                        }
+                        if let Some(last) = execution.recovery_attempts.last_mut() {
+                            last.outcome = LoadAttemptOutcome::UnsafeToRetry;
+                        }
+                    }
+                    let record = LoadRecoveryRecord {
+                        at_ms: self.clock.now_ms()?,
+                        runtime_id: request.runtime_id.clone(),
+                        asset_id: request.asset_id.clone(),
+                        recovered: false,
+                        attempts: execution.recovery_attempts.clone(),
+                    };
+                    let persistence = self.append_load_recovery_record(record).err();
+                    let suffix = if execution.recovery_attempts.len() > 1 {
+                        format!("; model-load recovery made {} bounded attempts (contexts/GPU layers: {})",
+                            execution.recovery_attempts.len(),
+                            execution.recovery_attempts.iter()
+                                .map(|item| format!("{}/{}", item.context_tokens, item.gpu_layers))
+                                .collect::<Vec<_>>().join(", ")
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let suffix = if let Some(save_error) = persistence {
+                        format!("{suffix}; could not save attempt history: {save_error}")
+                    } else { suffix };
+                    if suffix.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(M3HubError::Runtime(format!("{error}{suffix}")));
+                }
+            }
+        }
+        unreachable!("bounded OOM recovery always returns or retries")
     }
 
     /// Backward-compatible hub API for callers that only need success/failure.
@@ -3948,6 +4062,7 @@ impl M3RuntimeHub {
             effective_settings: settings.clone(),
             offload: None,
             decisions: Vec::new(),
+            recovery_attempts: Vec::new(),
         };
         if model.runtime != M3RuntimeKind::LlamaCpp {
             result.decisions.push(
@@ -4077,6 +4192,7 @@ impl M3RuntimeHub {
         request: &M3UnloadModelRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
+        let _mutation = self.mutation_lock.lock().await;
         validate_identifier(&request.runtime_id, "runtimeId")?;
         validate_identifier(&request.model_id, "modelId")?;
         self.runtime(&request.runtime_id)?
@@ -4102,6 +4218,44 @@ impl M3RuntimeHub {
         context: &M3OperationContext,
     ) -> M3HubResult<M3RuntimeMetricsView> {
         self.runtime(runtime_id)?.metrics(context).await
+    }
+
+    /// Bounded, private on-disk attempt audit; no raw model logs, prompts,
+    /// credentials, or inferencing output are written here.
+    pub fn load_recovery_history(&self) -> M3HubResult<Vec<crate::oom_recovery::LoadRecoveryRecord>> {
+        let _guard = lock(&self.state_lock)?;
+        self.read_load_recovery_history()
+    }
+
+    fn read_load_recovery_history(&self) -> M3HubResult<Vec<crate::oom_recovery::LoadRecoveryRecord>> {
+        let path = self.state_root.join("load-recovery-history.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(io_at("read load recovery history", &path, source)),
+        };
+        if bytes.len() > 256 * 1024 {
+            return Err(M3HubError::State("load recovery history exceeds its size cap".into()));
+        }
+        let rows: Vec<crate::oom_recovery::LoadRecoveryRecord> = serde_json::from_slice(&bytes)?;
+        if rows.len() > crate::oom_recovery::MAX_LOAD_HISTORY {
+            return Err(M3HubError::State("load recovery history exceeds its entry cap".into()));
+        }
+        Ok(rows)
+    }
+
+    fn append_load_recovery_record(
+        &self,
+        record: crate::oom_recovery::LoadRecoveryRecord,
+    ) -> M3HubResult<()> {
+        let _guard = lock(&self.state_lock)?;
+        let mut history = self.read_load_recovery_history()?;
+        history.push(record);
+        if history.len() > crate::oom_recovery::MAX_LOAD_HISTORY {
+            history.drain(..history.len() - crate::oom_recovery::MAX_LOAD_HISTORY);
+        }
+        let path = self.state_root.join("load-recovery-history.json");
+        atomic_write_private(&path, &canonical_json(&history)?)
     }
 
     pub fn set_runtime_config(
