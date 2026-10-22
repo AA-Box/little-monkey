@@ -1058,6 +1058,14 @@ pub async fn m3_runtime_load_model(
     finish(&state, &operation_id, result).await
 }
 
+/// Private bounded model-load attempt history; no raw process logs.
+#[tauri::command]
+pub fn m3_runtime_load_recovery_history(
+    state: tauri::State<'_, M3CommandState>,
+) -> Result<Vec<crate::oom_recovery::LoadRecoveryRecord>, String> {
+    state.hub.load_recovery_history().map_err(command_error)
+}
+
 #[tauri::command]
 pub async fn m3_runtime_unload_model(
     state: tauri::State<'_, M3CommandState>,
