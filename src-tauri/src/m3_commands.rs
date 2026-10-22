@@ -385,6 +385,13 @@ pub async fn m3_benchmark_run(
     request: BenchmarkRequest,
 ) -> Result<M3BenchmarkResponse, String> {
     let request = request.validated()?;
+    // Two concurrent benchmark commands compete for the same memory/compute
+    // budget and contaminate each other's measurements. Refuse rather than
+    // queue silently beyond the caller's requested timeout.
+    static BENCHMARK_EXECUTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _execution_guard = BENCHMARK_EXECUTION_LOCK
+        .try_lock()
+        .map_err(|_| "another local benchmark is already running".to_string())?;
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = benchmark_with_context(&state, &request, &context).await;
     let response = finish(&state, &operation_id, result).await?;
