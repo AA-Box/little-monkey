@@ -1002,6 +1002,10 @@ pub async fn generation_run(
     if request.task.is_video() {
         return Err("Use generation_video_submit for durable video jobs".to_string());
     }
+    // Background video recovery and ordinary Studio generation share the same
+    // native engine. Never allow an image run to relaunch the engine while a
+    // recovered clip is sampling.
+    let _engine_guard = crate::studio_video_jobs::engine_gate().lock().await;
     generation_run_impl(app, state, m3, request, None).await
 }
 
