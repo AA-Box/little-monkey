@@ -449,16 +449,24 @@ async fn benchmark_with_context(
     let config = state.hub.runtime_config(&request.runtime_id)?;
     let configured_settings_sha256 = sha256_hex_serialized(&config)?;
 
-    let pid = state
+    let mut pid = state
         .hub
         .benchmark_runtime_pid(&request.runtime_id, context)
         .await?;
     let mut memory_notes = Vec::new();
-    let before = read_peak_mark(pid, &mut memory_notes);
+    let mut before = read_peak_mark(pid, &mut memory_notes);
 
     let canonical = canonical_benchmark_request(request);
     let mut samples = Vec::with_capacity(request.repeats as usize);
     for repeat in 0..request.repeats {
+        // A lazy-starting local server may not exist until the warm-up.
+        // Sample its real PID and high-water baseline AFTER warm-up so the
+        // counted repeats aren't assigned the cold start's RSS peak.
+        if repeat == benchmark::WARMUP_REPEATS {
+            pid = state.hub.benchmark_runtime_pid(&request.runtime_id, context).await?;
+            memory_notes.clear();
+            before = read_peak_mark(pid, &mut memory_notes);
+        }
         let mut canonical = canonical.clone();
         // A distinct id per repeat: the hub tracks an in-flight inference by
         // request id, and reusing one would make the second repeat a duplicate.
@@ -489,6 +497,11 @@ async fn benchmark_with_context(
     if machine_identity(&hardware) != machine_identity(&state.hub.hardware_snapshot()?) {
         return Err(M3HubError::Conflict(
             "hardware changed during benchmark; samples discarded".to_string(),
+        ));
+    }
+    if config != state.hub.runtime_config(&request.runtime_id)? {
+        return Err(M3HubError::Conflict(
+            "configured runtime settings changed during benchmark; samples discarded".to_string(),
         ));
     }
     let after = read_peak_mark(pid, &mut memory_notes);
