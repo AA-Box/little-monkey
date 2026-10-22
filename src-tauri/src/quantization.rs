@@ -396,7 +396,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
     let mut name = None;
     let mut quantization_version = None;
     let mut context_length = None;
-    let mut block_count = None;
+    let mut block_count_candidates: Vec<(String, u64)> = Vec::new();
     let mut declared_license = None;
     let mut chat_template = None;
     for _ in 0..metadata_kv_count {
@@ -425,12 +425,24 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
             (key, Some(GgufScalar::UInt(value))) if key.ends_with(".context_length") => {
                 context_length = Some(value);
             }
-            (key, Some(GgufScalar::UInt(value))) if key.ends_with(".block_count") && value > 0 => {
-                block_count = Some(value);
+            (key, Some(GgufScalar::UInt(value)))
+                if key.ends_with(".block_count") && value > 0 && block_count_candidates.len() < 16 =>
+            {
+                block_count_candidates.push((key.to_string(), value));
             }
             _ => {}
         }
     }
+
+    // Accept only the block count declared for the actual model architecture;
+    // metadata such as a foreign 'clip.block_count' must never choose how many
+    // llama.cpp layers are offloaded for an unrelated language model.
+    let block_count = architecture.as_deref().and_then(|arch| {
+        block_count_candidates
+            .iter()
+            .find(|(key, _)| key == &format!("{arch}.block_count"))
+            .map(|(_, count)| *count)
+    });
 
     // Structurally walk the tensor-info table too (name, dimensions, ggml
     // type, data offset) so a truncated/corrupt tensor table — not just a
