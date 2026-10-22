@@ -183,8 +183,8 @@ function SavedMeasurements({ entries }: { entries: BenchmarkHistoryEntry[] }) {
       <div className="min-w-0 overflow-x-auto rounded-lg border border-border">
         <table className="w-full min-w-[40rem] text-left text-xs">
           <caption className="px-3 py-2 text-left text-[11px] text-faint">
-            Most recent first, one per model per runtime. Re-running a pair replaces its entry rather than
-            appending, since two reports for the same pair are not a time series.
+            Most recent first. Each completed run is retained (up to 128); compare only when model digest,
+            configured settings, workload and hardware match.
           </caption>
           <thead className="bg-surface-2 text-faint">
             <tr>
@@ -192,17 +192,18 @@ function SavedMeasurements({ entries }: { entries: BenchmarkHistoryEntry[] }) {
               <th scope="col" className="px-3 py-2 font-medium">Runtime</th>
               <th scope="col" className="px-3 py-2 font-medium">Time to first token</th>
               <th scope="col" className="px-3 py-2 font-medium">Decode rate</th>
+              <th scope="col" className="px-3 py-2 font-medium">Measurement evidence</th>
             </tr>
           </thead>
           <tbody>
-            {entries.map((entry) => {
-              const key = `${entry.report.runtimeId}/${entry.report.model}`;
+            {entries.map((entry, index) => {
+              const key = `${entry.report.runtimeId}/${entry.report.model}/${entry.measuredAtMs}/${index}`;
               if (entry.freshness.state !== "thisMachine") {
                 return (
                   <tr key={key} className="border-t border-border align-top">
                     <td className="px-3 py-2 text-foreground">{entry.report.model}</td>
                     <td className="px-3 py-2 text-muted">{entry.report.runtimeId}</td>
-                    <td className="px-3 py-2 text-warning" colSpan={2}>
+                    <td className="px-3 py-2 text-warning" colSpan={3}>
                       Measured on different hardware, so its numbers are not shown:{" "}
                       {entry.freshness.changed.join("; ")}. Re-run the benchmark to measure this machine.
                     </td>
@@ -232,6 +233,19 @@ function SavedMeasurements({ entries }: { entries: BenchmarkHistoryEntry[] }) {
                         "tok/s",
                       )}
                     />
+                  </td>
+                  <td className="px-3 py-2 text-muted">
+                    {entry.evidence ? (
+                      <span>
+                        {entry.evidence.completedMeasuredRepeats} completed measured repeats.
+                        {entry.evidence.modelDigest
+                          ? ` Runtime-reported digest: ${entry.evidence.modelDigest.slice(0, 16)}…`
+                          : " No model digest reported; exact identity remains unverified."}
+                        {" "}Workload: {entry.evidence.workloadSha256.slice(0, 12)}…
+                      </span>
+                    ) : (
+                      <span className="text-warning">Legacy run; provenance unavailable.</span>
+                    )}
                   </td>
                 </tr>
               );
