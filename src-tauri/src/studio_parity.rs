@@ -727,6 +727,8 @@ pub struct StudioWorkflowRequest {
     pub gallery_image_entry_id: Option<String>,
     #[serde(default)]
     pub gallery_audio_entry_id: Option<String>,
+    #[serde(default)]
+    pub gallery_last_frame_entry_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1014,28 +1016,31 @@ pub async fn studio_workflow_run(
     if request.gallery_audio_entry_id.is_some() && request.input_audio.is_some() {
         return Err("Choose either Studio gallery audio or an uploaded audio file".into());
     }
+    if request.gallery_last_frame_entry_id.is_some() && request.last_frame_image.is_some() {
+        return Err("Choose either a Studio end-frame image or an uploaded end frame".into());
+    }
     let base = validate_comfy_base(&request.base_url)?;
     let client = workflow_client()?;
     let mut values = request.values.clone();
 
-    // Gallery video automatically binds both the complete source video and
-    // its real decoded last frame, unless the caller deliberately chose a
-    // separate last frame. This is a first-class Studio → FreeVideo handoff.
+    // The *last frame of the previous clip* is the *first frame of
+    // the next clip*. Do not feed it to "last_frame_image": FreeVideo
+    // interprets that as the target END frame of the next generation.
+    // Operators can supply an independent end frame explicitly.
     if let Some(entry_id) = &request.gallery_video_entry_id {
         let (upload, bytes, mime) = gallery_upload(&app, entry_id, &["video/mp4", "video/webm"])?;
-        // Some FreeVideo and video-extension graphs take the clip directly
-        // without a separate last-frame loader. Don't require a decoder or
-        // do extra work unless the imported graph actually uses that slot.
-        let needs_last = workflow_uses_binding(&request.workflow, "last_frame_image");
-        let final_png = if request.last_frame_image.is_none() && needs_last {
+        let needs_start = workflow_uses_binding(&request.workflow, "input_image")
+            && request.input_image.is_none()
+            && request.gallery_image_entry_id.is_none();
+        let starting_png = if needs_start {
             Some(crate::studio_video_jobs::extract_final_frame(&app, &bytes, &mime).await?)
         } else { None };
         values.insert("input_video".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
-        if let Some(data_base64) = final_png {
+        if let Some(data_base64) = starting_png {
             let frame = WorkflowUpload {
-                name: format!("last-{}.png", Uuid::new_v4()), data_base64,
+                name: format!("next-scene-start-{}.png", Uuid::new_v4()), data_base64,
             };
-            values.insert("last_frame_image".into(), Value::String(upload_comfy(&client, &base, &frame).await?));
+            values.insert("input_image".into(), Value::String(upload_comfy(&client, &base, &frame).await?));
         }
     }
     if let Some(entry_id) = &request.gallery_image_entry_id {
@@ -1045,6 +1050,10 @@ pub async fn studio_workflow_run(
     if let Some(entry_id) = &request.gallery_audio_entry_id {
         let (upload, _, _) = gallery_upload(&app, entry_id, &["audio/wav", "audio/mpeg", "audio/flac", "audio/ogg"])?;
         values.insert("input_audio".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
+    }
+    if let Some(entry_id) = &request.gallery_last_frame_entry_id {
+        let (upload, _, _) = gallery_upload(&app, entry_id, &["image/png", "image/jpeg", "image/webp"])?;
+        values.insert("last_frame_image".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
     }
     if let Some(image) = &request.input_image {
         values.insert(
@@ -1241,6 +1250,7 @@ mod gallery_binding_tests {
         assert_eq!(super::unresolved_media_binding(&workflow), Some("input_video"));
         assert!(super::workflow_uses_binding(&workflow, "last_frame_image"));
         assert!(!super::workflow_uses_binding(&workflow, "input_audio"));
+        assert!(super::workflow_uses_binding(&workflow, "input_video"));
         let mut data = std::collections::BTreeMap::new();
         data.insert("input_video".to_string(), serde_json::json!("source.mp4"));
         data.insert("last_frame_image".to_string(), serde_json::json!("last.png"));

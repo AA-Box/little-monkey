@@ -61,6 +61,7 @@ export function CreatorHubPanel() {
   const [galleryVideoEntryId, setGalleryVideoEntryId] = useState("");
   const [galleryImageEntryId, setGalleryImageEntryId] = useState("");
   const [galleryAudioEntryId, setGalleryAudioEntryId] = useState("");
+  const [galleryLastFrameEntryId, setGalleryLastFrameEntryId] = useState("");
 
   useEffect(() => {
     void studioClient.engineStatus().then((status) => setTotalRam(status.totalRamBytes)).catch(() => undefined);
@@ -180,7 +181,7 @@ export function CreatorHubPanel() {
       setInputVideo(upload); setGalleryVideoEntryId("");
     } else if (type === "audio") {
       setInputAudio(upload); setGalleryAudioEntryId("");
-    } else setLastFrameImage(upload);
+    } else { setLastFrameImage(upload); setGalleryLastFrameEntryId(""); }
   };
   const runWorkflow = async () => {
     if (!workflow) return;
@@ -199,6 +200,7 @@ export function CreatorHubPanel() {
         galleryVideoEntryId: withGallery && galleryVideoEntryId ? galleryVideoEntryId : null,
         galleryImageEntryId: workflowKind === "freevideo" && galleryImageEntryId ? galleryImageEntryId : null,
         galleryAudioEntryId: workflowKind === "freevideo" && galleryAudioEntryId ? galleryAudioEntryId : null,
+        galleryLastFrameEntryId: workflowKind === "freevideo" && galleryLastFrameEntryId ? galleryLastFrameEntryId : null,
       }));
       // The next FreeVideo scene can immediately reuse this published result.
       if (withGallery) setGalleryEntries(await studioClient.gallery());
@@ -264,8 +266,9 @@ export function CreatorHubPanel() {
             </Button>
           </div>
           <p className="text-[11px] text-muted">
-            The backend reads verified gallery media. For a video, it uploads the clip and automatically extracts
-            its real last frame for FreeVideo; no MP4 or frame data goes through the browser.
+            The backend uploads the chosen clip and, when the graph needs a first frame, uses the
+            previous clip's final frame as the next scene's starting image. Choose a separate target
+            end frame below. Large MP4 and frame data never pass through the browser.
           </p>
           <label className="grid gap-1 text-[11px] text-muted">
             Source video or finished timeline
@@ -290,6 +293,19 @@ export function CreatorHubPanel() {
                     if (event.target.value) setInputImage(null);
                   }}>
                   <option value="">Use a local image or no first frame</option>
+                  {galleryImages.map((entry) => <option key={entry.entryId} value={entry.entryId}>
+                    {entry.prompt?.slice(0, 80) || entry.modelId}
+                  </option>)}
+                </select>
+              </label>
+              <label className="grid gap-1 text-[11px] text-muted">
+                Target end frame for next clip (optional)
+                <select className="w-full rounded border border-border bg-background p-1 text-xs" value={galleryLastFrameEntryId}
+                  onChange={(event) => {
+                    setGalleryLastFrameEntryId(event.target.value);
+                    if (event.target.value) setLastFrameImage(null);
+                  }}>
+                  <option value="">No gallery end frame / use manual file</option>
                   {galleryImages.map((entry) => <option key={entry.entryId} value={entry.entryId}>
                     {entry.prompt?.slice(0, 80) || entry.modelId}
                   </option>)}
