@@ -259,6 +259,24 @@ async fn probe_canvas(path: &Path) -> Result<(u32, u32), String> {
     Ok((target_width, target_height))
 }
 
+async fn probe_duration_ms(path: &Path) -> Result<u64, String> {
+    let binary = ffmpeg_executable().with_file_name("ffprobe");
+    let output = tokio::time::timeout(Duration::from_secs(20),
+        Command::new(binary)
+            .args(["-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(path).stdin(Stdio::null()).stderr(Stdio::null()).output()
+    ).await.map_err(|_| "MP4 duration probe timed out".to_string())?
+     .map_err(|e| format!("FFprobe is required to inspect MP4 duration: {e}"))?;
+    if !output.status.success() { return Err("Cannot inspect assembled MP4 duration".into()); }
+    let text = std::str::from_utf8(&output.stdout).map_err(|e| e.to_string())?;
+    let seconds: f64 = text.trim().parse().map_err(|_| "Invalid MP4 duration")?;
+    if !seconds.is_finite() || seconds <= 0.0 || seconds > 60.0 * 60.0 {
+        return Err("Assembled MP4 duration is invalid or exceeds one hour".into());
+    }
+    Ok((seconds * 1000.0).round() as u64)
+}
+
 fn ffmpeg_executable() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -481,8 +499,9 @@ async fn assemble(app: &AppHandle, timeline: &VideoTimeline) -> Result<Generatio
         let (width, height) = probe_canvas(&paths[0]).await?;
         let out = scratch.join("timeline.mp4");
         export_ffmpeg(&paths, &timeline.segments, music.as_deref(), &out, width, height).await?;
+        let duration_ms = probe_duration_ms(&out).await?;
         let bytes = fs::read(&out).map_err(|e| e.to_string())?;
-        generation_commands::publish_timeline_export(app, timeline, &entries, &bytes, (width, height))
+        generation_commands::publish_timeline_export(app, timeline, &entries, &bytes, (width, height), duration_ms)
     }.await;
     result
 }
@@ -633,6 +652,8 @@ mod tests {
         export_ffmpeg(&[a,b], &segments, None, &out, 64, 64).await.unwrap();
         let metadata = fs::metadata(&out).unwrap();
         assert!(metadata.len() > 500);
+        let duration = probe_duration_ms(&out).await.unwrap();
+        assert!(duration >= 1950 && duration <= 2050, "two full one-second clips must produce two seconds");
         let verify = std::process::Command::new("ffmpeg")
             .args(["-nostdin", "-loglevel", "error", "-i"])
             .arg(&out).args(["-f","null","-"]).status().unwrap();

@@ -229,6 +229,7 @@ pub(crate) fn publish_timeline_export(
     clips: &[GenerationEntry],
     media: &[u8],
     canvas: (u32, u32),
+    duration_ms: u64,
 ) -> Result<GenerationEntry, String> {
     let _guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let model_id = format!("studio:timeline:{}", timeline.id);
@@ -238,9 +239,8 @@ pub(crate) fn publish_timeline_export(
     }
     let blob = artifacts(app)?.put(media).map_err(|error| error.to_string())?;
     let first = clips.first().ok_or("Timeline has no published segments")?;
-    let duration_ms = timeline.segments.iter().zip(clips.iter()).map(|(segment, item)| {
-        segment.trim_end_ms.unwrap_or(item.duration_ms).saturating_sub(segment.trim_start_ms)
-    }).sum();
+    // FFprobe measured this final file. Imported ComfyUI gallery clips may
+    // have no source duration in their metadata, so summing those would lie.
     let entry = GenerationEntry {
         entry_id: format!("studio-{}", Uuid::new_v4()),
         artifact_id: blob.id,
