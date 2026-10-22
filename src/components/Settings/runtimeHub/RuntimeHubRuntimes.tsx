@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, FileText, Gauge, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
@@ -11,7 +11,6 @@ import type {
   M3InstalledModel,
   M3RuntimeCapability,
   M3RuntimeKind,
-  M3LoadRecoveryRecord,
   OffloadPlan,
   OffloadPlanInput,
   RunningModel,
@@ -34,7 +33,10 @@ import {
   Toggle,
 } from "./RuntimeHubShared";
 import { errorMessage } from "../../../lib/errors";
-import { runtimeHubClient } from "../../../lib/runtimeHubClient";
+
+const RuntimeHubLoadRecoveryHistory = lazy(() =>
+  import("./RuntimeHubLoadRecoveryHistory").then((module) => ({ default: module.RuntimeHubLoadRecoveryHistory })),
+);
 
 function statusState(detail: RuntimeDetail | undefined): string {
   if (!detail?.status) return "unknown";
@@ -489,50 +491,6 @@ function SettingControl({
   return <p className="text-xs text-danger">Unsupported setting schema for {capability.key}</p>;
 }
 
-/** Native-only bounded evidence; the backend never persists prompt text or logs. */
-function LoadRecoveryHistory({ runtimeId, loading }: { runtimeId: string; loading: boolean }) {
-  const [records, setRecords] = useState<M3LoadRecoveryRecord[]>([]);
-  const [historyError, setHistoryError] = useState<string | null>(null);
-  const [refreshNumber, setRefreshNumber] = useState(0);
-
-  useEffect(() => {
-    let active = true;
-    void runtimeHubClient.runtimeLoadRecoveryHistory().then((all) => {
-      if (!active) return;
-      setRecords(all.filter((record) => record.runtimeId === runtimeId).slice(-5).reverse());
-      setHistoryError(null);
-    }).catch((error: unknown) => {
-      if (active) setHistoryError(errorMessage(error));
-    });
-    return () => { active = false; };
-  }, [runtimeId, loading, refreshNumber]);
-
-  return (
-    <section className="mt-4 rounded-md border border-border bg-surface-2 p-3" aria-label="Model-load recovery history">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-xs font-medium text-foreground">Model-load attempts</p>
-        <Button type="button" className="min-h-9" onClick={() => setRefreshNumber((value) => value + 1)}>
-          <RefreshCw size={13} aria-hidden="true" /> Refresh
-        </Button>
-      </div>
-      {historyError && <ErrorNotice message={historyError} />}
-      {!historyError && records.length === 0 && <p className="mt-2 text-xs text-muted">No recorded loads yet.</p>}
-      {records.map((record, index) => (
-        <div key={`${record.atMs}-${record.assetId}-${index}`} className="mt-2 border-t border-border pt-2 text-xs text-muted">
-          <p className="break-all text-foreground">{record.assetId} · {formatDate(record.atMs)} · {record.recovered ? "Recovered after OOM" : record.attempts[record.attempts.length - 1]?.outcome === "success" ? "Loaded normally" : "Load failed"}</p>
-          <ol className="mt-1 list-inside list-decimal space-y-1">
-            {record.attempts.map((attempt) => (
-              <li key={attempt.ordinal}>
-                {attempt.outcome.replace(/_/g, " ")} · context {attempt.contextTokens.toLocaleString()} · GPU layers {attempt.gpuLayers === -1 ? "runtime default" : attempt.gpuLayers}
-              </li>
-            ))}
-          </ol>
-        </div>
-      ))}
-    </section>
-  );
-}
-
 function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const { t } = useT();
   const runtimeId = runtime.descriptor.runtimeId;
@@ -732,7 +690,11 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
           )}
           <OffloadPlanPanel plan={offloadPlan} busy={offloadBusy} error={offloadError} />
           <ErrorNotice message={errors[`load:${runtimeId}`]} />
-          {runtime.descriptor.kind === "llama_cpp" && <LoadRecoveryHistory runtimeId={runtimeId} loading={!!busy[`load:${runtimeId}`]} />}
+          {runtime.descriptor.kind === "llama_cpp" && (
+            <Suspense fallback={<p className="mt-2 text-xs text-muted">Loading model-load history…</p>}>
+              <RuntimeHubLoadRecoveryHistory runtimeId={runtimeId} loading={!!busy[`load:${runtimeId}`]} />
+            </Suspense>
+          )}
           <div className="mt-3 flex justify-end">
             <BusyButton type="button" variant="primary" busy={busy[`load:${runtimeId}`]} disabled={!assetId} onClick={handleLoad}>
               <Play size={15} aria-hidden="true" /> Load model
