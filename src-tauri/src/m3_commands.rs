@@ -51,6 +51,7 @@ use crate::runtime_telemetry::{
     SupportBundle, TraceFieldNote,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -350,6 +351,21 @@ pub fn m3_hardware_profile(
 pub struct M3BenchmarkResponse {
     pub report: BenchmarkReport,
     pub hardware: HardwareSnapshot,
+    pub evidence: BenchmarkEvidence,
+}
+
+/// Recorded by the Rust command from the live stream, inventory and process.
+/// None for a runtime-owned field means unknown, never inferred.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BenchmarkEvidence {
+    pub workload_sha256: String,
+    pub model_digest: Option<String>,
+    pub model_size_bytes: u64,
+    pub runtime_process_id: Option<i64>,
+    /// Hash of the user's configured settings, not a claim about runtime argv.
+    pub configured_settings_sha256: String,
+    pub completed_measured_repeats: u32,
 }
 
 /// ROADMAP #2. Times `repeats` real streamed generations of `model` on
@@ -369,25 +385,33 @@ pub async fn m3_benchmark_run(
     request: BenchmarkRequest,
 ) -> Result<M3BenchmarkResponse, String> {
     let request = request.validated()?;
+    // Two concurrent benchmark commands compete for the same memory/compute
+    // budget and contaminate each other's measurements. Refuse rather than
+    // queue silently beyond the caller's requested timeout.
+    static BENCHMARK_EXECUTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _execution_guard = BENCHMARK_EXECUTION_LOCK
+        .try_lock()
+        .map_err(|_| "another local benchmark is already running".to_string())?;
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = benchmark_with_context(&state, &request, &context).await;
     let response = finish(&state, &operation_id, result).await?;
 
-    // Persisted after the operation is finished, not inside it: a benchmark that
-    // measured fine but could not be written down is still a valid measurement,
-    // and failing the command would throw away the wall-clock the user spent.
-    // The write error is surfaced through the log rather than swallowed.
+    // Never report successful persistence if storage failed. Serialize
+    // read-modify-write so concurrent benchmark commands retain both runs.
+    static HISTORY_WRITE_LOCK: Mutex<()> = Mutex::new(());
     let path = benchmark_history_path(&app)?;
     let stored = StoredBenchmark {
         report: response.report.clone(),
         machine: machine_identity(&response.hardware),
         measured_at_ms: trusted_now_ms(),
+        evidence: Some(response.evidence.clone()),
     };
-    if let Err(error) = load_benchmarks(&path)
-        .and_then(|existing| save_benchmarks(&path, &remember_benchmark(existing, stored)))
-    {
-        eprintln!("benchmark measured but not saved: {error}");
-    }
+    let _guard = HISTORY_WRITE_LOCK
+        .lock()
+        .map_err(|_| "Benchmark history lock poisoned".to_string())?;
+    let existing = load_benchmarks(&path)?;
+    save_benchmarks(&path, &remember_benchmark(existing, stored))
+        .map_err(|e| format!("Benchmark measured but could not be persisted: {e}"))?;
     Ok(response)
 }
 
@@ -428,18 +452,28 @@ async fn benchmark_with_context(
     context: &M3OperationContext,
 ) -> Result<M3BenchmarkResponse, M3HubError> {
     let hardware = state.hub.hardware_snapshot()?;
-    refuse_a_model_this_machine_does_not_run(state, request, context).await?;
+    let model_before = benchmark_local_model(state, request, context).await?;
+    let config = state.hub.runtime_config(&request.runtime_id)?;
+    let configured_settings_sha256 = sha256_hex_serialized(&config)?;
 
-    let pid = state
+    let mut pid = state
         .hub
         .benchmark_runtime_pid(&request.runtime_id, context)
         .await?;
     let mut memory_notes = Vec::new();
-    let before = read_peak_mark(pid, &mut memory_notes);
+    let mut before = read_peak_mark(pid, &mut memory_notes);
 
     let canonical = canonical_benchmark_request(request);
     let mut samples = Vec::with_capacity(request.repeats as usize);
     for repeat in 0..request.repeats {
+        // A lazy-starting local server may not exist until the warm-up.
+        // Sample its real PID and high-water baseline AFTER warm-up so the
+        // counted repeats aren't assigned the cold start's RSS peak.
+        if repeat == benchmark::WARMUP_REPEATS {
+            pid = state.hub.benchmark_runtime_pid(&request.runtime_id, context).await?;
+            memory_notes.clear();
+            before = read_peak_mark(pid, &mut memory_notes);
+        }
         let mut canonical = canonical.clone();
         // A distinct id per repeat: the hub tracks an in-flight inference by
         // request id, and reusing one would make the second repeat a duplicate.
@@ -452,6 +486,20 @@ async fn benchmark_with_context(
         );
     }
 
+    let model_after = benchmark_local_model(state, request, context).await?;
+    let pid_after = state.hub.benchmark_runtime_pid(&request.runtime_id, context).await?;
+    let current_machine = machine_identity(&state.hub.hardware_snapshot()?);
+    let current_config = state.hub.runtime_config(&request.runtime_id)?;
+    ensure_benchmark_continuity(
+        &model_before,
+        &model_after,
+        pid,
+        pid_after,
+        &machine_identity(&hardware),
+        &current_machine,
+        &config,
+        &current_config,
+    )?;
     let after = read_peak_mark(pid, &mut memory_notes);
     let mut peak_memory = PeakMemory::measure(pid, before, after);
     peak_memory.unavailable.extend(memory_notes);
@@ -476,7 +524,30 @@ async fn benchmark_with_context(
             .to_string(),
     });
 
-    Ok(M3BenchmarkResponse { report, hardware })
+    let completed_measured_repeats = report.samples.iter().filter(|sample| {
+        !sample.warmup && sample.timings.error.is_none()
+            && sample.decode_tokens_per_second.is_some()
+            && sample.timings.time_to_first_token_ms.is_some()
+    }).count() as u32;
+    if completed_measured_repeats == 0 {
+        return Err(M3HubError::Runtime(
+            "no complete non-warmup generation with measured token usage; nothing saved".to_string(),
+        ));
+    }
+    let evidence = BenchmarkEvidence {
+        workload_sha256: sha256_hex_serialized(&(
+            request.prompt_text(),
+            request.max_output_tokens,
+            request.repeats,
+            benchmark::WARMUP_REPEATS,
+        ))?,
+        model_digest: model_before.digest,
+        model_size_bytes: model_before.size_bytes,
+        runtime_process_id: pid,
+        configured_settings_sha256,
+        completed_measured_repeats,
+    };
+    Ok(M3BenchmarkResponse { report, hardware, evidence })
 }
 
 /// Refuses a model whose numbers would have been produced somewhere else.
@@ -486,11 +557,11 @@ async fn benchmark_with_context(
 /// thing ROADMAP #2's "on the machine displaying it" clause rules out. A model
 /// the inventory does not list at all is also refused, since the alternative is
 /// a per-repeat "model not found" reported as a failed measurement.
-async fn refuse_a_model_this_machine_does_not_run(
+async fn benchmark_local_model(
     state: &M3CommandState,
     request: &BenchmarkRequest,
     context: &M3OperationContext,
-) -> Result<(), M3HubError> {
+) -> Result<crate::runtime_adapter::RuntimeModel, M3HubError> {
     let inventory = state
         .hub
         .runtime_inventory(&request.runtime_id, context)
@@ -512,7 +583,49 @@ async fn refuse_a_model_this_machine_does_not_run(
             request.model
         )));
     }
+    Ok(model.clone())
+}
+
+/// All measurements must belong to one model and one surviving execution
+/// context. Kept pure to regression-test failure paths without local GPUs.
+fn ensure_benchmark_continuity(
+    before: &crate::runtime_adapter::RuntimeModel,
+    after: &crate::runtime_adapter::RuntimeModel,
+    original_pid: Option<i64>,
+    current_pid: Option<i64>,
+    original_machine: &MachineIdentity,
+    current_machine: &MachineIdentity,
+    original_config: &Option<BTreeMap<String, crate::runtime_adapter::SettingValue>>,
+    current_config: &Option<BTreeMap<String, crate::runtime_adapter::SettingValue>>,
+) -> M3HubResult<()> {
+    if before.digest != after.digest
+        || before.size_bytes != after.size_bytes
+        || before.local_path != after.local_path
+    {
+        return Err(M3HubError::Conflict(
+            "the measured model changed during benchmark; samples discarded".to_string(),
+        ));
+    }
+    if original_pid != current_pid {
+        return Err(M3HubError::Conflict(
+            "the runtime process restarted during benchmark; samples discarded".to_string(),
+        ));
+    }
+    if original_machine != current_machine {
+        return Err(M3HubError::Conflict(
+            "hardware changed during benchmark; samples discarded".to_string(),
+        ));
+    }
+    if original_config != current_config {
+        return Err(M3HubError::Conflict(
+            "configured runtime settings changed during benchmark; samples discarded".to_string(),
+        ));
+    }
     Ok(())
+}
+
+fn sha256_hex_serialized<T: Serialize>(value: &T) -> M3HubResult<String> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
 /// Filename for the persisted benchmark history under the app data directory —
@@ -526,7 +639,7 @@ const BENCHMARK_FILE: &str = "benchmarks.json";
 /// How many reports to keep. One per model per runtime is the useful unit, and a
 /// user with more than this many benchmarked models is better served by the most
 /// recent ones than by an unbounded file.
-const MAX_STORED_BENCHMARKS: usize = 32;
+const MAX_STORED_BENCHMARKS: usize = 128;
 
 /// A report, the machine it was measured on, and when.
 ///
@@ -540,6 +653,8 @@ pub struct StoredBenchmark {
     pub report: BenchmarkReport,
     pub machine: MachineIdentity,
     pub measured_at_ms: u64,
+    #[serde(default)]
+    pub evidence: Option<BenchmarkEvidence>,
 }
 
 /// A stored report paired with whether its numbers may be shown.
@@ -601,26 +716,15 @@ fn save_benchmarks(path: &Path, stored: &[StoredBenchmark]) -> Result<(), String
     std::fs::rename(&temporary, path).map_err(|e| format!("Failed to save {BENCHMARK_FILE}: {e}"))
 }
 
-/// Insert `fresh`, replacing any earlier report for the same runtime and model.
-///
-/// Most recent first, capped at [`MAX_STORED_BENCHMARKS`]. Replacing rather than
-/// appending is deliberate: two reports for one model on one runtime differ only
-/// by when they ran, and keeping both invites a reader to compare numbers that
-/// were never meant to be a time series.
+/// Retain individual run records so changes in prompt or settings cannot
+/// silently replace previous measurements. Oldest entries are bounded.
 fn remember_benchmark(
-    existing: Vec<StoredBenchmark>,
+    mut existing: Vec<StoredBenchmark>,
     fresh: StoredBenchmark,
 ) -> Vec<StoredBenchmark> {
-    let mut kept: Vec<StoredBenchmark> = existing
-        .into_iter()
-        .filter(|entry| {
-            entry.report.runtime_id != fresh.report.runtime_id
-                || entry.report.model != fresh.report.model
-        })
-        .collect();
-    kept.insert(0, fresh);
-    kept.truncate(MAX_STORED_BENCHMARKS);
-    kept
+    existing.insert(0, fresh);
+    existing.truncate(MAX_STORED_BENCHMARKS);
+    existing
 }
 
 /// Reads the runtime process's high-water mark, collecting the platform's own
@@ -2099,30 +2203,96 @@ mod tests {
                 accelerators: Vec::new(),
             },
             measured_at_ms,
+            evidence: None,
         }
     }
 
-    /// Two reports for one model on one runtime differ only by when they ran, so
-    /// keeping both would invite a reader to compare numbers that were never
-    /// meant to be a time series.
+    /// Every real run is retained even when two runs use the same model. A
+    /// changed workload/configuration is not comparable to an earlier run.
     #[test]
-    fn re_benchmarking_a_pair_replaces_its_entry_rather_than_appending() {
+    fn re_benchmarking_retains_both_runs_in_newest_first_order() {
         let history = remember_benchmark(Vec::new(), stored("llama-local", "qwen3-4b", 1));
         let history = remember_benchmark(history, stored("llama-local", "gemma3-4b", 2));
         let history = remember_benchmark(history, stored("llama-local", "qwen3-4b", 3));
-
-        assert_eq!(
-            history.len(),
-            2,
-            "the qwen entry was replaced, not appended"
-        );
-        assert_eq!(history[0].report.model, "qwen3-4b");
-        assert_eq!(history[0].measured_at_ms, 3, "most recent first");
-        assert_eq!(history[1].report.model, "gemma3-4b");
-
-        // Same model on a different runtime is a different measurement.
-        let history = remember_benchmark(history, stored("ollama", "qwen3-4b", 4));
         assert_eq!(history.len(), 3);
+        assert_eq!(history[0].report.model, "qwen3-4b");
+        assert_eq!(history[0].measured_at_ms, 3);
+        assert_eq!(history[1].report.model, "gemma3-4b");
+        assert_eq!(history[2].measured_at_ms, 1);
+        let history = remember_benchmark(history, stored("ollama", "qwen3-4b", 4));
+        assert_eq!(history.len(), 4);
+    }
+
+    #[test]
+    fn benchmark_continuity_rejects_model_restart_memory_and_configuration_drift() {
+        use crate::runtime_adapter::{ModelCapabilities, RuntimeModel, SettingValue};
+        let model = RuntimeModel {
+            model_id: "qwen".into(),
+            display_name: "qwen".into(),
+            size_bytes: 1_024,
+            local_path: Some(PathBuf::from("/tmp/fixture.gguf")),
+            digest: Some("sha256:sample".into()),
+            modified_at: None,
+            capabilities: ModelCapabilities {
+                chat: true,
+                embeddings: false,
+                tool_calling: false,
+                vision: false,
+            },
+            metadata: BTreeMap::new(),
+        };
+        let machine = stored("llama", "qwen", 1).machine;
+        let settings = Some(BTreeMap::<String, SettingValue>::new());
+        let check = |other: &RuntimeModel,
+                     pid: Option<i64>,
+                     hardware: &MachineIdentity,
+                     config: &Option<BTreeMap<String, SettingValue>>| {
+            ensure_benchmark_continuity(
+                &model, other, Some(17), pid,
+                &machine, hardware, &settings, config,
+            )
+        };
+        assert!(check(&model, Some(17), &machine, &settings).is_ok());
+        let changed_model = RuntimeModel { digest: Some("other".into()), ..model.clone() };
+        assert!(check(&changed_model, Some(17), &machine, &settings)
+            .unwrap_err().to_string().contains("model changed"));
+        assert!(check(&model, Some(18), &machine, &settings)
+            .unwrap_err().to_string().contains("restarted"));
+        let changed_machine = MachineIdentity { total_ram_bytes: 64 << 30, ..machine.clone() };
+        assert!(check(&model, Some(17), &changed_machine, &settings)
+            .unwrap_err().to_string().contains("hardware changed"));
+        let mut changed_settings = BTreeMap::new();
+        changed_settings.insert("context_size".into(), SettingValue::Integer { value: 2048 });
+        assert!(check(&model, Some(17), &machine, &Some(changed_settings))
+            .unwrap_err().to_string().contains("settings changed"));
+    }
+
+    #[test]
+    fn evidence_round_trips_and_old_records_remain_unverified() {
+        let original = stored("llama-local", "qwen3-4b", 1);
+        let json = serde_json::to_value(&original).unwrap();
+        let mut legacy = json.clone();
+        legacy.as_object_mut().unwrap().remove("evidence");
+        let imported: StoredBenchmark = serde_json::from_value(legacy).unwrap();
+        assert!(imported.evidence.is_none(), "legacy records have no trusted provenance");
+
+        let mut proven = original;
+        proven.evidence = Some(BenchmarkEvidence {
+            workload_sha256: "a".repeat(64),
+            model_digest: Some("sha256:abc".into()),
+            model_size_bytes: 1_000,
+            runtime_process_id: Some(123),
+            configured_settings_sha256: "b".repeat(64),
+            completed_measured_repeats: 3,
+        });
+        assert_eq!(
+            serde_json::from_value::<StoredBenchmark>(serde_json::to_value(&proven).unwrap()).unwrap(),
+            proven
+        );
+        assert_ne!(
+            sha256_hex_serialized(&("hello", 128u32, 5u32)).unwrap(),
+            sha256_hex_serialized(&("hello", 256u32, 5u32)).unwrap(),
+        );
     }
 
     #[test]
