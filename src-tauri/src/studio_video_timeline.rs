@@ -142,14 +142,22 @@ fn save(path: &Path, jobs: &[VideoTimeline]) -> Result<(), String> {
     saved
 }
 
+fn valid_source_id(id: &str) -> bool {
+    if let Some(entry) = id.strip_prefix("gallery:studio-") {
+        let Ok(uuid) = Uuid::parse_str(entry) else { return false };
+        return uuid.to_string() == entry;
+    }
+    Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
+}
+
 fn validate_segments(segments: &[VideoTimelineSegment]) -> Result<(), String> {
     if !(2..=MAX_SEGMENTS).contains(&segments.len()) {
         return Err(format!("Select 2–{MAX_SEGMENTS} video clips to export"));
     }
     let mut seen = BTreeSet::new();
     for seg in segments {
-        if Uuid::parse_str(&seg.job_id).is_err() {
-            return Err("A timeline segment has an invalid video-job ID".into());
+        if !valid_source_id(&seg.job_id) {
+            return Err("A timeline segment must name a video job or a Studio gallery entry".into());
         }
         if !seen.insert(&seg.job_id) {
             return Err("A video job cannot appear twice in one timeline".into());
@@ -185,6 +193,15 @@ fn clip_entries(
 ) -> Result<Option<Vec<GenerationEntry>>, String> {
     let mut found = Vec::new();
     for segment in &timeline.segments {
+        if let Some(entry_id) = segment.job_id.strip_prefix("gallery:") {
+            let item = gallery.iter().find(|entry| entry.entry_id == entry_id)
+                .ok_or_else(|| format!("Gallery source {entry_id} is unavailable"))?;
+            if item.media_type != "video/mp4" && item.media_type != "video/webm" {
+                return Err("Gallery timeline source is not an MP4 or WebM video".into());
+            }
+            found.push(item.clone());
+            continue;
+        }
         let job = completed_jobs.iter().find(|j| j.id == segment.job_id)
             .ok_or_else(|| "A timeline references an unknown video job".to_string())?;
         match job.status {
@@ -213,6 +230,33 @@ fn clip_entries(
         found.push(item.clone());
     }
     Ok(Some(found))
+}
+
+/// Imported ComfyUI clips may not record pixel dimensions in gallery metadata.
+/// Inspect the actual decoded video stream so the timeline canvas is never a
+/// guessed 64x64 thumbnail.
+async fn probe_canvas(path: &Path) -> Result<(u32, u32), String> {
+    let ffprobe = ffmpeg_executable().with_file_name("ffprobe");
+    let output = tokio::time::timeout(Duration::from_secs(20),
+        Command::new(ffprobe)
+            .args(["-v","error","-select_streams","v:0",
+                   "-show_entries","stream=width,height","-of","csv=s=x:p=0"])
+            .arg(path)
+            .stdin(Stdio::null()).stderr(Stdio::null()).output()
+    ).await.map_err(|_| "Video geometry probe timed out".to_string())?
+     .map_err(|e| format!("FFprobe is required to read video dimensions: {e}"))?;
+    if !output.status.success() { return Err("Cannot read video stream geometry".into()); }
+    let line = std::str::from_utf8(&output.stdout).map_err(|e| e.to_string())?;
+    let mut parts = line.trim().split('x');
+    let width: u32 = parts.next().unwrap_or("").parse().map_err(|_| "Invalid video width")?;
+    let height: u32 = parts.next().unwrap_or("").parse().map_err(|_| "Invalid video height")?;
+    if parts.next().is_some() || width < 32 || height < 32 || width > 8192 || height > 8192 {
+        return Err("Source video dimensions are unsupported".into());
+    }
+    let scale = f64::min(1920.0 / f64::from(width), 1080.0 / f64::from(height)).min(1.0);
+    let target_width = ((f64::from(width) * scale).round() as u32 / 2 * 2).max(64);
+    let target_height = ((f64::from(height) * scale).round() as u32 / 2 * 2).max(64);
+    Ok((target_width, target_height))
 }
 
 fn ffmpeg_executable() -> PathBuf {
@@ -434,8 +478,7 @@ async fn assemble(app: &AppHandle, timeline: &VideoTimeline) -> Result<Generatio
             fs::write(&path, bytes).map_err(|e| e.to_string())?;
             paths.push(path);
         }
-        let width = entries[0].width.clamp(64, 1920) / 2 * 2;
-        let height = entries[0].height.clamp(64, 1080) / 2 * 2;
+        let (width, height) = probe_canvas(&paths[0]).await?;
         let out = scratch.join("timeline.mp4");
         export_ffmpeg(&paths, &timeline.segments, music.as_deref(), &out, width, height).await?;
         let bytes = fs::read(&out).map_err(|e| e.to_string())?;
@@ -556,6 +599,14 @@ mod tests {
         assert!(graph.contains("trim=start=0.500:end=1.200"));
         assert!(graph.contains("[v0][v1]concat=n=2:v=1:a=0[outv]"));
         assert!(graph.contains("pad=640:384"));
+    }
+    #[test]
+    fn gallery_video_refs_are_explicit_and_path_safe() {
+        let uuid = Uuid::new_v4().to_string();
+        assert!(valid_source_id(&format!("gallery:studio-{uuid}")));
+        assert!(!valid_source_id("gallery:../../etc/passwd"));
+        assert!(!valid_source_id("gallery:studio-not-a-uuid"));
+        assert!(!valid_source_id(&format!("gallery:{uuid}")));
     }
     #[test]
     fn soundtrack_rejects_unbounded_or_relative_files() {
