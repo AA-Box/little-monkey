@@ -95,7 +95,7 @@ export function VideoJobsPanel() {
               <Button size="sm" variant="secondary" disabled={busy === job.id}
                 onClick={() => void act(job, "cancel")}>Cancel</Button>
             )}
-            {job.status === "completed" && (
+            {(["queued", "running", "completed"] as const).some((status) => status === job.status) && (
               <span className="flex min-w-0 items-center gap-1">
                 <input aria-label="Next scene prompt" placeholder="Next scene prompt"
                   className="w-36 rounded border border-border bg-background px-2 py-1 text-[11px]"
