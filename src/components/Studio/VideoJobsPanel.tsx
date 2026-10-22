@@ -102,7 +102,7 @@ export function VideoJobsPanel() {
                 <Button size="sm" variant="secondary" disabled={busy === job.id}
                   onClick={() => void continueFrom(job)}>Continue</Button>
               </span>
-            )
+            )}
           </div>
         ))}
       </div>
