@@ -68,7 +68,7 @@ export const studioParityClient = {
   startPortableCharacterTraining: (request: PortableTrainingRequest) => invoke<PortableTrainingStatus>("character_portable_training_start", { request }),
   portableCharacterStatus: () => invoke<PortableTrainingStatus>("character_training_status"),
   cancelPortableCharacterTraining: () => invoke<void>("character_training_cancel"),
-  runWorkflow: (request: { kind: WorkflowKind; baseUrl: string; workflow: unknown; values: Record<string, unknown>; inputImage?: WorkflowUpload | null; inputVideo?: WorkflowUpload | null; lastFrameImage?: WorkflowUpload | null; inputAudio?: WorkflowUpload | null }) => invoke<import("./studioClient").GenerationEntry[]>("studio_workflow_run", { request }),
+  runWorkflow: (request: { kind: WorkflowKind; baseUrl: string; workflow: unknown; values: Record<string, unknown>; inputImage?: WorkflowUpload | null; inputVideo?: WorkflowUpload | null; lastFrameImage?: WorkflowUpload | null; inputAudio?: WorkflowUpload | null; galleryVideoEntryId?: string | null; galleryImageEntryId?: string | null; galleryAudioEntryId?: string | null }) => invoke<import("./studioClient").GenerationEntry[]>("studio_workflow_run", { request }),
 };
 
 export function inferComponentSlot(item: DiscoveryItem): ComponentSlot {

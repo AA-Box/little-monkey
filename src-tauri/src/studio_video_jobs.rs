@@ -322,7 +322,7 @@ fn parent_artifact(parent: &VideoJob, entries: &[GenerationEntry]) -> Result<Gen
 
 /// FFmpeg's image2 -update 1 overwrites one PNG for every decoded input frame.
 /// The final PNG is therefore the decoded last frame rather than a thumbnail.
-async fn extract_final_frame(app: &AppHandle, media: &[u8], mime: &str) -> Result<String, String> {
+pub(crate) async fn extract_final_frame(app: &AppHandle, media: &[u8], mime: &str) -> Result<String, String> {
     let root = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-v1").join("video-handoff");
     extract_final_frame_in(&root, media, mime).await

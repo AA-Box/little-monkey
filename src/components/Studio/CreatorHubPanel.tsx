@@ -57,6 +57,10 @@ export function CreatorHubPanel() {
   const [inputAudio, setInputAudio] = useState<WorkflowUpload | null>(null);
   const [workflowSeed, setWorkflowSeed] = useState("42");
   const [workflowResults, setWorkflowResults] = useState<GenerationEntry[]>([]);
+  const [galleryEntries, setGalleryEntries] = useState<GenerationEntry[]>([]);
+  const [galleryVideoEntryId, setGalleryVideoEntryId] = useState("");
+  const [galleryImageEntryId, setGalleryImageEntryId] = useState("");
+  const [galleryAudioEntryId, setGalleryAudioEntryId] = useState("");
 
   useEffect(() => {
     void studioClient.engineStatus().then((status) => setTotalRam(status.totalRamBytes)).catch(() => undefined);
@@ -87,6 +91,21 @@ export function CreatorHubPanel() {
       setError(errorMessage(cause));
     });
   }, [portableTraining, characterName]);
+
+  useEffect(() => {
+    if (workflowKind !== "freevideo" && workflowKind !== "extend_video") return;
+    void studioClient.gallery().then(setGalleryEntries).catch((cause) => setError(errorMessage(cause)));
+  }, [workflowKind]);
+
+  const galleryVideos = useMemo(() =>
+    galleryEntries.filter((entry) => entry.mediaType === "video/mp4" || entry.mediaType === "video/webm"),
+    [galleryEntries]);
+  const galleryImages = useMemo(() =>
+    galleryEntries.filter((entry) => ["image/png", "image/jpeg", "image/webp"].includes(entry.mediaType)),
+    [galleryEntries]);
+  const galleryAudio = useMemo(() =>
+    galleryEntries.filter((entry) => ["audio/wav", "audio/mpeg", "audio/flac", "audio/ogg"].includes(entry.mediaType)),
+    [galleryEntries]);
 
   const preset = WORKFLOW_PRESETS[workflowKind];
   const portableTrainer = trainerCapabilities?.backend === "musubi_zimage";
@@ -149,7 +168,29 @@ export function CreatorHubPanel() {
 
   const pickWorkflow = async () => { const picked = await open({ directory: false, multiple: false, filters: [{ name: "ComfyUI API workflow", extensions: ["json"] }] }); if (typeof picked === "string") setWorkflow(JSON.parse(await readTextFile(picked))); };
   const pickMedia = async (type: "image" | "video" | "last_image" | "audio") => { const picked = await open({ directory: false, multiple: false }); if (typeof picked !== "string") return; const upload = { name: picked.split(/[/\\]/).pop() ?? `${type}.bin`, dataBase64: toBase64(await readFile(picked)) }; if (type === "image") setInputImage(upload); else if (type === "video") setInputVideo(upload); else if (type === "audio") setInputAudio(upload); else setLastFrameImage(upload); };
-  const runWorkflow = async () => { if (!workflow) return; setBusy("workflow"); setError(null); try { localStorage.setItem("lm-comfy-workflow-url", workflowUrl); const values: Record<string, unknown> = { prompt: workflowPrompt, negative_prompt: "", script: workflowScript, duration_seconds: 10, seed: Number(workflowSeed) }; setWorkflowResults(await studioParityClient.runWorkflow({ kind: workflowKind, baseUrl: workflowUrl, workflow, values, inputImage, inputVideo, lastFrameImage, inputAudio })); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(null); } };
+  const runWorkflow = async () => {
+    if (!workflow) return;
+    setBusy("workflow");
+    setError(null);
+    try {
+      localStorage.setItem("lm-comfy-workflow-url", workflowUrl);
+      const values: Record<string, unknown> = {
+        prompt: workflowPrompt, negative_prompt: "", script: workflowScript,
+        duration_seconds: 10, seed: Number(workflowSeed),
+      };
+      const withGallery = workflowKind === "freevideo" || workflowKind === "extend_video";
+      setWorkflowResults(await studioParityClient.runWorkflow({
+        kind: workflowKind, baseUrl: workflowUrl, workflow, values,
+        inputImage, inputVideo, lastFrameImage, inputAudio,
+        galleryVideoEntryId: withGallery && galleryVideoEntryId ? galleryVideoEntryId : null,
+        galleryImageEntryId: workflowKind === "freevideo" && galleryImageEntryId ? galleryImageEntryId : null,
+        galleryAudioEntryId: workflowKind === "freevideo" && galleryAudioEntryId ? galleryAudioEntryId : null,
+      }));
+      // The next FreeVideo scene can immediately reuse this published result.
+      if (withGallery) setGalleryEntries(await studioClient.gallery());
+    } catch (cause) { setError(errorMessage(cause)); }
+    finally { setBusy(null); }
+  };
   const sortedResults = useMemo(() => [...results].sort((a, b) => Number(Boolean(b.sha256)) - Number(Boolean(a.sha256))), [results]);
 
   return <div className="grid gap-4 border-t border-border pt-4">
@@ -199,6 +240,64 @@ export function CreatorHubPanel() {
     <section className="rounded-lg border border-border bg-surface p-3">
       <h2 className="text-xs font-medium">Media workflow presets</h2><p className="mt-1 text-[11px] text-muted">Music, Talking Character, Motion Control, Extend Video, and FreeVideo workflows run against your own ComfyUI. Export the workflow in API format once; Little Monkey uploads media, binds typed placeholders, retrieves image/video/audio outputs, and files them in the Studio gallery.</p>
       <div className="mt-2 flex flex-wrap gap-2">{(Object.keys(WORKFLOW_PRESETS) as WorkflowKind[]).map((value) => <Button key={value} size="sm" variant={workflowKind === value ? "primary" : "secondary"} onClick={() => setWorkflowKind(value)}>{WORKFLOW_PRESETS[value].label}</Button>)}</div><p className="mt-2 text-[11px] text-muted">{preset.description} Placeholders: {preset.placeholders.map((p) => `{{${p}}}`).join(", ")}</p>
+      {(workflowKind === "freevideo" || workflowKind === "extend_video") && (
+        <div className="mt-3 grid gap-2 rounded border border-border p-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-medium">Use Studio gallery outputs directly</span>
+            <Button size="sm" variant="secondary" disabled={busy !== null}
+              onClick={() => void studioClient.gallery().then(setGalleryEntries).catch((cause) => setError(errorMessage(cause)))}>
+              Refresh gallery
+            </Button>
+          </div>
+          <p className="text-[11px] text-muted">
+            The backend reads verified gallery media. For a video, it uploads the clip and automatically extracts
+            its real last frame for FreeVideo; no MP4 or frame data goes through the browser.
+          </p>
+          <label className="grid gap-1 text-[11px] text-muted">
+            Source video or finished timeline
+            <select className="w-full rounded border border-border bg-background p-1 text-xs" value={galleryVideoEntryId}
+              onChange={(event) => {
+                setGalleryVideoEntryId(event.target.value);
+                if (event.target.value) setInputVideo(null);
+              }}>
+              <option value="">Choose a local file instead</option>
+              {galleryVideos.map((entry) => <option key={entry.entryId} value={entry.entryId}>
+                {entry.prompt?.slice(0, 80) || entry.modelId} · {new Date(entry.createdAtMs).toLocaleString()}
+              </option>)}
+            </select>
+          </label>
+          {workflowKind === "freevideo" && (
+            <>
+              <label className="grid gap-1 text-[11px] text-muted">
+                First frame image
+                <select className="w-full rounded border border-border bg-background p-1 text-xs" value={galleryImageEntryId}
+                  onChange={(event) => {
+                    setGalleryImageEntryId(event.target.value);
+                    if (event.target.value) setInputImage(null);
+                  }}>
+                  <option value="">Use a local image or no first frame</option>
+                  {galleryImages.map((entry) => <option key={entry.entryId} value={entry.entryId}>
+                    {entry.prompt?.slice(0, 80) || entry.modelId}
+                  </option>)}
+                </select>
+              </label>
+              <label className="grid gap-1 text-[11px] text-muted">
+                Reference audio
+                <select className="w-full rounded border border-border bg-background p-1 text-xs" value={galleryAudioEntryId}
+                  onChange={(event) => {
+                    setGalleryAudioEntryId(event.target.value);
+                    if (event.target.value) setInputAudio(null);
+                  }}>
+                  <option value="">Use a local audio file or no reference audio</option>
+                  {galleryAudio.map((entry) => <option key={entry.entryId} value={entry.entryId}>
+                    {entry.prompt?.slice(0, 80) || entry.modelId}
+                  </option>)}
+                </select>
+              </label>
+            </>
+          )}
+        </div>
+      )}
       <div className="mt-2 grid gap-2"><input value={workflowUrl} onChange={(e) => setWorkflowUrl(e.target.value)} className="h-8 rounded border border-border bg-background px-2 font-mono text-xs"/><textarea value={workflowPrompt} onChange={(e) => setWorkflowPrompt(e.target.value)} className="min-h-16 rounded border border-border bg-background p-2 text-xs" placeholder="Prompt"/>{workflowKind === "talking_character" && <textarea value={workflowScript} onChange={(e) => setWorkflowScript(e.target.value)} className="min-h-16 rounded border border-border bg-background p-2 text-xs" placeholder="Dialogue / script"/>}<div className="flex flex-wrap gap-2"><Button size="sm" variant="secondary" onClick={() => void pickWorkflow()}>{workflow ? "Workflow loaded" : "Load API workflow JSON"}</Button>{(workflowKind === "talking_character" || workflowKind === "motion_control") && <Button size="sm" variant="secondary" onClick={() => void pickMedia("image")}>{inputImage ? "Image loaded" : "Choose input image"}</Button>}{workflowKind === "extend_video" && <Button size="sm" variant="secondary" onClick={() => void pickMedia("video")}>{inputVideo ? "Video loaded" : "Choose input video"}</Button>}{workflowKind === "freevideo" && <>
   <Button size="sm" variant="secondary" onClick={() => void pickMedia("image")}>{inputImage ? "First frame ready" : "First frame"}</Button>
   <Button size="sm" variant="secondary" onClick={() => void pickMedia("last_image")}>{lastFrameImage ? "Last frame ready" : "Last frame"}</Button>

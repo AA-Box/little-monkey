@@ -127,3 +127,12 @@ binding. CI cannot prove visually coherent latent continuity between
 model-generated segments or exercise a user's installed FreeVideo graph.
 Real hardware / model checks and desktop crash/relaunch checks are still
 required to certify those behaviors.
+
+
+## Gallery-native FreeVideo inputs
+
+The Creator Hub's **FreeVideo (ComfyUI)** and **Extend Video** modes can now use a published Studio clip or exported timeline directly. The video input is resolved by `galleryVideoEntryId` in the backend and loaded from the content-addressed artifact store; the UI sends only the opaque gallery entry ID, never a 256 MiB base64 video. For a video source, the backend uploads the real MP4/WebM to ComfyUI as `input_video` and automatically decodes and uploads its last frame as `last_frame_image`. A user-supplied last frame explicitly overrides automatic last-frame selection. FreeVideo can also use a published Studio image as `input_image` and gallery audio as `input_audio`. Local-file upload controls remain supported.
+
+Gallery entries are checked against the published gallery and an allowlist of MIME types before artifact reads. Conflicting direct upload and gallery input for the same slot fails closed. A graph that still contains an unbound media placeholder after substitution is rejected **before** contacting ComfyUI's prompt endpoint. This adapter does not infer node IDs for every possible FreeVideo graph: operators still import their own API-format ComfyUI workflow with explicit `{{input_video}}`, `{{last_frame_image}}`, `{{input_image}}` and/or `{{input_audio}}` placeholders.
+
+Acceptance: render a video in Studio, select it in the FreeVideo preset, confirm ComfyUI receives its actual video and final PNG frame, publish the workflow output to the gallery, and use that output as the next scene/timeline source. Physical FreeVideo node/model acceptance still requires a host with an installed ComfyUI/FreeVideo graph.
