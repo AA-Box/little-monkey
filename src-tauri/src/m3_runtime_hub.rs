@@ -3928,8 +3928,12 @@ impl M3RuntimeHub {
                     execution.effective_settings = effective;
                     let recovered = attempt_number > 1;
                     if recovered {
+                        // The original hardware offload estimate described the
+                        // *first* launch, not the recovered settings. Reporting
+                        // it as the executed plan would falsify telemetry.
+                        execution.offload = None;
                         execution.decisions.push(format!(
-                            "Model loaded after {attempt_number} verified launch attempts with reduced implicit memory settings."
+                            "Model loaded after {attempt_number} verified launch attempts with reduced implicit memory settings; the initial offload estimate no longer represents the executed placement."
                         ));
                     }
                     let persistence = self.clock.now_ms().and_then(|at_ms| {

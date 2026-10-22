@@ -12,7 +12,7 @@ The Runtime Hub performs a real managed llama.cpp `load_model_with_plan` call. W
 
 ## Evidence
 
-`m3_runtime_load_model` returns the actual effective settings and an ordered `recoveryAttempts` array. A bounded history of 64 records is atomically stored in the app-private `state/load-recovery-history.json`, viewable in Runtime Hub's llama.cpp model load section and via `m3_runtime_load_recovery_history`. Records contain model and runtime IDs, timestamps, numeric context/GPU-layer controls, outcome, and recovery status. No prompts, inference output, raw logs or credentials are stored in this new file.
+`m3_runtime_load_model` returns the actual effective settings and an ordered `recoveryAttempts` array. After recovery, the original offload estimate is deliberately cleared, because it no longer represents the executed lower-memory placement. A bounded history of 64 records is atomically stored in the app-private `state/load-recovery-history.json`, viewable in Runtime Hub's llama.cpp model load section and via `m3_runtime_load_recovery_history`. Records contain model and runtime IDs, timestamps, numeric context/GPU-layer controls, outcome, and recovery status. No prompts, inference output, raw logs or credentials are stored in this new file.
 
 ## Test/acceptance plan
 

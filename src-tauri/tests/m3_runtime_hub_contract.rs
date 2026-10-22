@@ -1259,6 +1259,7 @@ async fn verified_oom_launch_failures_retry_twice_and_persist_actual_effective_s
     }).collect();
     assert_eq!(contexts, [4096, 2048, 1024]);
     assert_eq!(&completed.effective_settings, attempted.last().unwrap());
+    assert!(completed.offload.is_none(), "stale pre-recovery offload estimate is not execution evidence");
     drop(attempted);
     assert!(hub.runtime_config("managed-llama").unwrap().is_none(), "retries never persist inferred user settings");
     let events = hub.load_recovery_history().expect("private audit");
