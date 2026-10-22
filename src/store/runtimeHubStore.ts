@@ -1055,10 +1055,10 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const operationId = createM3OperationId("runtime-load");
       begin(key, operationId);
       const startedAtMs = Date.now();
-      // A stored preview is an estimate, not evidence of what the backend
-      // loaded. Replace it with the authoritative plan returned by the load
-      // command before writing telemetry.
-      let offloadPlan = get().offloadPlans[request.runtimeId] ?? null;
+      // An old offload preview is not proof of execution. Only the runtime
+      // response can provide authoritative load-plan evidence.
+      let offloadPlan = null as OffloadPlan | null;
+      let backendLoaded = false;
       const recordTrace = (loadError: unknown) => {
         // Wrapped in `Promise.resolve` (rather than chaining `.catch`
         // directly off the client call) so this stays safe even if the
@@ -1079,16 +1079,18 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       };
       try {
         const loaded = await runtimeHubClient.runtimeLoadModel({ operationId, timeoutMs: 120_000, request });
-        // A real response comes only after backend load succeeded. Test mocks
-        // and older IPC clients may return undefined; do not invent execution
-        // evidence when no authoritative plan was returned.
+        // A real response comes only after backend load succeeded. Older IPC
+        // clients can return undefined, which is not execution-plan evidence.
         if (loaded && "offload" in loaded) {
           offloadPlan = loaded.offload ?? null;
         }
-        await get().refreshRuntime(request.runtimeId);
+        backendLoaded = true;
         recordTrace(undefined);
+        // Refreshing the UI can independently fail after a successful load:
+        // never rewrite an already successful backend load as a failure.
+        await get().refreshRuntime(request.runtimeId);
       } catch (error) {
-        recordTrace(error);
+        if (!backendLoaded) recordTrace(error);
         fail(key, error);
         throw error;
       } finally {
