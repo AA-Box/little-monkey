@@ -181,6 +181,10 @@ pub struct GgufHeaderInfo {
     /// used to auto-size `llama-server`'s `-c` instead of one fixed guess
     /// for every model (see `llama.rs::resolve_ctx_size`).
     pub context_length: Option<u64>,
+    /// Transformer block count read from the architecture-specific GGUF metadata.
+    /// Unlike a filesize heuristic this is safe to use for GPU-layer flags.
+    #[serde(default)]
+    pub block_count: Option<u64>,
     pub declared_license: Option<String>,
     /// Kept internal so callers can validate runtime compatibility without
     /// exposing a potentially large template in reports or over IPC.
@@ -392,6 +396,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
     let mut name = None;
     let mut quantization_version = None;
     let mut context_length = None;
+    let mut block_count = None;
     let mut declared_license = None;
     let mut chat_template = None;
     for _ in 0..metadata_kv_count {
@@ -419,6 +424,9 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
             // per real GGUF file.
             (key, Some(GgufScalar::UInt(value))) if key.ends_with(".context_length") => {
                 context_length = Some(value);
+            }
+            (key, Some(GgufScalar::UInt(value))) if key.ends_with(".block_count") && value > 0 => {
+                block_count = Some(value);
             }
             _ => {}
         }
@@ -459,6 +467,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
         name,
         quantization_version,
         context_length,
+        block_count,
         declared_license,
         chat_template,
     })
