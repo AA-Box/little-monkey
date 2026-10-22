@@ -48,6 +48,7 @@ pub mod runtime_adapter;
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
 pub(crate) mod generation_commands;
+mod studio_video_jobs;
 pub mod studio_parity;
 pub mod character_trainer;
 pub mod studio_tools;
@@ -2118,6 +2119,10 @@ pub fn run() {
             generation_commands::generation_add_backend,
             generation_commands::generation_remove_backend,
             generation_commands::generation_run,
+            studio_video_jobs::generation_video_submit,
+            studio_video_jobs::generation_video_jobs,
+            studio_video_jobs::generation_video_resume,
+            studio_video_jobs::generation_video_cancel,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
             generation_commands::generation_delete_entry,

@@ -1021,6 +1021,7 @@ pub async fn studio_workflow_run(
         entries.push(GenerationEntry {
             entry_id: format!("studio-{}", Uuid::new_v4()),
             artifact_id: blob.id,
+            video_job_id: None,
             model_id: format!("comfy-workflow:{}", request.kind),
             task,
             prompt: prompt.clone(),

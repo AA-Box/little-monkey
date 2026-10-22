@@ -1218,7 +1218,7 @@ pub struct HiresSettings {
 }
 
 /// One generation job's user-controlled inputs.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationRequest {
     pub model_id: String,

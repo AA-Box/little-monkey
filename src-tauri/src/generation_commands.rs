@@ -119,6 +119,8 @@ pub struct GenerationModelView {
 pub struct GenerationEntry {
     pub entry_id: String,
     pub artifact_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_job_id: Option<String>,
     pub model_id: String,
     pub task: generation::GenerationTask,
     pub prompt: String,
@@ -997,6 +999,39 @@ pub async fn generation_run(
     m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
     request: GenerationRequest,
 ) -> Result<Vec<GenerationEntry>, String> {
+    if request.task.is_video() {
+        return Err("Use generation_video_submit for durable video jobs".to_string());
+    }
+    generation_run_impl(app, state, m3, request, None).await
+}
+
+/// Internal worker path. The gallery write is the durable publication
+/// checkpoint; retrying a job never renders twice after it was published.
+pub(crate) async fn generation_run_with_job(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
+    request: GenerationRequest,
+    job_id: &str,
+) -> Result<Vec<GenerationEntry>, String> {
+    generation_run_impl(app, state, m3, request, Some(job_id)).await
+}
+
+async fn generation_run_impl(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
+    request: GenerationRequest,
+    video_job_id: Option<&str>,
+) -> Result<Vec<GenerationEntry>, String> {
+    if let Some(id) = video_job_id {
+        let previous: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
+        let already_published: Vec<_> = previous.into_iter()
+            .filter(|entry| entry.video_job_id.as_deref() == Some(id)).collect();
+        if !already_published.is_empty() {
+            return Ok(already_published);
+        }
+    }
     // A remote backend has no library entry to look up, no components to
     // override and no engine to launch, so it forks before all three rather
     // than threading an "is it local" flag through them.
@@ -1051,6 +1086,7 @@ pub async fn generation_run(
         entries.push(GenerationEntry {
             entry_id: format!("studio-{}", Uuid::new_v4()),
             artifact_id: blob.id,
+            video_job_id: video_job_id.map(str::to_string),
             model_id: model_id.clone(),
             task: request.task,
             prompt: request.prompt.clone(),
@@ -1504,6 +1540,7 @@ pub async fn studio_tool_run(
         entries.push(GenerationEntry {
             entry_id: format!("studio-{}", Uuid::new_v4()),
             artifact_id: blob.id,
+            video_job_id: None,
             model_id: format!("tool:{tool_id}"),
             task,
             prompt: summary.clone(),

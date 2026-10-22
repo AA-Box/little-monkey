@@ -1,0 +1,481 @@
+//! Durable, profile-scoped Studio video job journal.
+//!
+//! A completed gallery entry is the publication checkpoint. Neither sd-server
+//! nor the packaged MLX video service exports sampler/frame checkpoints, so
+//! interrupted sampling is *not* represented as resumable mid-frame state.
+//! Resuming explicitly starts a new render of the persisted, fixed-seed request.
+
+use crate::generation::{GenerationRequest, GenerationTask};
+use crate::generation_commands::{self, GenerationEntry};
+use crate::profiles::ProfileScopedPaths;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use tauri::{AppHandle, Manager};
+use uuid::Uuid;
+
+const MAX_JOBS: usize = 128;
+const MAX_JOB_BYTES: u64 = 48 * 1024 * 1024;
+const MAX_DEPENDENCIES: usize = 16;
+const MAX_ATTEMPTS: u32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoJobStatus {
+    Queued,
+    Running,
+    Interrupted,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoJobStage {
+    WaitingForDependencies,
+    Rendering,
+    Published,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoJob {
+    id: String,
+    idempotency_key: String,
+    depends_on: Vec<String>,
+    request: GenerationRequest,
+    status: VideoJobStatus,
+    stage: VideoJobStage,
+    attempts: u32,
+    result_entry_ids: Vec<String>,
+    error: Option<String>,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoJobView {
+    id: String,
+    depends_on: Vec<String>,
+    model_id: String,
+    prompt: String,
+    status: VideoJobStatus,
+    stage: VideoJobStage,
+    attempts: u32,
+    result_entry_ids: Vec<String>,
+    error: Option<String>,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+impl From<&VideoJob> for VideoJobView {
+    fn from(job: &VideoJob) -> Self {
+        Self {
+            id: job.id.clone(),
+            depends_on: job.depends_on.clone(),
+            model_id: job.request.model_id.clone(),
+            prompt: job.request.prompt.chars().take(240).collect(),
+            status: job.status,
+            stage: job.stage,
+            attempts: job.attempts,
+            result_entry_ids: job.result_entry_ids.clone(),
+            error: job.error.clone(),
+            created_at_ms: job.created_at_ms,
+            updated_at_ms: job.updated_at_ms,
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn journal_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn active() -> &'static Mutex<HashSet<String>> {
+    static RUNNING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    RUNNING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn engine_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn directory(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.profile_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("studio-v1").join("video-jobs");
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    if fs::symlink_metadata(&dir).map_err(|error| error.to_string())?.file_type().is_symlink() {
+        return Err("Studio video journal may not be a symlink".to_string());
+    }
+    Ok(dir)
+}
+
+fn path_for(dir: &Path, id: &str) -> Result<PathBuf, String> {
+    // Never use caller-controlled path segments without validation.
+    let parsed = Uuid::parse_str(id).map_err(|_| "Invalid video job id".to_string())?;
+    if parsed.to_string() != id {
+        return Err("Invalid video job id".to_string());
+    }
+    Ok(dir.join(format!("{id}.json")))
+}
+
+fn read_file(path: &Path) -> Result<VideoJob, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_JOB_BYTES {
+        return Err("Unsafe or oversized Studio video job record".to_string());
+    }
+    let job: VideoJob = serde_json::from_slice(
+        &fs::read(path).map_err(|error| error.to_string())?
+    ).map_err(|error| format!("Invalid Studio video job record: {error}"))?;
+    if path.file_name().and_then(|name| name.to_str()) != Some(format!("{}.json", job.id).as_str()) {
+        return Err("Studio video journal filename/id mismatch".to_string());
+    }
+    Ok(job)
+}
+
+fn write_file(dir: &Path, job: &VideoJob) -> Result<(), String> {
+    let path = path_for(dir, &job.id)?;
+    if let Ok(meta) = fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err("Unsafe Studio video job destination".to_string());
+        }
+    }
+    let bytes = serde_json::to_vec(job).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_JOB_BYTES {
+        return Err("Video request exceeds the durable journal limit".to_string());
+    }
+    let temporary = dir.join(format!(".{}.{}.tmp", job.id, Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<(), String> {
+        let mut file = options.open(&temporary).map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            fs::File::open(dir).and_then(|folder| folder.sync_all())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn read_all(dir: &Path) -> Result<Vec<VideoJob>, String> {
+    let mut jobs = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        if jobs.len() >= MAX_JOBS {
+            return Err("Studio video journal exceeds its job limit".to_string());
+        }
+        jobs.push(read_file(&entry.path())?);
+    }
+    jobs.sort_by_key(|job| job.created_at_ms);
+    Ok(jobs)
+}
+
+fn saved_results(app: &AppHandle, id: &str) -> Result<Vec<String>, String> {
+    let entries = generation_commands::generation_gallery(app.clone())?;
+    Ok(entries.into_iter()
+        .filter(|entry| entry.video_job_id.as_deref() == Some(id))
+        .map(|entry| entry.entry_id).collect())
+}
+
+fn reconcile(app: &AppHandle, dir: &Path, jobs: &mut [VideoJob]) -> Result<(), String> {
+    let active_ids = active().lock().map_err(|error| error.to_string())?.clone();
+    for job in jobs.iter_mut() {
+        if matches!(job.status, VideoJobStatus::Running | VideoJobStatus::Interrupted | VideoJobStatus::Failed) {
+            let results = saved_results(app, &job.id)?;
+            if !results.is_empty() {
+                job.status = VideoJobStatus::Completed;
+                job.stage = VideoJobStage::Published;
+                job.result_entry_ids = results;
+                job.error = None;
+                job.updated_at_ms = now_ms();
+                write_file(dir, job)?;
+            } else if job.status == VideoJobStatus::Running && !active_ids.contains(&job.id) {
+                job.status = VideoJobStatus::Interrupted;
+                job.error = Some("The app exited while rendering. The engine provides no mid-frame checkpoint; resume starts the saved request again.".to_string());
+                job.updated_at_ms = now_ms();
+                write_file(dir, job)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dependencies_complete(job: &VideoJob, jobs: &[VideoJob]) -> bool {
+    job.depends_on.iter().all(|id| jobs.iter().any(|candidate| {
+        candidate.id == *id && candidate.status == VideoJobStatus::Completed
+    }))
+}
+
+fn dispatch(app: &AppHandle) -> Result<(), String> {
+    let ready = {
+        let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
+        let dir = directory(app)?;
+        let mut jobs = read_all(&dir)?;
+        reconcile(app, &dir, &mut jobs)?;
+        jobs.iter().filter(|job|
+            job.status == VideoJobStatus::Queued && dependencies_complete(job, &jobs)
+        ).map(|job| job.id.clone()).collect::<Vec<_>>()
+    };
+    for id in ready {
+        let inserted = active().lock().map_err(|error| error.to_string())?.insert(id.clone());
+        if !inserted {
+            continue;
+        }
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            // The managed engine is shared: never swap models while another
+            // video job is rendering, including while waiting on MLX ownership.
+            let _gate = engine_gate().lock().await;
+            let _ = execute(&app, &id).await;
+            if let Ok(mut active) = active().lock() {
+                active.remove(&id);
+            }
+            let _ = dispatch(&app);
+        });
+    }
+    Ok(())
+}
+
+fn transition(
+    app: &AppHandle,
+    id: &str,
+    update: impl FnOnce(&mut VideoJob) -> Result<(), String>,
+) -> Result<VideoJob, String> {
+    let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
+    let dir = directory(app)?;
+    let mut job = read_file(&path_for(&dir, id)?)?;
+    update(&mut job)?;
+    job.updated_at_ms = now_ms();
+    write_file(&dir, &job)?;
+    Ok(job)
+}
+
+async fn execute(app: &AppHandle, id: &str) -> Result<(), String> {
+    let job = transition(app, id, |job| {
+        if job.status != VideoJobStatus::Queued {
+            return Err("Video job is no longer queued".to_string());
+        }
+        job.status = VideoJobStatus::Running;
+        job.stage = VideoJobStage::Rendering;
+        job.attempts += 1;
+        job.error = None;
+        Ok(())
+    })?;
+    let result: Result<Vec<GenerationEntry>, String> = generation_commands::generation_run_with_job(
+        app.clone(),
+        app.state::<crate::AppState>(),
+        app.state::<crate::m3_commands::M3CommandState>(),
+        job.request,
+        id,
+    ).await;
+    let _ = transition(app, id, |job| {
+        // Cancellation wins over late engine errors, but published artifacts
+        // are never discarded because a cancel raced with publication.
+        match &result {
+            Ok(entries) => {
+                job.status = VideoJobStatus::Completed;
+                job.stage = VideoJobStage::Published;
+                job.result_entry_ids = entries.iter().map(|entry| entry.entry_id.clone()).collect();
+                job.error = None;
+            }
+            Err(error) if job.status != VideoJobStatus::Cancelled => {
+                job.status = VideoJobStatus::Failed;
+                job.error = Some(error.chars().take(500).collect());
+            }
+            Err(_) => {}
+        }
+        Ok(())
+    });
+    result.map(|_| ())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_video_submit(
+    app: AppHandle,
+    request: GenerationRequest,
+    idempotency_key: String,
+    depends_on: Vec<String>,
+) -> Result<VideoJobView, String> {
+    if !request.task.is_video() {
+        return Err("Durable Studio jobs accept only video tasks".to_string());
+    }
+    if idempotency_key.is_empty() || idempotency_key.len() > 128
+        || !idempotency_key.bytes().all(|ch| ch.is_ascii_alphanumeric() || b"_-.:".contains(&ch)) {
+        return Err("Video idempotency key must be 1–128 safe ASCII characters".to_string());
+    }
+    if depends_on.len() > MAX_DEPENDENCIES || depends_on.iter().collect::<BTreeSet<_>>().len() != depends_on.len() {
+        return Err("Too many or duplicate video dependencies".to_string());
+    }
+    let result = {
+        let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
+        let dir = directory(&app)?;
+        let mut jobs = read_all(&dir)?;
+        reconcile(&app, &dir, &mut jobs)?;
+        if let Some(old) = jobs.iter().find(|job| job.idempotency_key == idempotency_key) {
+            if serde_json::to_value(&old.request).map_err(|error| error.to_string())?
+                != serde_json::to_value(&request).map_err(|error| error.to_string())?
+                || old.depends_on != depends_on {
+                return Err("Video idempotency key already belongs to a different request".to_string());
+            }
+            VideoJobView::from(old)
+        } else {
+            if jobs.len() >= MAX_JOBS {
+                return Err("Studio video job history is full (128 jobs)".to_string());
+            }
+            for dependency in &depends_on {
+                if !jobs.iter().any(|job| &job.id == dependency) {
+                    return Err(format!("Unknown video dependency {dependency}"));
+                }
+            }
+            let time = now_ms();
+            let job = VideoJob {
+                id: Uuid::new_v4().to_string(),
+                idempotency_key,
+                depends_on,
+                request,
+                status: VideoJobStatus::Queued,
+                stage: VideoJobStage::WaitingForDependencies,
+                attempts: 0,
+                result_entry_ids: Vec::new(),
+                error: None,
+                created_at_ms: time,
+                updated_at_ms: time,
+            };
+            write_file(&dir, &job)?;
+            VideoJobView::from(&job)
+        }
+    };
+    dispatch(&app)?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn generation_video_jobs(app: AppHandle) -> Result<Vec<VideoJobView>, String> {
+    let views = {
+        let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
+        let dir = directory(&app)?;
+        let mut jobs = read_all(&dir)?;
+        reconcile(&app, &dir, &mut jobs)?;
+        jobs.iter().rev().map(VideoJobView::from).collect::<Vec<_>>()
+    };
+    dispatch(&app)?;
+    Ok(views)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_video_resume(app: AppHandle, job_id: String) -> Result<VideoJobView, String> {
+    let job = transition(&app, &job_id, |job| {
+        if !matches!(job.status, VideoJobStatus::Interrupted | VideoJobStatus::Failed) {
+            return Err("Only interrupted or failed video jobs can be resumed".to_string());
+        }
+        if job.request.seed < 0 {
+            return Err("A random-seed job cannot be replayed deterministically".to_string());
+        }
+        if job.attempts >= MAX_ATTEMPTS {
+            return Err("Video render retry limit reached".to_string());
+        }
+        job.status = VideoJobStatus::Queued;
+        job.stage = VideoJobStage::WaitingForDependencies;
+        job.error = None;
+        Ok(())
+    })?;
+    dispatch(&app)?;
+    Ok(VideoJobView::from(&job))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_video_cancel(app: AppHandle, job_id: String) -> Result<VideoJobView, String> {
+    let job = transition(&app, &job_id, |job| {
+        if !matches!(job.status, VideoJobStatus::Queued | VideoJobStatus::Running | VideoJobStatus::Interrupted) {
+            return Err("Video job is already terminal".to_string());
+        }
+        job.status = VideoJobStatus::Cancelled;
+        job.error = None;
+        Ok(())
+    })?;
+    if job.status == VideoJobStatus::Cancelled
+        && active().lock().map_err(|error| error.to_string())?.contains(&job_id) {
+        // Stop only when the job actually owns the native generation process.
+        // A queued job waiting for the gate must not stop somebody else's run.
+        let _ = app.state::<crate::AppState>().generation_engine.stop();
+    }
+    Ok(VideoJobView::from(&job))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example(id: &str, status: VideoJobStatus, depends_on: Vec<String>) -> VideoJob {
+        VideoJob {
+            id: id.into(), idempotency_key: id.into(), depends_on,
+            request: serde_json::from_value(serde_json::json!({
+                "modelId":"model", "task":"text_to_video","prompt":"test",
+                "width":512,"height":512,"steps":10,"cfgScale":4,"seed":1
+            })).unwrap(),
+            status, stage: VideoJobStage::WaitingForDependencies, attempts: 0,
+            result_entry_ids: vec![], error: None, created_at_ms: 1, updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn dependencies_require_all_successful_predecessors() {
+        let root = example("a", VideoJobStatus::Completed, vec![]);
+        let waiting = example("b", VideoJobStatus::Interrupted, vec![]);
+        let child = example("c", VideoJobStatus::Queued, vec!["a".into(), "b".into()]);
+        assert!(!dependencies_complete(&child, &[root.clone(), waiting]));
+        assert!(dependencies_complete(&child, &[root, example("b", VideoJobStatus::Completed, vec![])]));
+    }
+
+    #[test]
+    fn journal_round_trips_request_without_losing_seed_or_dependency_ids() {
+        let dir = std::env::temp_dir().join(format!("lm-video-jobs-{}", Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let mut job = example(&Uuid::new_v4().to_string(), VideoJobStatus::Queued, vec!["parent".into()]);
+        job.request.seed = 42;
+        write_file(&dir, &job).unwrap();
+        let restored = read_all(&dir).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].request.seed, 42);
+        assert_eq!(restored[0].depends_on, vec!["parent"]);
+        assert_eq!(restored[0].status, VideoJobStatus::Queued);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn untrusted_ids_cannot_traverse_job_directory() {
+        let dir = Path::new("/tmp");
+        assert!(path_for(dir, "../outside").is_err());
+        assert!(path_for(dir, "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx").is_err());
+    }
+}
