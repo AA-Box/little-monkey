@@ -139,6 +139,41 @@ export function measuredRate(sample: BenchmarkSample): Measured {
   );
 }
 
+/**
+ * History is comparable only with evidence of the same model artifact,
+ * measured workload, configured runtime knobs, and physical hardware.
+ * Missing model digests (or legacy evidence) fail closed: identical model
+ * names are not sufficient evidence of comparable performance.
+ */
+export function comparableBenchmarkRuns(a: BenchmarkHistoryEntry, b: BenchmarkHistoryEntry): boolean {
+  if (a.freshness.state !== "thisMachine" || b.freshness.state !== "thisMachine") return false;
+  const x = a.evidence;
+  const y = b.evidence;
+  if (!x || !y || !x.modelDigest || !y.modelDigest) return false;
+  return (
+    a.report.runtimeId === b.report.runtimeId &&
+    a.report.model === b.report.model &&
+    x.modelDigest === y.modelDigest &&
+    x.modelSizeBytes === y.modelSizeBytes &&
+    x.workloadSha256 === y.workloadSha256 &&
+    x.configuredSettingsSha256 === y.configuredSettingsSha256 &&
+    a.machine.os === b.machine.os &&
+    a.machine.arch === b.machine.arch &&
+    a.machine.totalRamBytes === b.machine.totalRamBytes &&
+    a.machine.logicalCpuCount === b.machine.logicalCpuCount &&
+    a.machine.accelerators.length === b.machine.accelerators.length &&
+    a.machine.accelerators.every((device, index) => device === b.machine.accelerators[index])
+  );
+}
+
+export function benchmarkDecodeChange(current: BenchmarkHistoryEntry, previous: BenchmarkHistoryEntry): number | null {
+  if (!comparableBenchmarkRuns(current, previous)) return null;
+  const a = current.report.decodeTokensPerSecond?.median;
+  const b = previous.report.decodeTokensPerSecond?.median;
+  if (a === undefined || b === undefined || !Number.isFinite(a) || !Number.isFinite(b) || b <= 0) return null;
+  return ((a - b) / b) * 100;
+}
+
 /** The only place a {@link Measured} becomes pixels. */
 function MeasuredText({ value }: { value: Measured }) {
   if (!value.measured) {
@@ -198,6 +233,8 @@ function SavedMeasurements({ entries }: { entries: BenchmarkHistoryEntry[] }) {
           <tbody>
             {entries.map((entry, index) => {
               const key = `${entry.report.runtimeId}/${entry.report.model}/${entry.measuredAtMs}/${index}`;
+              const previous = entries.slice(index + 1).find((earlier) => comparableBenchmarkRuns(entry, earlier));
+              const decodeChange = previous ? benchmarkDecodeChange(entry, previous) : null;
               if (entry.freshness.state !== "thisMachine") {
                 return (
                   <tr key={key} className="border-t border-border align-top">
@@ -242,6 +279,12 @@ function SavedMeasurements({ entries }: { entries: BenchmarkHistoryEntry[] }) {
                           ? ` Runtime-reported digest: ${entry.evidence.modelDigest.slice(0, 16)}…`
                           : " No model digest reported; exact identity remains unverified."}
                         {" "}Workload: {entry.evidence.workloadSha256.slice(0, 12)}…
+                        {decodeChange !== null && (
+                          <span className="block mt-1 font-mono text-foreground">
+                            Decode median vs. previous matching run: {decodeChange > 0 ? "+" : ""}
+                            {decodeChange.toFixed(1)}%
+                          </span>
+                        )}
                       </span>
                     ) : (
                       <span className="text-warning">Legacy run; provenance unavailable.</span>
