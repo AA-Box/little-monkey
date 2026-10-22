@@ -621,6 +621,11 @@ struct MockRuntimeState {
     models: Mutex<BTreeMap<String, (PathBuf, u64)>>,
     loaded: Mutex<BTreeSet<String>>,
     last_settings: Mutex<Option<BTreeMap<String, SettingValue>>>,
+    load_attempts: Mutex<Vec<BTreeMap<String, SettingValue>>>,
+    simulate_exited_loads: AtomicBool,
+    injected_oom_remaining: AtomicU64,
+    injected_other_failure: AtomicBool,
+    claim_resident_after_oom: AtomicBool,
     cancelled: Mutex<Vec<String>>,
     hold_stream: AtomicBool,
     stream_started: Notify,
@@ -779,7 +784,12 @@ impl MockRuntimeDriver {
         Ok(M3RuntimeStatusView::Adapter {
             status: RuntimeStatus {
                 runtime: Self::native_descriptor(),
-                state: RuntimeLifecycleState::Ready,
+                state: if self.state.simulate_exited_loads.load(Ordering::SeqCst)
+                    && running_models.is_empty() {
+                    RuntimeLifecycleState::Stopped
+                } else {
+                    RuntimeLifecycleState::Ready
+                },
                 version: Some("test-1".to_string()),
                 process: None,
                 message: None,
@@ -891,6 +901,23 @@ impl M3RuntimeDriver for MockRuntimeDriver {
                 ));
             }
             drop(models);
+            self.state.load_attempts.lock().map_err(|_| M3HubError::LockPoisoned)?.push(settings.clone());
+            if self.state.injected_other_failure.load(Ordering::SeqCst) {
+                return Err(M3HubError::Runtime(
+                    "managed runtime controller failed during wait for managed llama.cpp readiness: process exited before readiness: missing model file".into(),
+                ));
+            }
+            let before = self.state.injected_oom_remaining.fetch_update(
+                Ordering::SeqCst, Ordering::SeqCst, |value| value.checked_sub(1),
+            );
+            if before.is_ok() {
+                if self.state.claim_resident_after_oom.load(Ordering::SeqCst) {
+                    self.state.loaded.lock().map_err(|_| M3HubError::LockPoisoned)?.insert(model.model_id.clone());
+                }
+                return Err(M3HubError::Runtime(
+                    "managed runtime controller failed during wait for managed llama.cpp readiness: process exited before readiness: exit status: 1\nllama_model_load: CUDA out of memory".into(),
+                ));
+            }
             self.state
                 .loaded
                 .lock()
@@ -1177,6 +1204,118 @@ async fn live_load_plan_changes_the_real_driver_settings_without_mutating_user_c
     let overridden = hub.plan_model_load(&request).expect("preview explicit controls");
     assert_eq!(overridden.effective_settings.get("context_size"), Some(&SettingValue::Integer { value: 8192 }));
     assert_eq!(overridden.effective_settings.get("gpu_layers"), Some(&SettingValue::Integer { value: -1 }));
+}
+
+
+async fn hub_with_injected_load_failures(
+    directory: &TestDirectory,
+    state: Arc<MockRuntimeState>,
+) -> (M3RuntimeHub, M3LoadModelRequest) {
+    let bytes = payload(90_000, 61);
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-oom"));
+    let hub = make_hub(
+        &directory.0,
+        download,
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(state.clone()))],
+        Some(Arc::new(MockReconciler { state })),
+        None,
+    );
+    let model = catalog_model(&bytes, "rev-oom");
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: model.license.declaration_sha256(),
+            model: model.clone(),
+        },
+        &M3OperationContext::default(),
+    ).await.expect("reconcile model");
+    (hub, M3LoadModelRequest {
+        runtime_id: "managed-llama".to_string(),
+        asset_id: model.asset_id(),
+        keep_alive: None,
+        replace_existing: false,
+    })
+}
+
+#[tokio::test]
+async fn verified_oom_launch_failures_retry_twice_and_persist_actual_effective_settings() {
+    let dir = TestDirectory::new("oom-recovery");
+    let state = Arc::new(MockRuntimeState::default());
+    state.simulate_exited_loads.store(true, Ordering::SeqCst);
+    state.injected_oom_remaining.store(2, Ordering::SeqCst);
+    let (hub, request) = hub_with_injected_load_failures(&dir, state.clone()).await;
+    let preview = hub.plan_model_load(&request).expect("initial plan");
+    assert!(preview.recovery_attempts.is_empty(), "a preview is not execution evidence");
+    let completed = hub.load_model_with_plan(&request, &M3OperationContext::default())
+        .await.expect("third real driver call loads");
+    assert_eq!(completed.recovery_attempts.len(), 3);
+    assert_eq!(completed.recovery_attempts[0].outcome, little_monkey_lib::oom_recovery::LoadAttemptOutcome::OutOfMemory);
+    assert_eq!(completed.recovery_attempts[1].outcome, little_monkey_lib::oom_recovery::LoadAttemptOutcome::OutOfMemory);
+    assert_eq!(completed.recovery_attempts[2].outcome, little_monkey_lib::oom_recovery::LoadAttemptOutcome::Success);
+    let attempted = state.load_attempts.lock().unwrap();
+    let contexts: Vec<i64> = attempted.iter().map(|settings| match settings.get("context_size") {
+        Some(SettingValue::Integer { value }) => *value,
+        _ => 4096,
+    }).collect();
+    assert_eq!(contexts, [4096, 2048, 1024]);
+    assert_eq!(&completed.effective_settings, attempted.last().unwrap());
+    drop(attempted);
+    assert!(hub.runtime_config("managed-llama").unwrap().is_none(), "retries never persist inferred user settings");
+    let events = hub.load_recovery_history().expect("private audit");
+    assert_eq!(events.len(), 1);
+    assert!(events[0].recovered);
+    assert_eq!(events[0].attempts, completed.recovery_attempts);
+    assert!(dir.0.join("state/load-recovery-history.json").is_file(), "history must survive process shutdown");
+}
+
+#[tokio::test]
+async fn explicit_user_memory_settings_prevent_automatic_oom_retry() {
+    let dir = TestDirectory::new("oom-explicit");
+    let state = Arc::new(MockRuntimeState::default());
+    state.simulate_exited_loads.store(true, Ordering::SeqCst);
+    state.injected_oom_remaining.store(3, Ordering::SeqCst);
+    let (hub, request) = hub_with_injected_load_failures(&dir, state.clone()).await;
+    hub.set_runtime_config(&M3SetRuntimeConfigRequest {
+        runtime_id: request.runtime_id.clone(),
+        values: BTreeMap::from([
+            ("context_size".to_string(), SettingValue::Integer { value: 4096 }),
+            ("gpu_layers".to_string(), SettingValue::Integer { value: -1 }),
+        ]),
+    }).expect("explicit preferences");
+    let err = hub.load_model_with_plan(&request, &M3OperationContext::default()).await
+        .expect_err("explicit controls cannot be lowered");
+    assert!(err.to_string().contains("out of memory"));
+    assert_eq!(state.load_attempts.lock().unwrap().len(), 1);
+    let history = hub.load_recovery_history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(!history[0].recovered);
+    assert_eq!(history[0].attempts.len(), 1);
+}
+
+#[tokio::test]
+async fn a_non_oom_failure_or_uncertain_live_process_is_never_retried() {
+    let dir = TestDirectory::new("oom-non-oom");
+    let state = Arc::new(MockRuntimeState::default());
+    state.simulate_exited_loads.store(true, Ordering::SeqCst);
+    state.injected_other_failure.store(true, Ordering::SeqCst);
+    let (hub, request) = hub_with_injected_load_failures(&dir, state.clone()).await;
+    hub.load_model_with_plan(&request, &M3OperationContext::default()).await
+        .expect_err("missing file never triggers memory retry");
+    assert_eq!(state.load_attempts.lock().unwrap().len(), 1);
+    assert_eq!(hub.load_recovery_history().unwrap()[0].attempts[0].outcome,
+        little_monkey_lib::oom_recovery::LoadAttemptOutcome::OtherFailure);
+
+    let dir = TestDirectory::new("oom-running");
+    let state = Arc::new(MockRuntimeState::default());
+    state.simulate_exited_loads.store(true, Ordering::SeqCst);
+    state.injected_oom_remaining.store(3, Ordering::SeqCst);
+    state.claim_resident_after_oom.store(true, Ordering::SeqCst);
+    let (hub, request) = hub_with_injected_load_failures(&dir, state.clone()).await;
+    hub.load_model_with_plan(&request, &M3OperationContext::default()).await
+        .expect_err("ambiguous resident process must abort recovery");
+    assert_eq!(state.load_attempts.lock().unwrap().len(), 1);
+    assert_eq!(hub.load_recovery_history().unwrap()[0].attempts[0].outcome,
+        little_monkey_lib::oom_recovery::LoadAttemptOutcome::UnsafeToRetry);
 }
 
 #[tokio::test]
