@@ -2134,6 +2134,7 @@ pub fn run() {
             studio_video_timeline::generation_video_timeline_submit,
             studio_video_timeline::generation_video_timelines,
             studio_video_timeline::generation_video_timeline_retry,
+            studio_video_timeline::generation_video_timeline_cancel,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
             generation_commands::generation_delete_entry,

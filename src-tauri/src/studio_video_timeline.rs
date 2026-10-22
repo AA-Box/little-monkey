@@ -9,7 +9,7 @@
 use crate::generation_commands::{self, GenerationEntry};
 use crate::profiles::ProfileScopedPaths;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_TIMELINES: usize = 48;
@@ -74,6 +75,14 @@ fn mutex() -> &'static Mutex<()> {
 fn active() -> &'static Mutex<HashSet<String>> {
     static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+fn cancellations() -> &'static Mutex<HashMap<String, CancellationToken>> {
+    static TOKENS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+    TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+struct ScratchDir(PathBuf);
+impl Drop for ScratchDir {
+    fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
 }
 fn export_gate() -> &'static tokio::sync::Mutex<()> {
     static M: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -342,24 +351,33 @@ fn launch_ready(app: &AppHandle) -> Result<(), String> {
         }
         let fresh = active().lock().map_err(|e| e.to_string())?.insert(job.id.clone());
         if !fresh { continue; }
+        let cancellation = CancellationToken::new();
+        cancellations().lock().map_err(|e| e.to_string())?
+            .insert(job.id.clone(), cancellation.clone());
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let _gate = export_gate().lock().await;
-            let _ = run(&app, &job.id).await;
+            let _ = run(&app, &job.id, cancellation).await;
+            if let Ok(mut tokens) = cancellations().lock() { tokens.remove(&job.id); }
             if let Ok(mut active) = active().lock() { active.remove(&job.id); }
         });
     }
     Ok(())
 }
 
-async fn run(app: &AppHandle, id: &str) -> Result<(), String> {
+async fn run(app: &AppHandle, id: &str, cancellation: CancellationToken) -> Result<(), String> {
     let task = update(app, id, |job| {
         if job.status != TimelineStatus::Queued { return Err("Timeline export is no longer queued".into()); }
         job.status = TimelineStatus::Rendering;
         job.error = None;
         Ok(())
     })?;
-    let result = assemble(app, &task).await;
+    // Dropping an in-progress FFmpeg status future kills the process through
+    // kill_on_drop, and ScratchDir removes temporary media on cancellation.
+    let result = tokio::select! {
+        result = assemble(app, &task) => result,
+        _ = cancellation.cancelled() => Err("Timeline export cancelled".to_string()),
+    };
     let _ = update(app, id, |job| {
         match &result {
             Ok(entry) => {
@@ -399,6 +417,7 @@ async fn assemble(app: &AppHandle, timeline: &VideoTimeline) -> Result<Generatio
     }
     let scratch = root.join(Uuid::new_v4().to_string());
     fs::create_dir(&scratch).map_err(|e| e.to_string())?;
+    let _cleanup = ScratchDir(scratch.clone());
     #[cfg(unix)] {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
@@ -422,7 +441,6 @@ async fn assemble(app: &AppHandle, timeline: &VideoTimeline) -> Result<Generatio
         let bytes = fs::read(&out).map_err(|e| e.to_string())?;
         generation_commands::publish_timeline_export(app, timeline, &entries, &bytes)
     }.await;
-    let _ = fs::remove_dir_all(&scratch);
     result
 }
 
@@ -491,6 +509,22 @@ pub fn generation_video_timeline_retry(app: AppHandle, timeline_id: String) -> R
         Ok(())
     })?;
     launch_ready(&app)?;
+    Ok(record)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_video_timeline_cancel(app: AppHandle, timeline_id: String) -> Result<VideoTimeline, String> {
+    let record = update(&app, &timeline_id, |job| {
+        if !matches!(job.status, TimelineStatus::Queued | TimelineStatus::Rendering) {
+            return Err("Only queued or rendering timeline exports can be cancelled".into());
+        }
+        job.status = TimelineStatus::Cancelled;
+        job.error = None;
+        Ok(())
+    })?;
+    if let Ok(tokens) = cancellations().lock() {
+        if let Some(token) = tokens.get(&timeline_id) { token.cancel(); }
+    }
     Ok(record)
 }
 

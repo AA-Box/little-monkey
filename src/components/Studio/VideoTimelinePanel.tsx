@@ -84,6 +84,15 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
       setError(String(e));
     } finally { setBusy(false); }
   };
+  const cancel = async (id: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await studioClient.videoTimelineCancel(id);
+      setTimelines(await studioClient.videoTimelines());
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(false); }
+  };
   const retry = async (id: string) => {
     setBusy(true);
     setError(null);
@@ -174,6 +183,11 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
             {(timeline.status === "failed" || timeline.status === "interrupted") &&
               <Button size="sm" variant="secondary" disabled={busy} onClick={() => void retry(timeline.id)}>
                 Retry
+              </Button>
+            }
+            {(timeline.status === "queued" || timeline.status === "rendering") &&
+              <Button size="sm" variant="secondary" disabled={busy} onClick={() => void cancel(timeline.id)}>
+                Cancel
               </Button>
             }
           </div>

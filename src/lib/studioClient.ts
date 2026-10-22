@@ -640,6 +640,8 @@ export const studioClient = {
   videoTimelines: () => invoke<VideoTimeline[]>("generation_video_timelines"),
   videoTimelineRetry: (timelineId: string) =>
     invoke<VideoTimeline>("generation_video_timeline_retry", { timelineId }),
+  videoTimelineCancel: (timelineId: string) =>
+    invoke<VideoTimeline>("generation_video_timeline_cancel", { timelineId }),
   run: (request: GenerationRequest) =>
     invoke<GenerationEntry[]>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),
