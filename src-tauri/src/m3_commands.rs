@@ -30,7 +30,8 @@ use crate::m3_runtime_hub::{
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
     M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
     M3HubError, M3HubResult, M3InstallComponentRequest, M3InstalledComponentView,
-    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
+    M3InstalledModelView, M3LoadExecutionPlan, M3LoadModelRequest, M3OperationContext,
+    M3PruneModelVersionsRequest,
     M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView,
     M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus,
     M3UnloadModelRequest, M3VerifyProjectorRequest,
@@ -918,6 +919,16 @@ pub async fn m3_runtime_inventory(
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.runtime_inventory(&runtime_id, &context).await;
     finish(&state, &operation_id, result).await
+}
+
+/// Returns the authoritative settings that `m3_runtime_load_model` will
+/// actually forward for this exact installed model and current memory snapshot.
+#[tauri::command]
+pub fn m3_runtime_plan_model_load(
+    state: tauri::State<'_, M3CommandState>,
+    request: M3LoadModelRequest,
+) -> Result<M3LoadExecutionPlan, String> {
+    state.hub.plan_model_load(&request).map_err(command_error)
 }
 
 #[tauri::command]
