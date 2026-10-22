@@ -120,14 +120,17 @@ fn directory(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())?
         .join("studio-v1").join("video-jobs");
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    // Check the leaf *before* chmod: chmod follows symlinks and could modify
+    // an outside directory if a local attacker swapped the journal path.
+    let meta = fs::symlink_metadata(&dir).map_err(|error| error.to_string())?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err("Studio video journal must be an app-owned directory".to_string());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
-    }
-    if fs::symlink_metadata(&dir).map_err(|error| error.to_string())?.file_type().is_symlink() {
-        return Err("Studio video journal may not be a symlink".to_string());
     }
     Ok(dir)
 }
