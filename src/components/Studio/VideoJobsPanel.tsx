@@ -5,6 +5,7 @@ import { useStudioRunStore } from "../../store/studioRunStore";
 
 export function VideoJobsPanel() {
   const [jobs, setJobs] = useState<VideoJob[]>([]);
+  const [nextPrompts, setNextPrompts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -46,13 +47,33 @@ export function VideoJobsPanel() {
     }
   };
 
+  const continueFrom = async (job: VideoJob) => {
+    const prompt = (nextPrompts[job.id] ?? job.prompt).trim();
+    if (!prompt) {
+      setError("Describe the next scene");
+      return;
+    }
+    setBusy(job.id);
+    setError(null);
+    try {
+      await studioClient.videoContinue(job.id, prompt, crypto.randomUUID());
+      setJobs(await studioClient.videoJobs());
+      setNextPrompts((current) => ({ ...current, [job.id]: "" }));
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   if (jobs.length === 0 && !error) return null;
   return (
     <section className="mx-1 rounded-lg border border-border bg-surface p-3" aria-label="Durable video jobs">
       <h3 className="mb-1 text-xs font-semibold">Video jobs</h3>
       <p className="mb-2 text-[11px] text-muted">
-        Jobs survive closing the Studio panel. Interrupted renders can be explicitly restarted with
-        the saved seed; the native engines do not expose a mid-frame checkpoint.
+        Queued jobs recover automatically when the app starts. Continue from a clip to feed its
+        decoded final frame into the next video. FFmpeg is required. Interrupted renders restart
+        from their saved seed; there is no mid-frame checkpoint.
       </p>
       {error && <p role="alert" className="mb-2 text-xs text-danger">{error}</p>}
       <div className="max-h-32 space-y-2 overflow-y-auto">
@@ -62,6 +83,7 @@ export function VideoJobsPanel() {
             <span className="shrink-0 font-mono text-[11px] text-muted">
               {job.status} · seed {job.seed}{job.status === "running" ? " · rendering" : ""}
             </span>
+            {job.sourceJobId && <span className="text-[11px] text-muted" title={job.sourceJobId}>↳ clip</span>}
             {(job.status === "interrupted" || job.status === "failed") && (
               <Button size="sm" variant="secondary" disabled={busy === job.id}
                 onClick={() => void act(job, "resume")}>Resume</Button>
@@ -70,6 +92,17 @@ export function VideoJobsPanel() {
               <Button size="sm" variant="secondary" disabled={busy === job.id}
                 onClick={() => void act(job, "cancel")}>Cancel</Button>
             )}
+            {job.status === "completed" && (
+              <span className="flex min-w-0 items-center gap-1">
+                <input aria-label="Next scene prompt" placeholder="Next scene prompt"
+                  className="w-36 rounded border border-border bg-background px-2 py-1 text-[11px]"
+                  value={nextPrompts[job.id] ?? ""}
+                  onChange={(event) => setNextPrompts((state) => ({ ...state, [job.id]: event.target.value }))}
+                />
+                <Button size="sm" variant="secondary" disabled={busy === job.id}
+                  onClick={() => void continueFrom(job)}>Continue</Button>
+              </span>
+            )
           </div>
         ))}
       </div>

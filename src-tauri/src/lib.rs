@@ -1105,6 +1105,9 @@ pub fn run() {
             // cross-window updates. Workspace restoration below triggers a
             // second sync once the primary root is known.
             native_skill_commands::sync_native_skill_watchers(app.handle());
+            // Resume queued native video jobs at process startup without
+            // requiring any Studio panel mount or listing IPC.
+            studio_video_jobs::start_background_recovery(app.handle().clone());
 
             // Listens for `littlemonkey://` deep links (macOS/mobile live
             // events; Windows/Linux fresh-launch CLI-arg parsing — a
@@ -2123,6 +2126,7 @@ pub fn run() {
             studio_video_jobs::generation_video_jobs,
             studio_video_jobs::generation_video_resume,
             studio_video_jobs::generation_video_cancel,
+            studio_video_jobs::generation_video_continue,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
             generation_commands::generation_delete_entry,

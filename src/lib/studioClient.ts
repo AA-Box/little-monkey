@@ -225,6 +225,8 @@ export type VideoJobStage = "waiting_for_dependencies" | "rendering" | "publishe
 export interface VideoJob {
   id: string;
   dependsOn: string[];
+  sourceJobId: string | null;
+  sourceArtifactId: string | null;
   modelId: string;
   prompt: string;
   seed: number;
@@ -608,8 +610,10 @@ export const studioClient = {
     invoke<RemoteBackend[]>("generation_remove_backend", { backendId }),
   /** Resolves to every artifact the run produced: one for a clip or an
    *  utterance, `batchCount` of them for a batch of images. */
-  videoSubmit: (request: GenerationRequest, idempotencyKey: string, dependsOn: string[] = []) =>
-    invoke<VideoJob>("generation_video_submit", { request, idempotencyKey, dependsOn }),
+  videoSubmit: (request: GenerationRequest, idempotencyKey: string, dependsOn: string[] = [], sourceJobId: string | null = null) =>
+    invoke<VideoJob>("generation_video_submit", { request, idempotencyKey, dependsOn, sourceJobId }),
+  videoContinue: (parentJobId: string, prompt: string, idempotencyKey: string) =>
+    invoke<VideoJob>("generation_video_continue", { parentJobId, prompt, idempotencyKey }),
   videoJobs: () => invoke<VideoJob[]>("generation_video_jobs"),
   videoResume: (jobId: string) => invoke<VideoJob>("generation_video_resume", { jobId }),
   videoCancel: (jobId: string) => invoke<VideoJob>("generation_video_cancel", { jobId }),

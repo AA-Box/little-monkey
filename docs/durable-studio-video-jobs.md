@@ -62,3 +62,12 @@ wired media inputs. Image-to-video uses its own saved starting image.
 - Verify on a real video model and actual desktop restart. Unit tests prove
   serialization, dependency gating, and path safety; physical-engine
   acceptance requires a model-installed host and is not asserted by CI.
+
+
+## Boot recovery and video-to-video chaining
+
+The Tauri setup hook launches the journal reconciler and dispatcher without a Studio UI request. Queued children of completed jobs resume scheduling automatically. An interrupted native sampling operation remains interrupted until the user explicitly requests a new render; native engines do not support restoring mid-frame sampler state.
+
+A single dependent video job automatically selects its parent as the source. With multiple predecessors, the caller must choose sourceJobId. The worker verifies a published, content-addressed parent video blob in the gallery, decodes its actual final PNG frame using FFmpeg, and supplies the PNG to the child's image_to_video input. SourceArtifactId is recorded for provenance. The Studio Continue button creates the next clip using the selected parent, with a new-scene prompt. If FFmpeg is unavailable, the source format is unsupported, or the receiving model lacks image_to_video support, the job fails visibly rather than silently generating an unrelated clip.
+
+These are last-frame handoffs, not cross-model latent or audio-context continuity, and video clips are not stitched into a single longer file in this PR. Installed FFmpeg is an explicit runtime dependency for chaining. Real installed-model and actual desktop crash/restart acceptance remain necessary.

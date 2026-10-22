@@ -5,7 +5,8 @@
 //! interrupted sampling is *not* represented as resumable mid-frame state.
 //! Resuming explicitly starts a new render of the persisted, fixed-seed request.
 
-use crate::generation::GenerationRequest;
+use crate::generation::{GenerationRequest, GenerationTask};
+use base64::Engine as _;
 use crate::generation_commands::{self, GenerationEntry};
 use crate::profiles::ProfileScopedPaths;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
@@ -21,6 +25,9 @@ const MAX_JOBS: usize = 128;
 const MAX_JOB_BYTES: u64 = 48 * 1024 * 1024;
 const MAX_DEPENDENCIES: usize = 16;
 const MAX_ATTEMPTS: u32 = 3;
+const MAX_HANDOFF_VIDEO_BYTES: usize = 256 * 1024 * 1024;
+const MAX_HANDOFF_PNG_BYTES: u64 = 22 * 1024 * 1024;
+const FRAME_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +44,7 @@ pub enum VideoJobStatus {
 #[serde(rename_all = "snake_case")]
 pub enum VideoJobStage {
     WaitingForDependencies,
+    PreparingInput,
     Rendering,
     Published,
 }
@@ -47,6 +55,10 @@ struct VideoJob {
     id: String,
     idempotency_key: String,
     depends_on: Vec<String>,
+    #[serde(default)]
+    source_job_id: Option<String>,
+    #[serde(default)]
+    source_artifact_id: Option<String>,
     request: GenerationRequest,
     status: VideoJobStatus,
     stage: VideoJobStage,
@@ -62,6 +74,8 @@ struct VideoJob {
 pub struct VideoJobView {
     id: String,
     depends_on: Vec<String>,
+    source_job_id: Option<String>,
+    source_artifact_id: Option<String>,
     model_id: String,
     prompt: String,
     seed: i64,
@@ -79,6 +93,8 @@ impl From<&VideoJob> for VideoJobView {
         Self {
             id: job.id.clone(),
             depends_on: job.depends_on.clone(),
+            source_job_id: job.source_job_id.clone(),
+            source_artifact_id: job.source_artifact_id.clone(),
             model_id: job.request.model_id.clone(),
             prompt: job.request.prompt.chars().take(240).collect(),
             seed: job.request.seed,
@@ -259,6 +275,128 @@ fn same_effective_request(saved: &GenerationRequest, incoming: &GenerationReques
     serde_json::to_value(saved).ok() == serde_json::to_value(normalized).ok()
 }
 
+/// Boot-time job reconciliation and dispatch, independent of Studio frontend.
+pub(crate) fn start_background_recovery(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = dispatch(&app) {
+            eprintln!("Studio video startup recovery failed: {error}");
+        }
+    });
+}
+
+/// A single predecessor is automatically the media source. Multiple parents
+/// need an explicit selector to avoid arbitrary output choices.
+fn continuation_source(dependencies: &[String], explicit: Option<&str>) -> Result<Option<String>, String> {
+    match explicit {
+        Some(id) if dependencies.iter().any(|parent| parent == id) => Ok(Some(id.into())),
+        Some(_) => Err("Video source must be one of the declared dependencies".into()),
+        None if dependencies.len() == 1 => Ok(Some(dependencies[0].clone())),
+        None if dependencies.len() > 1 => Err("Choose sourceJobId when a video has multiple dependencies".into()),
+        None => Ok(None),
+    }
+}
+
+fn parent_artifact(parent: &VideoJob, entries: &[GenerationEntry]) -> Result<GenerationEntry, String> {
+    if parent.status != VideoJobStatus::Completed {
+        return Err("Source video is not complete".into());
+    }
+    let entry = entries.iter().find(|entry|
+        entry.video_job_id.as_deref() == Some(parent.id.as_str())
+            && parent.result_entry_ids.contains(&entry.entry_id)
+            && entry.task.is_video()
+    ).ok_or("The source job has no published video artifact")?;
+    if entry.media_type != "video/mp4" && entry.media_type != "video/webm" {
+        return Err(format!("Unsupported continuation video format: {}", entry.media_type));
+    }
+    Ok(entry.clone())
+}
+
+/// FFmpeg's image2 -update 1 overwrites one PNG for every decoded input frame.
+/// The final PNG is therefore the decoded last frame rather than a thumbnail.
+async fn extract_final_frame(app: &AppHandle, media: &[u8], mime: &str) -> Result<String, String> {
+    if media.is_empty() || media.len() > MAX_HANDOFF_VIDEO_BYTES {
+        return Err("Source video is empty or too large".into());
+    }
+    let root = app.profile_data_dir().map_err(|error| error.to_string())?
+        .join("studio-v1").join("video-handoff");
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    if fs::symlink_metadata(&root).map_err(|error| error.to_string())?.file_type().is_symlink() {
+        return Err("Unsafe video handoff directory".into());
+    }
+    let scratch = root.join(Uuid::new_v4().to_string());
+    fs::create_dir(&scratch).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    let input = scratch.join(if mime == "video/webm" { "input.webm" } else { "input.mp4" });
+    let output = scratch.join("last.png");
+    let result = async {
+        fs::write(&input, media).map_err(|error| error.to_string())?;
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&input)
+            .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-vsync", "0",
+                   "-f", "image2", "-update", "1", "-y"])
+            .arg(&output)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .kill_on_drop(true);
+        let status = tokio::time::timeout(FRAME_EXTRACTION_TIMEOUT, cmd.status())
+            .await.map_err(|_| "Final-frame extraction exceeded two minutes".to_string())?
+            .map_err(|error| format!("FFmpeg unavailable for video continuation: {error}. Install FFmpeg and retry."))?;
+        if !status.success() {
+            return Err("FFmpeg could not decode the source video's final frame".into());
+        }
+        let meta = fs::symlink_metadata(&output).map_err(|error| error.to_string())?;
+        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() > MAX_HANDOFF_PNG_BYTES {
+            return Err("Decoded final frame is unsafe or too large".into());
+        }
+        let bytes = fs::read(&output).map_err(|error| error.to_string())?;
+        if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.len() < 24 {
+            return Err("Final-frame decoder returned no PNG".into());
+        }
+        let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap_or([0; 4]));
+        let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap_or([0; 4]));
+        if w == 0 || h == 0 || w > 4096 || h > 4096 {
+            return Err("Decoded frame dimensions exceed engine limits".into());
+        }
+        Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+    }.await;
+    let _ = fs::remove_dir_all(&scratch);
+    result
+}
+
+/// Resolve a real video blob from the verified artifact store and bind its
+/// decoded last frame to the child's image-to-video request.
+async fn prepared_request(app: &AppHandle, job: &VideoJob) -> Result<GenerationRequest, String> {
+    let Some(source_id) = &job.source_job_id else {
+        return Ok(job.request.clone());
+    };
+    let entry = {
+        let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
+        let dir = directory(app)?;
+        let parent = read_file(&path_for(&dir, source_id)?)?;
+        let gallery = generation_commands::generation_gallery(app.clone())?;
+        parent_artifact(&parent, &gallery)?
+    };
+    let base = app.profile_data_dir().map_err(|error| error.to_string())?;
+    let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
+        base.join("content-v1"), MAX_HANDOFF_VIDEO_BYTES as u64
+    ).map_err(|error| error.to_string())?;
+    let bytes = store.read(&entry.artifact_id).map_err(|error| error.to_string())?;
+    let png = extract_final_frame(app, &bytes, &entry.media_type).await?;
+    transition(app, &job.id, |record| {
+        record.source_artifact_id = Some(entry.artifact_id.clone());
+        Ok(())
+    })?;
+    let mut request = job.request.clone();
+    request.task = GenerationTask::ImageToVideo;
+    request.init_image_base64 = Some(png);
+    Ok(request)
+}
+
 fn dependencies_complete(job: &VideoJob, jobs: &[VideoJob]) -> bool {
     job.depends_on.iter().all(|id| jobs.iter().any(|candidate| {
         candidate.id == *id && candidate.status == VideoJobStatus::Completed
@@ -315,18 +453,28 @@ async fn execute(app: &AppHandle, id: &str) -> Result<(), String> {
             return Err("Video job is no longer queued".to_string());
         }
         job.status = VideoJobStatus::Running;
-        job.stage = VideoJobStage::Rendering;
+        job.stage = if job.source_job_id.is_some() { VideoJobStage::PreparingInput } else { VideoJobStage::Rendering };
         job.attempts += 1;
         job.error = None;
         Ok(())
     })?;
-    let result: Result<Vec<GenerationEntry>, String> = generation_commands::generation_run_with_job(
-        app.clone(),
-        app.state::<crate::AppState>(),
-        app.state::<crate::m3_commands::M3CommandState>(),
-        job.request,
-        id,
-    ).await;
+    let result: Result<Vec<GenerationEntry>, String> = async {
+        let request = prepared_request(app, &job).await?;
+        transition(app, id, |record| {
+            if record.status != VideoJobStatus::Running {
+                return Err("Video job cancelled during media preparation".into());
+            }
+            record.stage = VideoJobStage::Rendering;
+            Ok(())
+        })?;
+        generation_commands::generation_run_with_job(
+            app.clone(),
+            app.state::<crate::AppState>(),
+            app.state::<crate::m3_commands::M3CommandState>(),
+            request,
+            id,
+        ).await
+    }.await;
     let _ = transition(app, id, |job| {
         // Cancellation wins over late engine errors, but published artifacts
         // are never discarded because a cancel raced with publication.
@@ -354,6 +502,7 @@ pub fn generation_video_submit(
     request: GenerationRequest,
     idempotency_key: String,
     depends_on: Vec<String>,
+    source_job_id: Option<String>,
 ) -> Result<VideoJobView, String> {
     if !request.task.is_video() {
         return Err("Durable Studio jobs accept only video tasks".to_string());
@@ -365,13 +514,18 @@ pub fn generation_video_submit(
     if depends_on.len() > MAX_DEPENDENCIES || depends_on.iter().collect::<BTreeSet<_>>().len() != depends_on.len() {
         return Err("Too many or duplicate video dependencies".to_string());
     }
+    let source = continuation_source(&depends_on, source_job_id.as_deref())?;
+    if source.is_some() && request.init_image_base64.is_some() {
+        return Err("A chained video cannot also supply another starting frame".into());
+    }
     let result = {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
         let dir = directory(&app)?;
         let mut jobs = read_all(&dir)?;
         reconcile(&app, &dir, &mut jobs)?;
         if let Some(old) = jobs.iter().find(|job| job.idempotency_key == idempotency_key) {
-            if !same_effective_request(&old.request, &request) || old.depends_on != depends_on {
+            if !same_effective_request(&old.request, &request)
+                || old.depends_on != depends_on || old.source_job_id != source {
                 return Err("Video idempotency key already belongs to a different request".to_string());
             }
             VideoJobView::from(old)
@@ -389,6 +543,8 @@ pub fn generation_video_submit(
                 id: Uuid::new_v4().to_string(),
                 idempotency_key,
                 depends_on,
+                source_job_id: source,
+                source_artifact_id: None,
                 request: pin_seed(request),
                 status: VideoJobStatus::Queued,
                 stage: VideoJobStage::WaitingForDependencies,
@@ -404,6 +560,29 @@ pub fn generation_video_submit(
     };
     dispatch(&app)?;
     Ok(result)
+}
+
+/// Create a new scene using the parent's published video as the source.
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_video_continue(
+    app: AppHandle,
+    parent_job_id: String,
+    prompt: String,
+    idempotency_key: String,
+) -> Result<VideoJobView, String> {
+    let mut request = {
+        let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
+        let parent = read_file(&path_for(&directory(&app)?, &parent_job_id)?)?;
+        parent.request
+    };
+    if prompt.trim().is_empty() {
+        return Err("A continuation needs a new scene prompt".into());
+    }
+    request.prompt = prompt;
+    request.task = GenerationTask::ImageToVideo;
+    request.init_image_base64 = None;
+    request.mask_image_base64 = None;
+    generation_video_submit(app, request, idempotency_key, vec![parent_job_id.clone()], Some(parent_job_id))
 }
 
 #[tauri::command]
@@ -468,6 +647,7 @@ mod tests {
     fn example(id: &str, status: VideoJobStatus, depends_on: Vec<String>) -> VideoJob {
         VideoJob {
             id: id.into(), idempotency_key: id.into(), depends_on,
+            source_job_id: None, source_artifact_id: None,
             request: serde_json::from_value(serde_json::json!({
                 "modelId":"model", "task":"text_to_video","prompt":"test",
                 "width":512,"height":512,"steps":10,"cfgScale":4,"seed":1
@@ -511,6 +691,23 @@ mod tests {
         let mut changed = incoming;
         changed.prompt = "different request".into();
         assert!(!same_effective_request(&fixed, &changed));
+    }
+
+    #[test]
+    fn single_dependency_is_an_automatic_video_source() {
+        assert_eq!(continuation_source(&["a".into()], None).unwrap(), Some("a".into()));
+        assert!(continuation_source(&["a".into(), "b".into()], None).is_err());
+        assert_eq!(continuation_source(&["a".into(), "b".into()], Some("b")).unwrap(), Some("b".into()));
+        assert!(continuation_source(&["a".into()], Some("other")).is_err());
+    }
+
+    #[test]
+    fn parent_must_be_completed_and_published() {
+        let job = example("parent", VideoJobStatus::Completed, vec![]);
+        assert!(parent_artifact(&job, &[]).is_err());
+        let mut busy = job.clone();
+        busy.status = VideoJobStatus::Running;
+        assert!(parent_artifact(&busy, &[]).is_err());
     }
 
     #[test]
