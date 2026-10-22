@@ -938,7 +938,7 @@ pub async fn m3_runtime_load_model(
     operation_id: String,
     timeout_ms: Option<u64>,
     request: M3LoadModelRequest,
-) -> Result<(), String> {
+) -> Result<M3LoadExecutionPlan, String> {
     let _owner = if request.runtime_id == "mlx" {
         Some(state.mlx_ownership.acquire().await)
     } else {
@@ -950,7 +950,7 @@ pub async fn m3_runtime_load_model(
         }
     }
     let context = state.begin_operation(&operation_id, timeout_ms)?;
-    let result = state.hub.load_model(&request, &context).await;
+    let result = state.hub.load_model_with_plan(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
 
