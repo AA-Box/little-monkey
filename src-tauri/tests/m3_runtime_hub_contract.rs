@@ -620,6 +620,7 @@ async fn catalog_hardware_fit_is_bounded_deduplicated_and_explicit_about_mlx() {
 struct MockRuntimeState {
     models: Mutex<BTreeMap<String, (PathBuf, u64)>>,
     loaded: Mutex<BTreeSet<String>>,
+    last_settings: Mutex<Option<BTreeMap<String, SettingValue>>>,
     cancelled: Mutex<Vec<String>>,
     hold_stream: AtomicBool,
     stream_started: Notify,
@@ -662,6 +663,26 @@ impl MockRuntimeDriver {
 
     fn setting_capabilities() -> Vec<AdvancedSettingCapability> {
         vec![
+            AdvancedSettingCapability {
+                key: "context_size".to_string(),
+                label: "Context".to_string(),
+                description: "llama.cpp context tokens".to_string(),
+                schema: SettingValueSchema::Integer { min: 128, max: 1_048_576, step: 1 },
+                default_value: SettingValue::Integer { value: 4_096 },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
+            AdvancedSettingCapability {
+                key: "gpu_layers".to_string(),
+                label: "GPU layers".to_string(),
+                description: "llama.cpp GPU offload layers".to_string(),
+                schema: SettingValueSchema::Integer { min: -1, max: 999, step: 1 },
+                default_value: SettingValue::Integer { value: -1 },
+                restart_required: true,
+                supported: true,
+                unsupported_reason: None,
+            },
             AdvancedSettingCapability {
                 key: "threads".to_string(),
                 label: "Threads".to_string(),
@@ -843,12 +864,17 @@ impl M3RuntimeDriver for MockRuntimeDriver {
     fn load<'a>(
         &'a self,
         model: &'a M3ResolvedModel,
-        _settings: &'a BTreeMap<String, SettingValue>,
+        settings: &'a BTreeMap<String, SettingValue>,
         _keep_alive: Option<little_monkey_lib::runtime_adapter::KeepAlive>,
         _replace_existing: bool,
         _context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, ()> {
         Box::pin(async move {
+            *self
+                .state
+                .last_settings
+                .lock()
+                .map_err(|_| M3HubError::LockPoisoned)? = Some(settings.clone());
             let models = self
                 .state
                 .models
@@ -1054,6 +1080,103 @@ impl M3RuntimeReconciler for MockReconciler {
             ])
         })
     }
+}
+
+#[tokio::test]
+async fn live_load_plan_changes_the_real_driver_settings_without_mutating_user_config() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    fn add_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    // The model need not contain executable weights for this contract test,
+    // but its metadata must be a structurally valid GGUF v3 header with a
+    // *real* architecture-bound transformer block count.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"GGUF");
+    bytes.extend_from_slice(&3u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor count
+    bytes.extend_from_slice(&2u64.to_le_bytes()); // metadata entries
+    add_string(&mut bytes, "general.architecture");
+    bytes.extend_from_slice(&8u32.to_le_bytes()); // GGUF string
+    add_string(&mut bytes, "qwen2");
+    add_string(&mut bytes, "qwen2.block_count");
+    bytes.extend_from_slice(&4u32.to_le_bytes()); // GGUF uint32
+    bytes.extend_from_slice(&48u32.to_le_bytes());
+    bytes.resize(90_000, 0);
+
+    let mut constrained = hardware_with_cuda();
+    constrained.available_ram_bytes = 5 * GIB;
+    // PlatformCapabilities::from_host injects a CPU entry, sorted before CUDA.
+    // Select by kind; index zero silently capped the CPU entry instead and
+    // left the CUDA budget at 20 GiB, invalidating the memory-pressure test.
+    let cuda = constrained
+        .platform
+        .accelerators
+        .iter_mut()
+        .find(|accelerator| {
+            accelerator.kind == little_monkey_lib::runtime_adapter::AcceleratorKind::Cuda
+        })
+        .expect("test snapshot must contain a CUDA accelerator");
+    cuda.available_memory_bytes = Some(GIB);
+
+    let root = TestDirectory::new("adaptive-real-load-settings");
+    let runtime_state = Arc::new(MockRuntimeState::default());
+    let download = Arc::new(MutableDownload::new(bytes.clone(), "etag-adaptive"));
+    let hub = make_hub_with_hardware(
+        &root.0,
+        download,
+        Vec::new(),
+        vec![Arc::new(MockRuntimeDriver::new(runtime_state.clone()))],
+        Some(Arc::new(MockReconciler { state: runtime_state.clone() })),
+        None,
+        constrained,
+    );
+    let mut model = catalog_model(&bytes, "rev-adaptive");
+    model.required_accelerator = Some("cuda".to_string());
+    model.estimated_ram_bytes = 4 * GIB;
+    model.estimated_vram_bytes = 4 * GIB;
+    let context = M3OperationContext::default();
+    hub.download_model(
+        &M3DownloadRequest {
+            accepted_license_sha256: model.license.declaration_sha256(),
+            model: model.clone(),
+        },
+        &context,
+    )
+    .await
+    .expect("installed GGUF is available to reconciled runtime");
+
+    let request = M3LoadModelRequest {
+        runtime_id: "managed-llama".to_string(),
+        asset_id: model.asset_id(),
+        keep_alive: None,
+        replace_existing: false,
+    };
+    let preview = hub.plan_model_load(&request).expect("live preview");
+    assert_eq!(preview.effective_settings.get("context_size"), Some(&SettingValue::Integer { value: 2_048 }));
+    assert_eq!(preview.effective_settings.get("gpu_layers"), Some(&SettingValue::Integer { value: 12 }));
+
+    let executed = hub.load_model_with_plan(&request, &context)
+        .await
+        .expect("real hub load delegates effective plan to runtime");
+    assert_eq!(executed.effective_settings, preview.effective_settings);
+    let received = runtime_state.last_settings.lock().unwrap().clone().expect("actual driver settings");
+    assert_eq!(received, executed.effective_settings);
+    assert!(hub.runtime_config("managed-llama").unwrap().is_none(), "adaptive settings never mutate the user's persisted config");
+
+    // A user override survives the same planner. It is authority, not a hint.
+    hub.set_runtime_config(&M3SetRuntimeConfigRequest {
+        runtime_id: request.runtime_id.clone(),
+        values: BTreeMap::from([
+            ("context_size".to_string(), SettingValue::Integer { value: 8192 }),
+            ("gpu_layers".to_string(), SettingValue::Integer { value: -1 }),
+        ]),
+    }).expect("persist explicit override");
+    let overridden = hub.plan_model_load(&request).expect("preview explicit controls");
+    assert_eq!(overridden.effective_settings.get("context_size"), Some(&SettingValue::Integer { value: 8192 }));
+    assert_eq!(overridden.effective_settings.get("gpu_layers"), Some(&SettingValue::Integer { value: -1 }));
 }
 
 #[tokio::test]

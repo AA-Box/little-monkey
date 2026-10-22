@@ -30,7 +30,8 @@ use crate::m3_runtime_hub::{
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
     M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
     M3HubError, M3HubResult, M3InstallComponentRequest, M3InstalledComponentView,
-    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
+    M3InstalledModelView, M3LoadExecutionPlan, M3LoadModelRequest, M3OperationContext,
+    M3PruneModelVersionsRequest,
     M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView,
     M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus,
     M3UnloadModelRequest, M3VerifyProjectorRequest,
@@ -920,6 +921,16 @@ pub async fn m3_runtime_inventory(
     finish(&state, &operation_id, result).await
 }
 
+/// Returns the authoritative settings that `m3_runtime_load_model` will
+/// actually forward for this exact installed model and current memory snapshot.
+#[tauri::command]
+pub fn m3_runtime_plan_model_load(
+    state: tauri::State<'_, M3CommandState>,
+    request: M3LoadModelRequest,
+) -> Result<M3LoadExecutionPlan, String> {
+    state.hub.plan_model_load(&request).map_err(command_error)
+}
+
 #[tauri::command]
 pub async fn m3_runtime_load_model(
     app: tauri::AppHandle,
@@ -927,7 +938,7 @@ pub async fn m3_runtime_load_model(
     operation_id: String,
     timeout_ms: Option<u64>,
     request: M3LoadModelRequest,
-) -> Result<(), String> {
+) -> Result<M3LoadExecutionPlan, String> {
     let _owner = if request.runtime_id == "mlx" {
         Some(state.mlx_ownership.acquire().await)
     } else {
@@ -939,7 +950,7 @@ pub async fn m3_runtime_load_model(
         }
     }
     let context = state.begin_operation(&operation_id, timeout_ms)?;
-    let result = state.hub.load_model(&request, &context).await;
+    let result = state.hub.load_model_with_plan(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
 
@@ -1799,12 +1810,12 @@ pub async fn m3_component_activate_version(
 // Runtime Telemetry and Memory Trace Viewer
 // -------------------------------------------------------------------------
 
-/// Records a per-load trace. The caller (the Runtime Hub's load flow)
-/// already measured `startedAtMs`/`readyAtMs` around its own
-/// `m3_runtime_load_model` call and already computed an offload plan via
-/// `m3_offload_plan` before loading — this only stores what the caller
-/// already has, applying redaction to `errorMessage` before it is ever held
-/// in memory.
+/// Records a per-load trace. The desktop caller measures start/end timestamps
+/// and uses the effective offload plan returned *after* successful loading by
+/// `m3_runtime_load_model`. A separate preview via `m3_offload_plan` or
+/// `m3_runtime_plan_model_load` must not be recorded as execution evidence.
+/// This only stores the caller-supplied evidence, redacting error text before
+/// it is ever retained in memory.
 #[tauri::command]
 pub fn m3_telemetry_record_load(
     state: tauri::State<'_, M3CommandState>,
