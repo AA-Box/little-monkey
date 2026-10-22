@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowDown, ArrowUp, Plus, Trash2 } from "lucide-react";
 import { Button, IconButton } from "../ui";
-import { studioClient, type VideoJob, type VideoTimeline, type VideoTimelineSegment } from "../../lib/studioClient";
+import { studioClient, type GenerationEntry, type VideoJob, type VideoTimeline, type VideoTimelineSegment } from "../../lib/studioClient";
 import { useStudioRunStore } from "../../store/studioRunStore";
 
 type TimelineRow = VideoTimelineSegment & { key: string };
@@ -13,6 +13,7 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
   const [parts, setParts] = useState<TimelineRow[]>([]);
   const [music, setMusic] = useState<string | null>(null);
   const [timelines, setTimelines] = useState<VideoTimeline[]>([]);
+  const [gallery, setGallery] = useState<GenerationEntry[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,7 +23,7 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
     let known = new Set<string>();
     const refresh = async () => {
       try {
-        const records = await studioClient.videoTimelines();
+        const [records, entries] = await Promise.all([studioClient.videoTimelines(), studioClient.gallery()]);
         if (!mounted) return;
         const done = new Set(records.filter((item) => item.status === "completed").map((item) => item.id));
         if (initialized && [...done].some((id) => !known.has(id))) {
@@ -31,6 +32,7 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
         initialized = true;
         known = done;
         setTimelines(records);
+        setGallery(entries);
       } catch (e) {
         if (mounted) setError(String(e));
       }
@@ -40,7 +42,14 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
     return () => { mounted = false; clearInterval(interval); };
   }, []);
 
-  const candidates = jobs.filter((job) => job.status !== "cancelled" && job.status !== "failed");
+  const candidates = [
+    ...jobs.filter((job) => job.status !== "cancelled" && job.status !== "failed").map((job) => ({
+      id: job.id, name: job.prompt || job.modelId, status: job.status,
+    })),
+    ...gallery.filter((entry) => entry.mediaType === "video/mp4" || entry.mediaType === "video/webm")
+      .filter((entry) => !entry.videoJobId || !jobs.some((job) => job.id === entry.videoJobId))
+      .map((entry) => ({ id: `gallery:${entry.entryId}`, name: entry.prompt || entry.modelId, status: "published" })),
+  ];
   const add = (id: string) => {
     if (!id || parts.some((p) => p.jobId === id) || parts.length >= 16) return;
     setParts((prev) => [...prev, { key: uuid(), jobId: id, trimStartMs: 0, trimEndMs: null }]);
@@ -107,8 +116,8 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
     <section className="mt-3 rounded-lg border border-border bg-surface p-3" aria-label="Video timeline editor">
       <h3 className="text-xs font-semibold">Timeline and MP4 export</h3>
       <p className="mt-1 text-[11px] text-muted">
-        Arrange clips, trim each one, and optionally add a soundtrack. Export waits for unfinished
-        clips, then combines them into an MP4 in the Studio gallery. FFmpeg is required.
+        Arrange native or FreeVideo/ComfyUI gallery clips, trim and optionally add a soundtrack.
+        Export waits for unfinished clips and combines them into a single gallery MP4 using FFmpeg.
       </p>
       <label className="mt-3 grid gap-1 text-[11px] text-muted">
         Timeline name
@@ -121,17 +130,17 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
           className="h-8 min-w-0 flex-1 rounded border border-border bg-background px-2 text-xs">
           <option value="">Choose a clip to add…</option>
           {candidates.filter((job) => !parts.some((p) => p.jobId === job.id)).map((job) =>
-            <option key={job.id} value={job.id}>{job.prompt.slice(0, 65)} ({job.status})</option>
+            <option key={job.id} value={job.id}>{job.name.slice(0, 65)} ({job.status})</option>
           )}
         </select>
         <span className="text-[11px] text-muted">{parts.length}/16</span>
       </div>
       <div className="mt-2 max-h-52 space-y-1.5 overflow-y-auto">
         {parts.map((part, index) => {
-          const job = jobs.find((item) => item.id === part.jobId);
+          const job = candidates.find((item) => item.id === part.jobId);
           return (
             <div key={part.key} className="flex flex-wrap items-center gap-1 rounded border border-border p-2 text-xs">
-              <span className="min-w-20 flex-1 truncate" title={job?.prompt}>{index + 1}. {job?.prompt ?? part.jobId}</span>
+              <span className="min-w-20 flex-1 truncate" title={job?.name}>{index + 1}. {job?.name ?? part.jobId}</span>
               <label className="flex items-center gap-1 text-[10px] text-muted">
                 Start ms
                 <input type="number" min={0} max={600000} value={part.trimStartMs}

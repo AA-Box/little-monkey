@@ -228,6 +228,7 @@ pub(crate) fn publish_timeline_export(
     timeline: &crate::studio_video_timeline::VideoTimeline,
     clips: &[GenerationEntry],
     media: &[u8],
+    canvas: (u32, u32),
 ) -> Result<GenerationEntry, String> {
     let _guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let model_id = format!("studio:timeline:{}", timeline.id);
@@ -250,8 +251,8 @@ pub(crate) fn publish_timeline_export(
         negative_prompt: String::new(),
         media_type: "video/mp4".to_string(),
         size_bytes: blob.size,
-        width: first.width.clamp(64, 1920) / 2 * 2,
-        height: first.height.clamp(64, 1080) / 2 * 2,
+        width: canvas.0,
+        height: canvas.1,
         steps: 0,
         cfg_scale: 0.0,
         seed: -1,

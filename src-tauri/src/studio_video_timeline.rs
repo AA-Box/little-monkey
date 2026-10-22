@@ -482,7 +482,7 @@ async fn assemble(app: &AppHandle, timeline: &VideoTimeline) -> Result<Generatio
         let out = scratch.join("timeline.mp4");
         export_ffmpeg(&paths, &timeline.segments, music.as_deref(), &out, width, height).await?;
         let bytes = fs::read(&out).map_err(|e| e.to_string())?;
-        generation_commands::publish_timeline_export(app, timeline, &entries, &bytes)
+        generation_commands::publish_timeline_export(app, timeline, &entries, &bytes, (width, height))
     }.await;
     result
 }
