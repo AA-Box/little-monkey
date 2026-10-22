@@ -181,6 +181,10 @@ pub struct GgufHeaderInfo {
     /// used to auto-size `llama-server`'s `-c` instead of one fixed guess
     /// for every model (see `llama.rs::resolve_ctx_size`).
     pub context_length: Option<u64>,
+    /// Transformer block count read from the architecture-specific GGUF metadata.
+    /// Unlike a filesize heuristic this is safe to use for GPU-layer flags.
+    #[serde(default)]
+    pub block_count: Option<u64>,
     pub declared_license: Option<String>,
     /// Kept internal so callers can validate runtime compatibility without
     /// exposing a potentially large template in reports or over IPC.
@@ -392,6 +396,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
     let mut name = None;
     let mut quantization_version = None;
     let mut context_length = None;
+    let mut block_count_candidates: Vec<(String, u64)> = Vec::new();
     let mut declared_license = None;
     let mut chat_template = None;
     for _ in 0..metadata_kv_count {
@@ -420,9 +425,24 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
             (key, Some(GgufScalar::UInt(value))) if key.ends_with(".context_length") => {
                 context_length = Some(value);
             }
+            (key, Some(GgufScalar::UInt(value)))
+                if key.ends_with(".block_count") && value > 0 && block_count_candidates.len() < 16 =>
+            {
+                block_count_candidates.push((key.to_string(), value));
+            }
             _ => {}
         }
     }
+
+    // Accept only the block count declared for the actual model architecture;
+    // metadata such as a foreign 'clip.block_count' must never choose how many
+    // llama.cpp layers are offloaded for an unrelated language model.
+    let block_count = architecture.as_deref().and_then(|arch| {
+        block_count_candidates
+            .iter()
+            .find(|(key, _)| key == &format!("{arch}.block_count"))
+            .map(|(_, count)| *count)
+    });
 
     // Structurally walk the tensor-info table too (name, dimensions, ggml
     // type, data offset) so a truncated/corrupt tensor table — not just a
@@ -459,6 +479,7 @@ pub fn sniff_gguf_header<R: Read>(source: R) -> QuantizationResult<GgufHeaderInf
         name,
         quantization_version,
         context_length,
+        block_count,
         declared_license,
         chat_template,
     })
@@ -1513,6 +1534,41 @@ mod tests {
         assert_eq!(header.metadata_kv_count, 2);
         assert_eq!(header.architecture.as_deref(), Some("llama"));
         assert_eq!(header.declared_license.as_deref(), Some("apache-2.0"));
+    }
+
+    #[test]
+    fn sniffs_actual_architecture_block_count_without_a_filesize_guess() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC);
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0); // no tensor payload needed to test metadata
+        write_u64(&mut bytes, 2); // architecture and its block count
+        write_string(&mut bytes, "general.architecture");
+        write_u32(&mut bytes, GGUF_TYPE_STRING);
+        write_string(&mut bytes, "qwen2");
+        write_string(&mut bytes, "qwen2.block_count");
+        write_u32(&mut bytes, GGUF_TYPE_UINT32);
+        write_u32(&mut bytes, 48);
+        let header = sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF metadata");
+        assert_eq!(header.block_count, Some(48));
+        assert_eq!(header.architecture.as_deref(), Some("qwen2"));
+        assert_eq!(header.context_length, None);
+    }
+
+    #[test]
+    fn ignores_zero_gguf_block_count_as_unusable_for_offload_planning() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC);
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 1);
+        write_string(&mut bytes, "llama.block_count");
+        write_u32(&mut bytes, GGUF_TYPE_UINT32);
+        write_u32(&mut bytes, 0);
+        assert_eq!(
+            sniff_gguf_header(Cursor::new(bytes)).expect("valid GGUF").block_count,
+            None
+        );
     }
 
     #[test]

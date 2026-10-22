@@ -168,6 +168,7 @@ beforeEach(() => {
     busy: {},
     errors: {},
     activeOperations: {},
+    offloadPlans: {},
     downloadProgress: {},
     cleanupReport: null,
     schedulingPlan: null,
@@ -181,6 +182,102 @@ beforeEach(() => {
 });
 
 describe("runtimeHubStore", () => {
+  it("records the *executed* load plan rather than a potentially stale UI preview", async () => {
+    const request = {
+      runtimeId: "managed-llama",
+      assetId: "asset-1",
+      keepAlive: null,
+      replaceExisting: false,
+    };
+    const executed = {
+      runtimeId: request.runtimeId,
+      assetId: request.assetId,
+      effectiveSettings: { context_size: { type: "integer", value: 2048 } },
+      offload: {
+        schema_version: 1,
+        accelerator: "cuda",
+        context_tokens: 2048,
+        requested_context_tokens: 4096,
+        batch_size: 128,
+        gpu_layers: 10,
+        estimated_total_layers: 28,
+        cpu_spill_layers: 18,
+        projector_placement: "not_applicable",
+        parallel_sequences: 1,
+        available_ram_bytes: 8000000000,
+        available_vram_bytes: 4000000000,
+        rationale: [],
+        improvement_suggestions: [],
+      },
+      decisions: ["reduced default context"],
+    };
+    useRuntimeHubStore.setState({
+      offloadPlans: { [request.runtimeId]: { context_tokens: 16384 } } as never,
+    });
+    mocks.client.runtimeLoadModel.mockResolvedValue(executed);
+    mocks.client.runtimeStatus.mockResolvedValue({ status: "ready" });
+    mocks.client.runtimeInventory.mockResolvedValue({ models: [] });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.telemetryRecordLoad.mockResolvedValue(undefined);
+
+    await useRuntimeHubStore.getState().loadModel(request);
+    expect(mocks.client.telemetryRecordLoad).toHaveBeenCalledOnce();
+    expect(mocks.client.telemetryRecordLoad).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeId: request.runtimeId,
+        modelId: request.assetId,
+        offloadPlan: executed.offload,
+        errorMessage: null,
+      }),
+    );
+  });
+
+  it("does not reclassify a successful backend load as failed when refresh subsequently errors", async () => {
+    const request = {
+      runtimeId: "managed-llama",
+      assetId: "asset-2",
+      keepAlive: null,
+      replaceExisting: false,
+    };
+    mocks.client.runtimeLoadModel.mockResolvedValue({
+      runtimeId: request.runtimeId,
+      assetId: request.assetId,
+      effectiveSettings: {},
+      offload: null,
+      decisions: [],
+    });
+    mocks.client.runtimeStatus.mockRejectedValue(new Error("status unavailable"));
+    mocks.client.runtimeInventory.mockResolvedValue({ models: [] });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.telemetryRecordLoad.mockResolvedValue(undefined);
+
+    await expect(useRuntimeHubStore.getState().loadModel(request)).rejects.toThrow("status unavailable");
+    expect(mocks.client.telemetryRecordLoad).toHaveBeenCalledOnce();
+    expect(mocks.client.telemetryRecordLoad).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: request.assetId, errorMessage: null, offloadPlan: null }),
+    );
+  });
+
+  it("never records stale preview numbers when the backend failed to load", async () => {
+    const request = {
+      runtimeId: "managed-llama",
+      assetId: "asset-3",
+      keepAlive: null,
+      replaceExisting: false,
+    };
+    useRuntimeHubStore.setState({
+      offloadPlans: { [request.runtimeId]: { context_tokens: 16384 } } as never,
+    });
+    mocks.client.runtimeLoadModel.mockRejectedValue(new Error("GPU allocation failed"));
+    mocks.client.telemetryRecordLoad.mockResolvedValue(undefined);
+
+    await expect(useRuntimeHubStore.getState().loadModel(request)).rejects.toThrow("GPU allocation failed");
+    expect(mocks.client.telemetryRecordLoad).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: request.assetId, offloadPlan: null, errorMessage: "GPU allocation failed" }),
+    );
+    expect(mocks.client.runtimeStatus).not.toHaveBeenCalled();
+  });
+
   it("loads hardware, profile, storage, installed models, runtimes, and disabled LAN state", async () => {
     mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
     mocks.client.hardwareProfile.mockResolvedValue(profile);

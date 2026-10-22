@@ -1055,11 +1055,10 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       const operationId = createM3OperationId("runtime-load");
       begin(key, operationId);
       const startedAtMs = Date.now();
-      // Reuses whatever offload plan `previewOffloadPlan` already computed
-      // for this runtime (the Runtime Hub's load flow always previews one
-      // before offering the load action) — this trace never computes its
-      // own placement/memory numbers, only reports the planner's.
-      const offloadPlan = get().offloadPlans[request.runtimeId] ?? null;
+      // An old offload preview is not proof of execution. Only the runtime
+      // response can provide authoritative load-plan evidence.
+      let offloadPlan = null as OffloadPlan | null;
+      let backendLoaded = false;
       const recordTrace = (loadError: unknown) => {
         // Wrapped in `Promise.resolve` (rather than chaining `.catch`
         // directly off the client call) so this stays safe even if the
@@ -1079,11 +1078,19 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         });
       };
       try {
-        await runtimeHubClient.runtimeLoadModel({ operationId, timeoutMs: 120_000, request });
-        await get().refreshRuntime(request.runtimeId);
+        const loaded = await runtimeHubClient.runtimeLoadModel({ operationId, timeoutMs: 120_000, request });
+        // A real response comes only after backend load succeeded. Older IPC
+        // clients can return undefined, which is not execution-plan evidence.
+        if (loaded && "offload" in loaded) {
+          offloadPlan = loaded.offload ?? null;
+        }
+        backendLoaded = true;
         recordTrace(undefined);
+        // Refreshing the UI can independently fail after a successful load:
+        // never rewrite an already successful backend load as a failure.
+        await get().refreshRuntime(request.runtimeId);
       } catch (error) {
-        recordTrace(error);
+        if (!backendLoaded) recordTrace(error);
         fail(key, error);
         throw error;
       } finally {
