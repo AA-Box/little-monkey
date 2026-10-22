@@ -264,6 +264,9 @@ describe("verified benchmark comparison", () => {
   it("does not divide by missing or zero decode rates", () => {
     const original = verifiedHistoryEntry(100);
     expect(benchmarkDecodeChange(original, verifiedHistoryEntry(0))).toBeNull();
+    const single = verifiedHistoryEntry(100);
+    single.report.decodeTokensPerSecond!.n = 1;
+    expect(benchmarkDecodeChange(original, single)).toBeNull();
     expect(benchmarkDecodeChange({ ...original, report: { ...original.report, decodeTokensPerSecond: null } }, original)).toBeNull();
   });
 });
