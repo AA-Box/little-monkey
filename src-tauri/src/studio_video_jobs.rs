@@ -234,22 +234,31 @@ fn saved_results(app: &AppHandle, id: &str) -> Result<Vec<String>, String> {
         .map(|entry| entry.entry_id).collect())
 }
 
+fn reconcile_one(job: &mut VideoJob, is_active: bool, results: Vec<String>) -> bool {
+    if !matches!(job.status, VideoJobStatus::Running | VideoJobStatus::Interrupted | VideoJobStatus::Failed) {
+        return false;
+    }
+    if !results.is_empty() {
+        job.status = VideoJobStatus::Completed;
+        job.stage = VideoJobStage::Published;
+        job.result_entry_ids = results;
+        job.error = None;
+    } else if job.status == VideoJobStatus::Running && !is_active {
+        job.status = VideoJobStatus::Interrupted;
+        job.error = Some("The app exited while rendering. The engine provides no mid-frame checkpoint; resume starts the saved request again.".to_string());
+    } else {
+        return false;
+    }
+    job.updated_at_ms = now_ms();
+    true
+}
+
 fn reconcile(app: &AppHandle, dir: &Path, jobs: &mut [VideoJob]) -> Result<(), String> {
     let active_ids = active().lock().map_err(|error| error.to_string())?.clone();
     for job in jobs.iter_mut() {
         if matches!(job.status, VideoJobStatus::Running | VideoJobStatus::Interrupted | VideoJobStatus::Failed) {
             let results = saved_results(app, &job.id)?;
-            if !results.is_empty() {
-                job.status = VideoJobStatus::Completed;
-                job.stage = VideoJobStage::Published;
-                job.result_entry_ids = results;
-                job.error = None;
-                job.updated_at_ms = now_ms();
-                write_file(dir, job)?;
-            } else if job.status == VideoJobStatus::Running && !active_ids.contains(&job.id) {
-                job.status = VideoJobStatus::Interrupted;
-                job.error = Some("The app exited while rendering. The engine provides no mid-frame checkpoint; resume starts the saved request again.".to_string());
-                job.updated_at_ms = now_ms();
+            if reconcile_one(job, active_ids.contains(&job.id), results) {
                 write_file(dir, job)?;
             }
         }
@@ -407,15 +416,19 @@ fn dependencies_complete(job: &VideoJob, jobs: &[VideoJob]) -> bool {
     }))
 }
 
+fn ready_jobs(jobs: &[VideoJob]) -> Vec<String> {
+    jobs.iter().filter(|job|
+        job.status == VideoJobStatus::Queued && dependencies_complete(job, jobs)
+    ).map(|job| job.id.clone()).collect()
+}
+
 fn dispatch(app: &AppHandle) -> Result<(), String> {
     let ready = {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
         let dir = directory(app)?;
         let mut jobs = read_all(&dir)?;
         reconcile(app, &dir, &mut jobs)?;
-        jobs.iter().filter(|job|
-            job.status == VideoJobStatus::Queued && dependencies_complete(job, &jobs)
-        ).map(|job| job.id.clone()).collect::<Vec<_>>()
+        ready_jobs(&jobs)
     };
     for id in ready {
         let inserted = active().lock().map_err(|error| error.to_string())?.insert(id.clone());
@@ -683,6 +696,30 @@ mod tests {
         assert_eq!(restored[0].depends_on, vec!["parent"]);
         assert_eq!(restored[0].status, VideoJobStatus::Queued);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_reconciles_published_and_interrupted_jobs_without_replaying_them() {
+        let mut published = example("parent", VideoJobStatus::Running, vec![]);
+        assert!(reconcile_one(&mut published, false, vec!["gallery-1".into()]));
+        assert_eq!(published.status, VideoJobStatus::Completed);
+        assert_eq!(published.stage, VideoJobStage::Published);
+        let mut orphan = example("orphan", VideoJobStatus::Running, vec![]);
+        assert!(reconcile_one(&mut orphan, false, vec![]));
+        assert_eq!(orphan.status, VideoJobStatus::Interrupted);
+        assert!(!reconcile_one(&mut orphan, false, vec![]));
+        let child = example("child", VideoJobStatus::Queued, vec!["parent".into()]);
+        let ready = ready_jobs(&[published, orphan, child]);
+        assert_eq!(ready, vec!["child"]);
+        // No replay of a crashed native sampler without user approval.
+        assert!(!ready.contains(&"orphan".to_string()));
+    }
+
+    #[test]
+    fn startup_keeps_legitimately_active_renderers_running() {
+        let mut running = example("active", VideoJobStatus::Running, vec![]);
+        assert!(!reconcile_one(&mut running, true, vec![]));
+        assert_eq!(running.status, VideoJobStatus::Running);
     }
 
     #[test]
