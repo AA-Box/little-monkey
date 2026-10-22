@@ -70,7 +70,7 @@ The Tauri setup hook launches the journal reconciler and dispatcher without a St
 
 A single dependent video job automatically selects its parent as the source. With multiple predecessors, the caller must choose sourceJobId. The worker verifies a published, content-addressed parent video blob in the gallery, decodes its actual final PNG frame using FFmpeg, and supplies the PNG to the child's image_to_video input. SourceArtifactId is recorded for provenance. The Studio Continue button creates the next clip using the selected parent, with a new-scene prompt. If FFmpeg is unavailable, the source format is unsupported, or the receiving model lacks image_to_video support, the job fails visibly rather than silently generating an unrelated clip.
 
-These are last-frame handoffs, not cross-model latent or audio-context continuity, and video clips are not stitched into a single longer file in this PR. Installed FFmpeg is an explicit runtime dependency for chaining. Real installed-model and actual desktop crash/restart acceptance remain necessary.
+These are last-frame handoffs, not cross-model latent or audio-context continuity, and the separate timeline editor concatenates published clips into one MP4. Installed FFmpeg is an explicit runtime dependency for chaining. Real installed-model and actual desktop crash/restart acceptance remain necessary.
 
 
 ## Timeline editor and real MP4 assembly
@@ -88,7 +88,7 @@ cancellation, and manual retry.
 FFmpeg normalizes mixed MP4/WebM sources to a common 24fps, aspect-preserving
 canvas, pads rather than crops, then concatenates them in order. Optional
 audio is a **user-picked** source track that loops to the end of the video.
-Without soundtrack the assembled video is silent. This does not retain native
+Without a soundtrack, the compositor preserves embedded clip audio and inserts aligned silence for clips without audio; a picked soundtrack overrides all clip audio. This does not retain native
 audio from source clips; it also does not carry any diffusion latent states
 between clips. The resulting \`studio:timeline:<id>\` MP4 is published into
 the normal Studio gallery. A crash between publication and marking the export

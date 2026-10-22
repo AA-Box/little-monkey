@@ -304,6 +304,82 @@ fn filter_graph(segments: &[VideoTimelineSegment], width: u32, height: u32) -> S
     filters.join(";")
 }
 
+#[derive(Clone, Debug)]
+struct SourceAudio {
+    has_audio: bool,
+    duration_ms: u64,
+}
+
+async fn source_audio(path: &Path) -> Result<SourceAudio, String> {
+    let ffprobe = ffmpeg_executable().with_file_name("ffprobe");
+    let output = tokio::time::timeout(Duration::from_secs(20),
+        Command::new(ffprobe)
+            .args(["-v", "error", "-show_entries", "stream=codec_type",
+                   "-show_entries", "format=duration", "-of", "json"])
+            .arg(path).stdin(Stdio::null()).stderr(Stdio::null()).output()
+    ).await.map_err(|_| "Source audio probe timed out".to_string())?
+     .map_err(|e| format!("FFprobe is required for audio inspection: {e}"))?;
+    if !output.status.success() {
+        return Err("FFprobe could not read the source video".into());
+    }
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    let duration: f64 = result.get("format").and_then(|v| v.get("duration"))
+        .and_then(|v| v.as_str()).ok_or("Video container has no duration")?
+        .parse().map_err(|_| "Invalid source-video duration")?;
+    if !duration.is_finite() || duration <= 0.0 || duration > 3600.0 {
+        return Err("A source clip has an invalid or excessive duration".into());
+    }
+    Ok(SourceAudio {
+        has_audio: result.get("streams").and_then(|v| v.as_array())
+            .is_some_and(|streams| streams.iter().any(|v| v.get("codec_type").and_then(|s| s.as_str()) == Some("audio"))),
+        duration_ms: (duration * 1000.0).round() as u64,
+    })
+}
+
+/// Preserve the audio timeline as well as video. When one source has no sound,
+/// insert exactly its clipped duration of silence so later audio remains in
+/// sync. User-picked music overrides source audio completely.
+fn graph_with_audio(
+    segments: &[VideoTimelineSegment],
+    sources: &[SourceAudio],
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
+    if segments.len() != sources.len() { return Err("Audio source count mismatch".into()); }
+    let mut video_parts = filter_graph(segments, width, height)
+        .split(';').map(str::to_string).collect::<Vec<_>>();
+    video_parts.pop(); // replace the video-only concat with audio+video concat
+    let mut links = String::new();
+    let mut total_duration_ms = 0_u64;
+    for (index, (segment, source)) in segments.iter().zip(sources.iter()).enumerate() {
+        let end = segment.trim_end_ms.unwrap_or(source.duration_ms);
+        if end <= segment.trim_start_ms || end > source.duration_ms.saturating_add(100) {
+            return Err("A timeline audio trim is beyond the source clip duration".into());
+        }
+        let duration_ms = end.saturating_sub(segment.trim_start_ms);
+        total_duration_ms = total_duration_ms.saturating_add(duration_ms);
+        let seconds = duration_ms as f64 / 1000.0;
+        let part = if source.has_audio {
+            format!(
+                "[{index}:a:0]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS,aresample=48000,\
+                 aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,\
+                 apad,atrim=duration={seconds:.3}[a{index}]",
+                segment.trim_start_ms as f64 / 1000.0, end as f64 / 1000.0
+            )
+        } else {
+            format!("anullsrc=r=48000:cl=stereo,atrim=duration={seconds:.3},asetpts=PTS-STARTPTS[a{index}]")
+        };
+        video_parts.push(part);
+        links.push_str(&format!("[v{index}][a{index}]"));
+    }
+    if total_duration_ms > 3_600_000 {
+        return Err("A Studio timeline cannot exceed one hour".into());
+    }
+    video_parts.push(format!("{links}concat=n={}:v=1:a=1[outv][outa]", segments.len()));
+    Ok(video_parts.join(";"))
+}
+
 /// Stateless FFmpeg runner that is usable directly from the native decoder
 /// acceptance test. It never accepts a caller-authored FFmpeg argument.
 async fn export_ffmpeg(
@@ -315,7 +391,21 @@ async fn export_ffmpeg(
     height: u32,
 ) -> Result<(), String> {
     if files.len() != segments.len() { return Err("Timeline source count mismatch".into()); }
-    let args = filter_graph(segments, width, height);
+    let source_audio = if soundtrack.is_none() {
+        let mut info = Vec::with_capacity(files.len());
+        for path in files {
+            info.push(source_audio(path).await?);
+        }
+        info
+    } else {
+        Vec::new()
+    };
+    let mix_audio = soundtrack.is_none() && source_audio.iter().any(|source| source.has_audio);
+    let args = if mix_audio {
+        graph_with_audio(segments, &source_audio, width, height)?
+    } else {
+        filter_graph(segments, width, height)
+    };
     let mut cmd = Command::new(ffmpeg_executable());
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"]);
     for path in files {
@@ -328,6 +418,8 @@ async fn export_ffmpeg(
         .args(["-map", "[outv]"]);
     if soundtrack.is_some() {
         cmd.args(["-map", &format!("{}:a:0", files.len()), "-c:a", "aac", "-b:a", "160k"]);
+    } else if mix_audio {
+        cmd.args(["-map", "[outa]", "-c:a", "aac", "-b:a", "160k"]);
     } else {
         cmd.arg("-an");
     }
@@ -628,6 +720,18 @@ mod tests {
         assert!(!valid_source_id(&format!("gallery:{uuid}")));
     }
     #[test]
+    fn audio_concat_preserves_audio_and_fills_missing_segment_with_silence() {
+        let ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+        let parts = ids.iter().map(|id| segment(id)).collect::<Vec<_>>();
+        let graph = graph_with_audio(&parts,
+            &[SourceAudio { has_audio: true, duration_ms: 1000 },
+              SourceAudio { has_audio: false, duration_ms: 1000 }], 640, 384).unwrap();
+        assert!(graph.contains("[0:a:0]atrim"));
+        assert!(graph.contains("anullsrc=r=48000:cl=stereo"));
+        assert!(graph.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]"));
+    }
+
+    #[test]
     fn soundtrack_rejects_unbounded_or_relative_files() {
         assert!(validated_soundtrack(Some("../../../something.mp3")).is_err());
         assert!(validated_soundtrack(Some("")).unwrap().is_none());
@@ -646,6 +750,19 @@ mod tests {
                        "-c:v","mpeg4","-y"]).arg(dest).status().unwrap();
             assert!(status.success(), "FFmpeg fixture generation failed");
         }
+        // First source contains a real audio stream; the second has none.
+        // The compositor must carry the first and pad the second with silence.
+        let with_audio = root.join("a_with_audio.mp4");
+        let attached = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-loglevel", "error", "-i"])
+            .arg(&a)
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                   "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                   "-c:a", "aac", "-y"])
+            .arg(&with_audio).status().unwrap();
+        assert!(attached.success(), "Audio fixture must be muxed into first clip");
+        fs::rename(&with_audio, &a).unwrap();
+
         let clip_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
         let segments = clip_ids.iter().map(|id| segment(id)).collect::<Vec<_>>();
         let out = root.join("out.mp4");
@@ -658,6 +775,13 @@ mod tests {
             .args(["-nostdin", "-loglevel", "error", "-i"])
             .arg(&out).args(["-f","null","-"]).status().unwrap();
         assert!(verify.success(), "Exported MP4 must decode all frames");
+        let audio_check = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=codec_type",
+                   "-of", "csv=p=0"])
+            .arg(&out).output().unwrap();
+        assert!(audio_check.status.success());
+        assert!(String::from_utf8_lossy(&audio_check.stdout).contains("audio"),
+            "Source audio must survive mixed audio/silent clip concatenation");
         fs::remove_dir_all(root).unwrap();
     }
 }
