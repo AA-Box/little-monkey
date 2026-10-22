@@ -487,30 +487,19 @@ async fn benchmark_with_context(
     }
 
     let model_after = benchmark_local_model(state, request, context).await?;
-    if model_before.digest != model_after.digest
-        || model_before.size_bytes != model_after.size_bytes
-        || model_before.local_path != model_after.local_path
-    {
-        return Err(M3HubError::Conflict(
-            "the measured model changed during benchmark; samples discarded".to_string(),
-        ));
-    }
     let pid_after = state.hub.benchmark_runtime_pid(&request.runtime_id, context).await?;
-    if pid != pid_after {
-        return Err(M3HubError::Conflict(
-            "the runtime process restarted during benchmark; samples discarded".to_string(),
-        ));
-    }
-    if machine_identity(&hardware) != machine_identity(&state.hub.hardware_snapshot()?) {
-        return Err(M3HubError::Conflict(
-            "hardware changed during benchmark; samples discarded".to_string(),
-        ));
-    }
-    if config != state.hub.runtime_config(&request.runtime_id)? {
-        return Err(M3HubError::Conflict(
-            "configured runtime settings changed during benchmark; samples discarded".to_string(),
-        ));
-    }
+    let current_machine = machine_identity(&state.hub.hardware_snapshot()?);
+    let current_config = state.hub.runtime_config(&request.runtime_id)?;
+    ensure_benchmark_continuity(
+        &model_before,
+        &model_after,
+        pid,
+        pid_after,
+        &machine_identity(&hardware),
+        &current_machine,
+        &config,
+        &current_config,
+    )?;
     let after = read_peak_mark(pid, &mut memory_notes);
     let mut peak_memory = PeakMemory::measure(pid, before, after);
     peak_memory.unavailable.extend(memory_notes);
@@ -595,6 +584,44 @@ async fn benchmark_local_model(
         )));
     }
     Ok(model.clone())
+}
+
+/// All measurements must belong to one model and one surviving execution
+/// context. Kept pure to regression-test failure paths without local GPUs.
+fn ensure_benchmark_continuity(
+    before: &crate::runtime_adapter::RuntimeModel,
+    after: &crate::runtime_adapter::RuntimeModel,
+    original_pid: Option<i64>,
+    current_pid: Option<i64>,
+    original_machine: &MachineIdentity,
+    current_machine: &MachineIdentity,
+    original_config: &Option<BTreeMap<String, crate::runtime_adapter::SettingValue>>,
+    current_config: &Option<BTreeMap<String, crate::runtime_adapter::SettingValue>>,
+) -> M3HubResult<()> {
+    if before.digest != after.digest
+        || before.size_bytes != after.size_bytes
+        || before.local_path != after.local_path
+    {
+        return Err(M3HubError::Conflict(
+            "the measured model changed during benchmark; samples discarded".to_string(),
+        ));
+    }
+    if original_pid != current_pid {
+        return Err(M3HubError::Conflict(
+            "the runtime process restarted during benchmark; samples discarded".to_string(),
+        ));
+    }
+    if original_machine != current_machine {
+        return Err(M3HubError::Conflict(
+            "hardware changed during benchmark; samples discarded".to_string(),
+        ));
+    }
+    if original_config != current_config {
+        return Err(M3HubError::Conflict(
+            "configured runtime settings changed during benchmark; samples discarded".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn sha256_hex_serialized<T: Serialize>(value: &T) -> M3HubResult<String> {
