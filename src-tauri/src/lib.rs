@@ -49,6 +49,7 @@ pub mod runtime_adapter;
 pub mod generation;
 pub(crate) mod generation_commands;
 mod studio_video_jobs;
+mod studio_video_timeline;
 pub mod studio_parity;
 pub mod character_trainer;
 pub mod studio_tools;
@@ -1345,6 +1346,7 @@ pub fn run() {
             // runtimes were materialized and profile restore was recovered.
             // No Studio window, tab, or listing IPC is needed to dispatch.
             studio_video_jobs::start_background_recovery(app.handle().clone());
+            studio_video_timeline::start_background_recovery(app.handle().clone());
 
             Ok(())
         })
@@ -2129,6 +2131,9 @@ pub fn run() {
             studio_video_jobs::generation_video_resume,
             studio_video_jobs::generation_video_cancel,
             studio_video_jobs::generation_video_continue,
+            studio_video_timeline::generation_video_timeline_submit,
+            studio_video_timeline::generation_video_timelines,
+            studio_video_timeline::generation_video_timeline_retry,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
             generation_commands::generation_delete_entry,

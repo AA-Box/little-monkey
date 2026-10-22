@@ -72,20 +72,20 @@ struct VideoJob {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoJobView {
-    id: String,
-    depends_on: Vec<String>,
-    source_job_id: Option<String>,
-    source_artifact_id: Option<String>,
-    model_id: String,
-    prompt: String,
-    seed: i64,
-    status: VideoJobStatus,
-    stage: VideoJobStage,
-    attempts: u32,
-    result_entry_ids: Vec<String>,
-    error: Option<String>,
-    created_at_ms: u64,
-    updated_at_ms: u64,
+    pub(crate) id: String,
+    pub(crate) depends_on: Vec<String>,
+    pub(crate) source_job_id: Option<String>,
+    pub(crate) source_artifact_id: Option<String>,
+    pub(crate) model_id: String,
+    pub(crate) prompt: String,
+    pub(crate) seed: i64,
+    pub(crate) status: VideoJobStatus,
+    pub(crate) stage: VideoJobStage,
+    pub(crate) attempts: u32,
+    pub(crate) result_entry_ids: Vec<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) created_at_ms: u64,
+    pub(crate) updated_at_ms: u64,
 }
 
 impl From<&VideoJob> for VideoJobView {
@@ -518,6 +518,9 @@ async fn execute(app: &AppHandle, id: &str) -> Result<(), String> {
         }
         Ok(())
     });
+    if result.is_ok() {
+        crate::studio_video_timeline::notify_video_published(app);
+    }
     result.map(|_| ())
 }
 

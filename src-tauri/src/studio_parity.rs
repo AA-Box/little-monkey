@@ -882,6 +882,7 @@ fn gallery_paths(app: &AppHandle) -> Result<(PathBuf, ArtifactStore), String> {
 }
 
 fn append_gallery(app: &AppHandle, new_entries: &[GenerationEntry]) -> Result<(), String> {
+    let _gallery_guard = crate::generation_commands::gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let (gallery_path, _) = gallery_paths(app)?;
     let mut entries: Vec<GenerationEntry> = fs::read(&gallery_path)
         .ok()

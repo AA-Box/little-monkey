@@ -213,6 +213,59 @@ fn model_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Every local Studio publisher participates in this short-lived write lock,
+/// including the timeline compositor and imported ComfyUI workflow results.
+pub(crate) fn gallery_write_lock() -> &'static Mutex<()> {
+    static GALLERY_WRITE: OnceLock<Mutex<()>> = OnceLock::new();
+    GALLERY_WRITE.get_or_init(|| Mutex::new(()))
+}
+
+/// The output is already encoded; this publishes exactly once by timeline id.
+/// A crash after gallery commit and before timeline journal completion is
+/// recovered from the gallery rather than re-encoding and duplicating it.
+pub(crate) fn publish_timeline_export(
+    app: &AppHandle,
+    timeline: &crate::studio_video_timeline::VideoTimeline,
+    clips: &[GenerationEntry],
+    media: &[u8],
+) -> Result<GenerationEntry, String> {
+    let _guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
+    let model_id = format!("studio:timeline:{}", timeline.id);
+    let mut gallery: Vec<GenerationEntry> = read_state(app, GALLERY_FILE)?;
+    if let Some(existing) = gallery.iter().find(|entry| entry.model_id == model_id) {
+        return Ok(existing.clone());
+    }
+    let blob = artifacts(app)?.put(media).map_err(|error| error.to_string())?;
+    let first = clips.first().ok_or("Timeline has no published segments")?;
+    let duration_ms = timeline.segments.iter().zip(clips.iter()).map(|(segment, item)| {
+        segment.trim_end_ms.unwrap_or(item.duration_ms).saturating_sub(segment.trim_start_ms)
+    }).sum();
+    let entry = GenerationEntry {
+        entry_id: format!("studio-{}", Uuid::new_v4()),
+        artifact_id: blob.id,
+        video_job_id: None,
+        model_id,
+        task: generation::GenerationTask::TextToVideo,
+        prompt: format!("Timeline: {}", timeline.title),
+        negative_prompt: String::new(),
+        media_type: "video/mp4".to_string(),
+        size_bytes: blob.size,
+        width: first.width.clamp(64, 1920) / 2 * 2,
+        height: first.height.clamp(64, 1080) / 2 * 2,
+        steps: 0,
+        cfg_scale: 0.0,
+        seed: -1,
+        frame_count: (duration_ms.saturating_mul(24) / 1000).min(u64::from(u32::MAX)) as u32,
+        fps: 24,
+        duration_ms,
+        created_at_ms: now_ms(),
+    };
+    gallery.push(entry.clone());
+    gallery.sort_by_key(|item| item.created_at_ms);
+    write_state(app, GALLERY_FILE, &gallery)?;
+    Ok(entry)
+}
+
 fn artifacts(app: &AppHandle) -> Result<ArtifactStore, String> {
     let base = app
         .profile_data_dir()
@@ -1113,6 +1166,7 @@ async fn generation_run_impl(
         });
     }
 
+    let _gallery_guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
     gallery.extend(entries.iter().cloned());
     gallery.sort_by_key(|item| item.created_at_ms);
@@ -1319,6 +1373,7 @@ pub fn generation_gallery(app: AppHandle) -> Result<Vec<GenerationEntry>, String
 /// feature ever starts deleting as well.
 #[tauri::command]
 pub fn generation_delete_entry(app: AppHandle, entry_id: String) -> Result<(), String> {
+    let _gallery_guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
     let Some(at) = gallery.iter().position(|entry| entry.entry_id == entry_id) else {
         return Err("That generation is not in the gallery".to_string());
@@ -1563,6 +1618,7 @@ pub async fn studio_tool_run(
         });
     }
 
+    let _gallery_guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
     gallery.extend(entries.iter().cloned());
     gallery.sort_by_key(|item| item.created_at_ms);
