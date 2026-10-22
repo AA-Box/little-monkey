@@ -2224,6 +2224,50 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_continuity_rejects_model_restart_memory_and_configuration_drift() {
+        use crate::runtime_adapter::{ModelCapabilities, RuntimeModel, SettingValue};
+        let model = RuntimeModel {
+            model_id: "qwen".into(),
+            display_name: "qwen".into(),
+            size_bytes: 1_024,
+            local_path: Some(PathBuf::from("/tmp/fixture.gguf")),
+            digest: Some("sha256:sample".into()),
+            modified_at: None,
+            capabilities: ModelCapabilities {
+                chat: true,
+                embeddings: false,
+                tool_calling: false,
+                vision: false,
+            },
+            metadata: BTreeMap::new(),
+        };
+        let machine = stored("llama", "qwen", 1).machine;
+        let settings = Some(BTreeMap::<String, SettingValue>::new());
+        let check = |other: &RuntimeModel,
+                     pid: Option<i64>,
+                     hardware: &MachineIdentity,
+                     config: &Option<BTreeMap<String, SettingValue>>| {
+            ensure_benchmark_continuity(
+                &model, other, Some(17), pid,
+                &machine, hardware, &settings, config,
+            )
+        };
+        assert!(check(&model, Some(17), &machine, &settings).is_ok());
+        let changed_model = RuntimeModel { digest: Some("other".into()), ..model.clone() };
+        assert!(check(&changed_model, Some(17), &machine, &settings)
+            .unwrap_err().to_string().contains("model changed"));
+        assert!(check(&model, Some(18), &machine, &settings)
+            .unwrap_err().to_string().contains("restarted"));
+        let changed_machine = MachineIdentity { total_ram_bytes: 64 << 30, ..machine.clone() };
+        assert!(check(&model, Some(17), &changed_machine, &settings)
+            .unwrap_err().to_string().contains("hardware changed"));
+        let mut changed_settings = BTreeMap::new();
+        changed_settings.insert("context_size".into(), SettingValue::Integer { value: 2048 });
+        assert!(check(&model, Some(17), &machine, &Some(changed_settings))
+            .unwrap_err().to_string().contains("settings changed"));
+    }
+
+    #[test]
     fn evidence_round_trips_and_old_records_remain_unverified() {
         let original = stored("llama-local", "qwen3-4b", 1);
         let json = serde_json::to_value(&original).unwrap();
