@@ -212,6 +212,12 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "lifecycle commands for that same server",
     ),
     (
+        "studio_video_timeline.rs",
+        Class::HostUtility,
+        "fixed-argv FFmpeg with bounded app-owned scratch paths to compose user-selected
+         published Studio clips; timeline UI cannot author a shell command or executable",
+    ),
+    (
         "studio_video_jobs.rs",
         Class::HostUtility,
         "Studio uses FFmpeg with fixed, app-composed argv and private, generated paths

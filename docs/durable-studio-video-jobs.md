@@ -71,3 +71,59 @@ The Tauri setup hook launches the journal reconciler and dispatcher without a St
 A single dependent video job automatically selects its parent as the source. With multiple predecessors, the caller must choose sourceJobId. The worker verifies a published, content-addressed parent video blob in the gallery, decodes its actual final PNG frame using FFmpeg, and supplies the PNG to the child's image_to_video input. SourceArtifactId is recorded for provenance. The Studio Continue button creates the next clip using the selected parent, with a new-scene prompt. If FFmpeg is unavailable, the source format is unsupported, or the receiving model lacks image_to_video support, the job fails visibly rather than silently generating an unrelated clip.
 
 These are last-frame handoffs, not cross-model latent or audio-context continuity, and video clips are not stitched into a single longer file in this PR. Installed FFmpeg is an explicit runtime dependency for chaining. Real installed-model and actual desktop crash/restart acceptance remain necessary.
+
+
+## Timeline editor and real MP4 assembly
+
+The video tab now has an ordered timeline editor. Pick **2–16** Studio video
+jobs in the desired order (unfinished jobs can be selected); adjust start/end
+trims in milliseconds, add an optional local soundtrack, and submit an MP4
+export. The journal stores the exact clip order and trims, and the
+startup-independent dispatcher begins the export when every selected clip has
+published valid video bytes. A failed/cancelled source fails the export
+visibly. Export runs out-of-process via FFmpeg with a 30-minute limit,
+app-private scratch data, a bounded output, an explicit running/failed state,
+cancellation, and manual retry.
+
+FFmpeg normalizes mixed MP4/WebM sources to a common 24fps, aspect-preserving
+canvas, pads rather than crops, then concatenates them in order. Optional
+audio is a **user-picked** source track that loops to the end of the video.
+Without soundtrack the assembled video is silent. This does not retain native
+audio from source clips; it also does not carry any diffusion latent states
+between clips. The resulting \`studio:timeline:<id>\` MP4 is published into
+the normal Studio gallery. A crash between publication and marking the export
+complete is reconciled from the gallery, so retry cannot duplicate it.
+
+The timeline journal lives in the profile folder and is not sent to a hosted
+rendering service. Each input is resolved from a published
+\`videoJobId\` gallery entry rather than arbitrary file paths. The optional
+soundtrack is validated as a local regular audio file.
+
+## FreeVideo (user-owned ComfyUI integration)
+
+In Studio's media workflow area, select **FreeVideo (ComfyUI)** and import an
+API-format workflow JSON exported from *your own installed FreeVideo nodes*.
+Pick first frame, last frame, video reference and/or audio reference, provide
+a prompt and seed, then run the workflow through the existing ComfyUI executor.
+Each uploaded file is passed by the typed names
+\`input_image\`, \`last_frame_image\`, \`input_video\`, \`input_audio\`;
+your imported graph must place these placeholder values on its matching
+loader nodes. ComfyUI accepts video/audio files through the \`upload/image\`
+route as generic files in its input directory. The returned outputs go into
+the Studio gallery.
+
+FreeVideo's engine-dependent latent/motion conditioning runs **inside the
+actual FreeVideo/ComfyUI graph**, not by pretending FFmpeg last-frame chaining
+equals native latent transfer. Little Monkey does not automatically install
+or redistribute FreeVideo, and this adapter does not claim to resume a native
+FreeVideo sampler across a process crash. Running it requires the user's
+ComfyUI service, FreeVideo nodes, models and a compatible imported API graph.
+
+### Validation boundary
+
+Tests cover journal validation, ordered FFmpeg graph construction, actual
+MP4 creation with FFmpeg and decode, source ownership, and workflow reference
+binding. CI cannot prove visually coherent latent continuity between
+model-generated segments or exercise a user's installed FreeVideo graph.
+Real hardware / model checks and desktop crash/relaunch checks are still
+required to certify those behaviors.

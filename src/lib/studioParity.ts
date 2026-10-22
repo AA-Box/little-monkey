@@ -38,7 +38,7 @@ export interface PortableTrainingRequest {
   resolution: number;
 }
 export interface WorkflowUpload { name: string; dataBase64: string }
-export type WorkflowKind = "music" | "talking_character" | "motion_control" | "extend_video";
+export type WorkflowKind = "music" | "talking_character" | "motion_control" | "extend_video" | "freevideo";
 
 export const CURATED_STUDIO_PROFILES = [
   { id: "qwen-image", name: "Qwen Image 2.1", query: "Qwen Image 2.1 GGUF", source: "hugging_face" as const, kind: "model" as const, minRamBytes: 16 * 1024 ** 3, note: "Image generation/editing; prefer a GGUF or safetensors build with explicit license metadata." },
@@ -52,6 +52,11 @@ export const WORKFLOW_PRESETS: Record<WorkflowKind, { label: string; description
   talking_character: { label: "Talking Character", description: "Run a talking-character/lip-sync workflow with an uploaded portrait.", placeholders: ["input_image", "script", "prompt"] },
   motion_control: { label: "Motion Control", description: "Drive a video workflow from a reference image and motion prompt.", placeholders: ["input_image", "prompt", "negative_prompt"] },
   extend_video: { label: "Extend Video", description: "Upload an existing clip and run a continuation/extension workflow.", placeholders: ["input_video", "prompt", "negative_prompt"] },
+  freevideo: {
+    label: "FreeVideo (ComfyUI)",
+    description: "Import the API-format workflow from your own FreeVideo ComfyUI installation. Bind its first/last frame, video and audio inputs; its native nodes—not Little Monkey's image-to-video service—handle temporal latent/reference conditioning.",
+    placeholders: ["prompt", "negative_prompt", "seed", "input_image", "last_frame_image", "input_video", "input_audio"],
+  },
 };
 
 export const studioParityClient = {
@@ -63,7 +68,7 @@ export const studioParityClient = {
   startPortableCharacterTraining: (request: PortableTrainingRequest) => invoke<PortableTrainingStatus>("character_portable_training_start", { request }),
   portableCharacterStatus: () => invoke<PortableTrainingStatus>("character_training_status"),
   cancelPortableCharacterTraining: () => invoke<void>("character_training_cancel"),
-  runWorkflow: (request: { kind: WorkflowKind; baseUrl: string; workflow: unknown; values: Record<string, unknown>; inputImage?: WorkflowUpload | null; inputVideo?: WorkflowUpload | null }) => invoke<import("./studioClient").GenerationEntry[]>("studio_workflow_run", { request }),
+  runWorkflow: (request: { kind: WorkflowKind; baseUrl: string; workflow: unknown; values: Record<string, unknown>; inputImage?: WorkflowUpload | null; inputVideo?: WorkflowUpload | null; lastFrameImage?: WorkflowUpload | null; inputAudio?: WorkflowUpload | null }) => invoke<import("./studioClient").GenerationEntry[]>("studio_workflow_run", { request }),
 };
 
 export function inferComponentSlot(item: DiscoveryItem): ComponentSlot {

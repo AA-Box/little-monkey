@@ -717,6 +717,8 @@ pub struct StudioWorkflowRequest {
     pub values: BTreeMap<String, Value>,
     pub input_image: Option<WorkflowUpload>,
     pub input_video: Option<WorkflowUpload>,
+    pub last_frame_image: Option<WorkflowUpload>,
+    pub input_audio: Option<WorkflowUpload>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -915,7 +917,7 @@ pub async fn studio_workflow_run(
 ) -> Result<Vec<GenerationEntry>, String> {
     if !matches!(
         request.kind.as_str(),
-        "music" | "talking_character" | "motion_control" | "extend_video"
+        "music" | "talking_character" | "motion_control" | "extend_video" | "freevideo"
     ) {
         return Err("Unknown Studio workflow preset".into());
     }
@@ -940,6 +942,13 @@ pub async fn studio_workflow_run(
             "input_video".into(),
             Value::String(upload_comfy(&client, &base, video).await?),
         );
+    }
+
+    if let Some(last) = &request.last_frame_image {
+        values.insert("last_frame_image".into(), Value::String(upload_comfy(&client, &base, last).await?));
+    }
+    if let Some(audio) = &request.input_audio {
+        values.insert("input_audio".into(), Value::String(upload_comfy(&client, &base, audio).await?));
     }
     let mut workflow = request.workflow.clone();
     replace_workflow(&mut workflow, &values);
@@ -985,7 +994,7 @@ pub async fn studio_workflow_run(
     }
     let (_, store) = gallery_paths(&app)?;
     let task = match request.kind.as_str() {
-        "talking_character" | "motion_control" | "extend_video" => GenerationTask::ImageToVideo,
+        "talking_character" | "motion_control" | "extend_video" | "freevideo" => GenerationTask::ImageToVideo,
         _ => GenerationTask::TextToVideo,
     };
     let prompt = values
@@ -1057,6 +1066,25 @@ mod tests {
         replace_workflow(&mut value, &values);
         assert_eq!(value["a"], 12);
         assert_eq!(value["b"], "prefix hello");
+    }
+    #[test]
+    fn freevideo_references_are_bound_as_typed_workflow_values() {
+        let mut workflow = json!({"first":"{{input_image}}","last":"{{last_frame_image}}",
+                                  "video":"{{input_video}}","audio":"{{input_audio}}",
+                                  "seed":"{{seed}}"});
+        let vars = BTreeMap::from([
+            ("input_image".into(), json!("first.png")),
+            ("last_frame_image".into(), json!("last.png")),
+            ("input_video".into(), json!("reference.mp4")),
+            ("input_audio".into(), json!("audio.wav")),
+            ("seed".into(), json!(42)),
+        ]);
+        replace_workflow(&mut workflow, &vars);
+        assert_eq!(workflow["first"], "first.png");
+        assert_eq!(workflow["last"], "last.png");
+        assert_eq!(workflow["video"], "reference.mp4");
+        assert_eq!(workflow["audio"], "audio.wav");
+        assert_eq!(workflow["seed"], 42);
     }
     #[test]
     fn sha_requires_exact_hex() {
