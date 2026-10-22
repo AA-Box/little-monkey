@@ -168,9 +168,14 @@ export function comparableBenchmarkRuns(a: BenchmarkHistoryEntry, b: BenchmarkHi
 
 export function benchmarkDecodeChange(current: BenchmarkHistoryEntry, previous: BenchmarkHistoryEntry): number | null {
   if (!comparableBenchmarkRuns(current, previous)) return null;
-  const a = current.report.decodeTokensPerSecond?.median;
-  const b = previous.report.decodeTokensPerSecond?.median;
-  if (a === undefined || b === undefined || !Number.isFinite(a) || !Number.isFinite(b) || b <= 0) return null;
+  const currentSpread = current.report.decodeTokensPerSecond;
+  const previousSpread = previous.report.decodeTokensPerSecond;
+  // One counted sample has no repeatability estimate. Keep the raw measured
+  // value visible, but refuse to turn it into a headline percentage.
+  if (!currentSpread || !previousSpread || currentSpread.n < 2 || previousSpread.n < 2) return null;
+  const a = currentSpread.median;
+  const b = previousSpread.median;
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b <= 0) return null;
   return ((a - b) / b) * 100;
 }
 
@@ -281,7 +286,7 @@ function SavedMeasurements({ entries }: { entries: BenchmarkHistoryEntry[] }) {
                         {" "}Workload: {entry.evidence.workloadSha256.slice(0, 12)}…
                         {decodeChange !== null && (
                           <span className="block mt-1 font-mono text-foreground">
-                            Decode median vs. previous matching run: {decodeChange > 0 ? "+" : ""}
+                            Indicative decode change vs. matching run: {decodeChange > 0 ? "+" : ""}
                             {decodeChange.toFixed(1)}%
                           </span>
                         )}
