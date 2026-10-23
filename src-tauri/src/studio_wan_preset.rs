@@ -15,6 +15,21 @@ pub const WAN22_NATIVE_ID: &str = "wan22-ti2v-5b-native";
 const WAN_REPO: &str = "Comfy-Org/Wan_2.2_ComfyUI_Repackaged";
 const UMT5_REPO: &str = "city96/umt5-xxl-encoder-gguf";
 
+/// Hashes from the public Hugging Face Xet blob metadata. Checking these
+/// against actual downloaded bytes detects truncation and supply-chain
+/// replacement before publishing a weight to the resident model directory.
+pub fn expected_sha256(repo: &str, file: &str) -> Option<&'static str> {
+    match (repo, file) {
+        (WAN_REPO, "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors") =>
+            Some("456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e"),
+        (WAN_REPO, "split_files/vae/wan2.2_vae.safetensors") =>
+            Some("e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"),
+        (UMT5_REPO, "umt5-xxl-encoder-Q8_0.gguf") =>
+            Some("2521d4de0bf9e1cc6549866463ceae85e4ec3239bc6063f7488810be39033bbc"),
+        _ => None,
+    }
+}
+
 pub fn native_wan22_ti2v_5b() -> GenerationModelSpec {
     GenerationModelSpec {
         id: WAN22_NATIVE_ID.into(),
