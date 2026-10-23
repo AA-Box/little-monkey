@@ -226,11 +226,14 @@ pub async fn generation_vdn_run(
         break event;
     };
     let result = match outcome {
-        Outcome::Completed(status) if status.success() => {
+        Outcome::Completed(status) if status.success() => (|| -> Result<
+            crate::generation_commands::GenerationEntry, String
+        > {
             // Recheck immediately before publication; region and entitlement
             // may have changed during a long-running GPU operation.
             crate::generation_commands::ensure_vdn_usage(&app)?;
-            let info = std::fs::metadata(&output).map_err(|_| "OpenVDN did not produce an MP4")?;
+            let info = std::fs::metadata(&output)
+                .map_err(|_| "OpenVDN did not produce an MP4".to_string())?;
             if info.len() < 32 || info.len() > MAX_VIDEO_BYTES {
                 Err("OpenVDN output must be a nonempty MP4 smaller than 256 MB".into())
             } else {
@@ -244,7 +247,7 @@ pub async fn generation_vdn_run(
                     )
                 }
             }
-        },
+        })(),
         Outcome::Completed(_status) => Err(format!(
             "VDN worker failed: {}", brief_error(&stderr_path)
         )),
