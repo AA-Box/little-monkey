@@ -83,6 +83,31 @@ and profile model status refresh, even when the weight files were imported
 manually. A changed region or expired receipt closes the gate immediately.
 Users can revoke the receipt from the same control.
 
+### Distributor offline issuance
+
+After checking the rights-holder's actual, signed written authorization and
+confirming the application's distribution and end-user scope, generate a
+dedicated Ed25519 private key in a secure HSM/keystore or an access-controlled
+offline location. **Never commit that key.** The distributor's offline CLI
+can create the receipt:
+
+```bash
+node scripts/issue-minimax-entitlement.mjs \
+  --private-key /secure/issuer-ed25519.pem \
+  --license-reference "written-MiniMax-authorization-reference" \
+  --holder-id "authorized-customer-id" --regions eu \
+  --expires 2027-01-01T00:00:00Z \
+  --written-minimax-authorization-reviewed
+```
+
+The printed `issuerPublicKeyBase64` is embedded as
+`LITTLE_MONKEY_MINIMAX_GRANT_ED25519_PUBKEY_B64` at build time, **not**
+supplied by the recipient or loaded from a user-editable config. The
+`receipt` JSON is given to the licensed customer. The tool performs no
+online MiniMax license lookup and cannot decide whether written
+authorization is authentic; that verification remains a real prerequisite
+for trusted human/enterprise distribution.
+
 **Standard releases have no trusted entitlement issuer key**, and imported
 receipts are rejected. This is intentional. A user's own self-signed JSON,
 checkbox or unverifiable PDF does not create MiniMax licensing rights. Issuing a
