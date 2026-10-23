@@ -885,7 +885,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
 
   const download = async (model: GenerationModel) => {
     setError(null);
-    if (model.licenseEligible === false || (model.license.acceptanceRequired && !model.licenseAccepted)) {
+    if (model.licenseEligible === false || (model.licenseEligible === undefined && model.license.acceptanceRequired && !model.licenseAccepted)) {
       setError(model.licenseBlockReason ?? "Accept this model's license before downloading.");
       return;
     }
@@ -1336,7 +1336,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
         <div className="grid gap-2">
           {visible.map((model) => {
             const blockedByLicense =
-              model.licenseEligible === false || (model.license.acceptanceRequired && !model.licenseAccepted);
+              model.licenseEligible === false || (model.licenseEligible === undefined && model.license.acceptanceRequired && !model.licenseAccepted);
             const canAcceptLicense = model.license.acceptanceRequired && !model.licenseAccepted
               && (!model.licenseBlockReason || model.licenseBlockReason.startsWith("Accept the "));
             return (
