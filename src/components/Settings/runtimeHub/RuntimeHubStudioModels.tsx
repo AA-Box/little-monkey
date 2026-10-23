@@ -25,7 +25,7 @@ function StudioModelCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const blockedByLicense = model.licenseEligible === false || (model.licenseEligible === undefined && model.license.acceptanceRequired && !model.licenseAccepted);
-  const canAccept = model.license.acceptanceRequired && !model.licenseAccepted
+  const canAccept = model.licenseEligible !== true && model.license.acceptanceRequired && !model.licenseAccepted
     && (!model.licenseBlockReason || model.licenseBlockReason.startsWith("Accept the "));
 
   async function acceptLicense() {
