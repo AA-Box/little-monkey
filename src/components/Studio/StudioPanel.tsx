@@ -32,6 +32,7 @@ import { Button, IconButton, Listbox, StatusPill } from "../ui";
 import { AddBackendForm } from "./AddBackendForm";
 import { AddModelForm } from "./AddModelForm";
 import { StudioLicenseRegionControl } from "./StudioLicenseRegionControl";
+import { StudioVdnPanel } from "./StudioVdnPanel";
 import { LoraStack } from "./LoraStack";
 import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
@@ -1265,6 +1266,10 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
         <h1 className="text-sm font-medium">{t(`Studio.${mode}.title`)}</h1>
         <p className="mt-1 text-xs text-muted">{t(`Studio.${mode}.subtitle`)}</p>
       </header>
+
+      {mode === "video" && (
+        <StudioVdnPanel onCompleted={refresh} onOpenModels={onOpenModels} />
+      )}
 
       {(error ?? runError) && (
         <p className="mb-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
