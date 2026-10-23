@@ -146,7 +146,7 @@ mod tests {
             "source":{"kind":"components"},
             "defaults":{"width":512,"height":512,"steps":8,"cfgScale":4.0,
                 "sampleMethod":"euler","flowShift":null,"fps":16,"videoFrames":17,
-                "frameGrid":"down_to_4n_plus1"},
+                "frameGrid":"down_to4n_plus1"},
             "minRamBytes":1024,
             "license":{"id":"","name":"","url":"","excludedTerritories":[],
                 "acceptanceRequired":false},
