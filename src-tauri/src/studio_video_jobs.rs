@@ -57,6 +57,9 @@ struct VideoJob {
     depends_on: Vec<String>,
     #[serde(default)]
     source_job_id: Option<String>,
+    /// Published Studio clip/timeline: use its last frame with the local I2V engine.
+    #[serde(default)]
+    source_gallery_entry_id: Option<String>,
     #[serde(default)]
     source_artifact_id: Option<String>,
     request: GenerationRequest,
@@ -75,6 +78,7 @@ pub struct VideoJobView {
     pub(crate) id: String,
     pub(crate) depends_on: Vec<String>,
     pub(crate) source_job_id: Option<String>,
+    pub(crate) source_gallery_entry_id: Option<String>,
     pub(crate) source_artifact_id: Option<String>,
     pub(crate) model_id: String,
     pub(crate) prompt: String,
@@ -94,6 +98,7 @@ impl From<&VideoJob> for VideoJobView {
             id: job.id.clone(),
             depends_on: job.depends_on.clone(),
             source_job_id: job.source_job_id.clone(),
+            source_gallery_entry_id: job.source_gallery_entry_id.clone(),
             source_artifact_id: job.source_artifact_id.clone(),
             model_id: job.request.model_id.clone(),
             prompt: job.request.prompt.chars().take(240).collect(),
@@ -320,6 +325,18 @@ fn parent_artifact(parent: &VideoJob, entries: &[GenerationEntry]) -> Result<Gen
     Ok(entry.clone())
 }
 
+/// A gallery ID is resolved against published media in the current profile.
+/// Never accept an arbitrary caller-controlled path or artifact hash.
+fn gallery_source_artifact(app: &AppHandle, entry_id: &str) -> Result<GenerationEntry, String> {
+    let gallery = generation_commands::generation_gallery(app.clone())?;
+    let entry = gallery.into_iter().find(|entry| entry.entry_id == entry_id)
+        .ok_or("Source gallery clip no longer exists in this profile")?;
+    if !matches!(entry.media_type.as_str(), "video/mp4" | "video/webm") {
+        return Err("Source gallery entry must be an MP4 or WebM video".into());
+    }
+    Ok(entry)
+}
+
 /// FFmpeg's image2 -update 1 overwrites one PNG for every decoded input frame.
 /// The final PNG is therefore the decoded last frame rather than a thumbnail.
 pub(crate) async fn extract_final_frame(app: &AppHandle, media: &[u8], mime: &str) -> Result<String, String> {
@@ -392,20 +409,25 @@ async fn extract_final_frame_in(root: &Path, media: &[u8], mime: &str) -> Result
 /// Resolve a real video blob from the verified artifact store and bind its
 /// decoded last frame to the child's image-to-video request.
 async fn prepared_request(app: &AppHandle, job: &VideoJob) -> Result<GenerationRequest, String> {
-    let Some(source_id) = &job.source_job_id else {
+    if job.source_job_id.is_none() && job.source_gallery_entry_id.is_none() {
         return Ok(job.request.clone());
-    };
-    let entry = {
+    }
+    let entry = if let Some(source_id) = &job.source_job_id {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
         let dir = directory(app)?;
         let parent = read_file(&path_for(&dir, source_id)?)?;
         let gallery = generation_commands::generation_gallery(app.clone())?;
         parent_artifact(&parent, &gallery)?
+    } else if let Some(entry_id) = &job.source_gallery_entry_id {
+        gallery_source_artifact(app, entry_id)?
+    } else {
+        return Err("No video source selected".into());
     };
     let base = app.profile_data_dir().map_err(|error| error.to_string())?;
     let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
         base.join("content-v1"), MAX_HANDOFF_VIDEO_BYTES as u64
     ).map_err(|error| error.to_string())?;
+    // Integrity check happens in the content store before FFmpeg decodes.
     let bytes = store.read(&entry.artifact_id).map_err(|error| error.to_string())?;
     let png = extract_final_frame(app, &bytes, &entry.media_type).await?;
     transition(app, &job.id, |record| {
@@ -478,7 +500,7 @@ async fn execute(app: &AppHandle, id: &str) -> Result<(), String> {
             return Err("Video job is no longer queued".to_string());
         }
         job.status = VideoJobStatus::Running;
-        job.stage = if job.source_job_id.is_some() { VideoJobStage::PreparingInput } else { VideoJobStage::Rendering };
+        job.stage = if job.source_job_id.is_some() || job.source_gallery_entry_id.is_some() { VideoJobStage::PreparingInput } else { VideoJobStage::Rendering };
         job.attempts += 1;
         job.error = None;
         Ok(())
@@ -531,6 +553,7 @@ pub fn generation_video_submit(
     idempotency_key: String,
     depends_on: Vec<String>,
     source_job_id: Option<String>,
+    source_gallery_entry_id: Option<String>,
 ) -> Result<VideoJobView, String> {
     if !request.task.is_video() {
         return Err("Durable Studio jobs accept only video tasks".to_string());
@@ -546,6 +569,16 @@ pub fn generation_video_submit(
     if source.is_some() && request.init_image_base64.is_some() {
         return Err("A chained video cannot also supply another starting frame".into());
     }
+    if let Some(entry_id) = source_gallery_entry_id.as_deref() {
+        if source.is_some() || !depends_on.is_empty() || request.init_image_base64.is_some() {
+            return Err("A gallery continuation cannot mix job dependencies or another starting frame".into());
+        }
+        if request.task != GenerationTask::ImageToVideo {
+            return Err("Gallery continuation requires an image-to-video model".into());
+        }
+        // Validate the publication and MIME before committing a durable job.
+        gallery_source_artifact(&app, entry_id)?;
+    }
     let result = {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
         let dir = directory(&app)?;
@@ -553,7 +586,8 @@ pub fn generation_video_submit(
         reconcile(&app, &dir, &mut jobs)?;
         if let Some(old) = jobs.iter().find(|job| job.idempotency_key == idempotency_key) {
             if !same_effective_request(&old.request, &request)
-                || old.depends_on != depends_on || old.source_job_id != source {
+                || old.depends_on != depends_on || old.source_job_id != source
+                || old.source_gallery_entry_id != source_gallery_entry_id {
                 return Err("Video idempotency key already belongs to a different request".to_string());
             }
             VideoJobView::from(old)
@@ -572,6 +606,7 @@ pub fn generation_video_submit(
                 idempotency_key,
                 depends_on,
                 source_job_id: source,
+                source_gallery_entry_id: source_gallery_entry_id,
                 source_artifact_id: None,
                 request: pin_seed(request),
                 status: VideoJobStatus::Queued,
@@ -610,7 +645,7 @@ pub fn generation_video_continue(
     request.task = GenerationTask::ImageToVideo;
     request.init_image_base64 = None;
     request.mask_image_base64 = None;
-    generation_video_submit(app, request, idempotency_key, vec![parent_job_id.clone()], Some(parent_job_id))
+    generation_video_submit(app, request, idempotency_key, vec![parent_job_id.clone()], Some(parent_job_id), None)
 }
 
 #[tauri::command]
@@ -675,7 +710,7 @@ mod tests {
     fn example(id: &str, status: VideoJobStatus, depends_on: Vec<String>) -> VideoJob {
         VideoJob {
             id: id.into(), idempotency_key: id.into(), depends_on,
-            source_job_id: None, source_artifact_id: None,
+            source_job_id: None, source_gallery_entry_id: None, source_artifact_id: None,
             request: serde_json::from_value(serde_json::json!({
                 "modelId":"model", "task":"text_to_video","prompt":"test",
                 "width":512,"height":512,"steps":10,"cfgScale":4,"seed":1
@@ -751,6 +786,17 @@ mod tests {
         assert!(continuation_source(&["a".into(), "b".into()], None).is_err());
         assert_eq!(continuation_source(&["a".into(), "b".into()], Some("b")).unwrap(), Some("b".into()));
         assert!(continuation_source(&["a".into()], Some("other")).is_err());
+    }
+
+    #[test]
+    fn gallery_source_is_backward_compatible_with_existing_video_journals() {
+        let mut value = serde_json::to_value(example("job", VideoJobStatus::Queued, vec![])).unwrap();
+        value.as_object_mut().unwrap().remove("sourceGalleryEntryId");
+        let restored: VideoJob = serde_json::from_value(value).unwrap();
+        assert!(restored.source_gallery_entry_id.is_none());
+        let mut sourced = restored;
+        sourced.source_gallery_entry_id = Some("gallery-clip".into());
+        assert_eq!(serde_json::to_value(&sourced).unwrap()["sourceGalleryEntryId"], "gallery-clip");
     }
 
     #[test]
