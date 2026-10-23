@@ -996,7 +996,7 @@ pub async fn studio_workflow_run(
 ) -> Result<Vec<GenerationEntry>, String> {
     if !matches!(
         request.kind.as_str(),
-        "music" | "talking_character" | "motion_control" | "extend_video" | "freevideo"
+        "music" | "talking_character" | "motion_control" | "extend_video"
     ) {
         return Err("Unknown Studio workflow preset".into());
     }
@@ -1024,9 +1024,9 @@ pub async fn studio_workflow_run(
     let mut values = request.values.clone();
 
     // The *last frame of the previous clip* is the *first frame of
-    // the next clip*. Do not feed it to "last_frame_image": FreeVideo
-    // interprets that as the target END frame of the next generation.
-    // Operators can supply an independent end frame explicitly.
+    // the next clip*. Do not feed it to "last_frame_image", which is
+    // the *target* end frame in compatible external workflows. Operators
+    // may supply that target end frame independently.
     if let Some(entry_id) = &request.gallery_video_entry_id {
         let (upload, bytes, mime) = gallery_upload(&app, entry_id, &["video/mp4", "video/webm"])?;
         let needs_start = workflow_uses_binding(&request.workflow, "input_image")
@@ -1121,7 +1121,7 @@ pub async fn studio_workflow_run(
     }
     let (_, store) = gallery_paths(&app)?;
     let task = match request.kind.as_str() {
-        "talking_character" | "motion_control" | "extend_video" | "freevideo" => GenerationTask::ImageToVideo,
+        "talking_character" | "motion_control" | "extend_video" => GenerationTask::ImageToVideo,
         _ => GenerationTask::TextToVideo,
     };
     let prompt = values
@@ -1195,7 +1195,7 @@ mod tests {
         assert_eq!(value["b"], "prefix hello");
     }
     #[test]
-    fn freevideo_references_are_bound_as_typed_workflow_values() {
+    fn generic_workflow_references_are_bound_as_typed_values() {
         let mut workflow = json!({"first":"{{input_image}}","last":"{{last_frame_image}}",
                                   "video":"{{input_video}}","audio":"{{input_audio}}",
                                   "seed":"{{seed}}"});
