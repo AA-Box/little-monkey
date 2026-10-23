@@ -740,7 +740,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
         mode === "models" || model.tasks.some((entry) => tasksFor(mode).includes(entry)),
       );
       setSelectedId((current) => {
-        if (current && usable.some((model) => model.id === current)) return current;
+        if (current && usable.some((model) => model.id === current && model.licenseEligible !== false)) return current;
         // Never auto-select a restricted, ineligible local model if an
         // eligible alternative exists. Prefer an already-installed Wan 2.2
         // video model as the worldwide default when the user has one.
