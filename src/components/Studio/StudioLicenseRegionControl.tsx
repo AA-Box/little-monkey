@@ -19,6 +19,8 @@ export function StudioLicenseRegionControl({ onChanged }: { onChanged?: () => vo
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<Region | null>(null);
+  const [grantJson, setGrantJson] = useState("");
+  const [grantResult, setGrantResult] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -40,6 +42,37 @@ export function StudioLicenseRegionControl({ onChanged }: { onChanged?: () => vo
       await studioClient.setLicenseRegion(region);
       setSaved(region);
       setAcknowledged(false);
+      onChanged?.();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importGrant() {
+    if (!grantJson.trim()) return;
+    setBusy(true);
+    setGrantResult(null);
+    setError(null);
+    try {
+      await studioClient.importMinimaxEntitlement(grantJson.trim());
+      setGrantJson("");
+      setGrantResult("Signed entitlement verified for the declared territory.");
+      onChanged?.();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearGrant() {
+    setBusy(true);
+    setError(null);
+    try {
+      await studioClient.clearMinimaxEntitlement();
+      setGrantResult("Saved entitlement revoked for this profile.");
       onChanged?.();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -93,6 +126,35 @@ export function StudioLicenseRegionControl({ onChanged }: { onChanged?: () => vo
           Read original license
         </a>.
       </p>
+      <details className="rounded border border-border p-2">
+        <summary className="cursor-pointer font-medium text-foreground">
+          Verified enterprise MiniMax H3 license
+        </summary>
+        <p className="mt-2 text-muted">
+          Only for organizations holding separate written MiniMax permission.
+          The distributor must independently review that permission and issue
+          an Ed25519-signed entitlement for this installation. Standard builds
+          have no trusted issuer and cannot unlock excluded territories.
+        </p>
+        <textarea rows={3} aria-label="Signed MiniMax entitlement JSON"
+          className="mt-2 w-full rounded border border-border bg-surface px-2 py-1 font-mono text-xs text-foreground"
+          placeholder='{"payloadBase64":"…","signatureBase64":"…"}'
+          value={grantJson} onChange={(event) => setGrantJson(event.target.value)}
+          disabled={busy} />
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button type="button" disabled={busy || !saved || !grantJson.trim()}
+            className="rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
+            onClick={() => void importGrant()}>
+            Verify & import signed entitlement
+          </button>
+          <button type="button" disabled={busy}
+            className="rounded border border-border px-2 py-1 text-foreground disabled:opacity-50"
+            onClick={() => void clearGrant()}>
+            Revoke imported entitlement
+          </button>
+        </div>
+        {grantResult && <p role="status" className="mt-2 text-muted">{grantResult}</p>}
+      </details>
       {error && <p role="alert" className="text-danger">{error}</p>}
     </div>
   );
