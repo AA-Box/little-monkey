@@ -577,6 +577,10 @@ export const studioClient = {
     invoke<"eu" | "uk" | "us" | "kr" | "other" | null>("generation_license_region"),
   setLicenseRegion: (region: "eu" | "uk" | "us" | "kr" | "other") =>
     invoke<void>("generation_set_license_region", { region, acknowledged: true }),
+  importMinimaxEntitlement: (grantJson: string) =>
+    invoke<void>("generation_import_minimax_entitlement", { grantJson }),
+  clearMinimaxEntitlement: () =>
+    invoke<void>("generation_clear_minimax_entitlement"),
   setHuggingFaceToken: (modelId: string, token: string) =>
     invoke<void>("generation_set_hugging_face_token", { modelId, token }),
   downloadModel: (modelId: string) =>
