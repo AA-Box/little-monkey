@@ -37,6 +37,7 @@ const GALLERY_FILE: &str = "studio-gallery.json";
 const MODELS_FILE: &str = "studio-models.json";
 const ACCEPTED_LICENSES_FILE: &str = "studio-accepted-licenses.json";
 const LICENSE_REGION_FILE: &str = "studio-license-region.json";
+const MINIMAX_ENTITLEMENT_FILE: &str = "studio-minimax-entitlement.json";
 static HUGGING_FACE_TOKEN_SERVICE: OnceLock<String> = OnceLock::new();
 
 fn hugging_face_token_service() -> &'static str {
@@ -495,13 +496,57 @@ fn license_region(app: &AppHandle) -> Result<Option<crate::studio_model_policy::
     read_state(app, LICENSE_REGION_FILE)
 }
 
+fn license_block_reason(
+    app: &AppHandle,
+    spec: &GenerationModelSpec,
+    region: Option<crate::studio_model_policy::LicenseRegion>,
+    accepted: &BTreeSet<String>,
+) -> Result<Option<String>, String> {
+    if crate::studio_model_policy::is_minimax_h3(spec) {
+        if let Some(region) = region {
+            let grant: Option<crate::studio_minimax_entitlement::SignedGrant> =
+                read_state(app, MINIMAX_ENTITLEMENT_FILE)?;
+            if let Some(grant) = grant {
+                // Verify the rights-holder authorization reference and the
+                // distributor signature on EVERY use, including expiration,
+                // region edits, manual weight imports and restart recovery.
+                if crate::studio_minimax_entitlement::validate_for_region(&grant, region).is_ok() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    Ok(crate::studio_model_policy::block_reason(spec, region, accepted))
+}
+
 fn ensure_model_license(app: &AppHandle, spec: &GenerationModelSpec) -> Result<(), String> {
     let accepted: BTreeSet<String> = read_state(app, ACCEPTED_LICENSES_FILE)?;
     let region = license_region(app)?;
-    if let Some(reason) = crate::studio_model_policy::block_reason(spec, region, &accepted) {
+    if let Some(reason) = license_block_reason(app, spec, region, &accepted)? {
         return Err(reason);
     }
     Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_import_minimax_entitlement(
+    app: AppHandle,
+    grant_json: String,
+) -> Result<(), String> {
+    if grant_json.len() > 16 * 1024 {
+        return Err("The license receipt is too large".into());
+    }
+    let grant: crate::studio_minimax_entitlement::SignedGrant =
+        serde_json::from_str(&grant_json).map_err(|_| "Malformed signed license receipt")?;
+    let region = license_region(&app)?
+        .ok_or("Declare the intended territory of use before importing an entitlement")?;
+    crate::studio_minimax_entitlement::validate_for_region(&grant, region)?;
+    write_state(&app, MINIMAX_ENTITLEMENT_FILE, &Some(grant))
+}
+
+#[tauri::command]
+pub fn generation_clear_minimax_entitlement(app: AppHandle) -> Result<(), String> {
+    write_state(&app, MINIMAX_ENTITLEMENT_FILE, &Option::<crate::studio_minimax_entitlement::SignedGrant>::None)
 }
 
 #[tauri::command]
@@ -584,8 +629,10 @@ pub fn generation_models(app: AppHandle) -> Result<Vec<GenerationModelView>, Str
                 total_bytes: spec.size_on_disk(&root),
                 missing_bytes,
                 license_accepted: crate::studio_model_policy::acceptance_recorded(&spec, &accepted),
-                license_eligible: crate::studio_model_policy::block_reason(&spec, region, &accepted).is_none(),
-                license_block_reason: crate::studio_model_policy::block_reason(&spec, region, &accepted),
+                license_eligible: license_block_reason(&app, &spec, region, &accepted)
+                    .map(|reason| reason.is_none()).unwrap_or(false),
+                license_block_reason: license_block_reason(&app, &spec, region, &accepted)
+                    .unwrap_or_else(|error| Some(error)),
                 // A zero reading means the probe failed, not that the machine
                 // has no memory — do not block the model on a failed probe.
                 fits_in_memory: ram == 0 || ram >= spec.min_ram_bytes,
