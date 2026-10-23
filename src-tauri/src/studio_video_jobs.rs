@@ -559,6 +559,31 @@ async fn execute(app: &AppHandle, id: &str) -> Result<(), String> {
     result.map(|_| ())
 }
 
+/// Durable video work is always assigned to a locally installed model.
+/// A remote model ID must never be accepted as an accidental fallback to an
+/// external service. Check this in Rust, not only in the frontend picker.
+fn validate_local_video_model(app: &AppHandle, request: &GenerationRequest) -> Result<(), String> {
+    if crate::generation::parse_remote_model_id(&request.model_id).is_some() {
+        return Err("Durable native video jobs cannot invoke a remote video backend".into());
+    }
+    let models = generation_commands::generation_models(app.clone())?;
+    let model = models.iter().find(|model| model.spec.id == request.model_id)
+        .ok_or("Selected native video model does not exist")?;
+    if !model.spec.supports(request.task) {
+        return Err("Selected local model does not support this video task".into());
+    }
+    if !model.installed {
+        return Err("Selected native video model must be installed before submitting work".into());
+    }
+    if !model.license_accepted {
+        return Err("The selected video model's license must be accepted before use".into());
+    }
+    if !model.fits_in_memory {
+        return Err("Selected video model requires more RAM than is available on this machine".into());
+    }
+    Ok(())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub fn generation_video_submit(
     app: AppHandle,
@@ -571,6 +596,7 @@ pub fn generation_video_submit(
     if !request.task.is_video() {
         return Err("Durable Studio jobs accept only video tasks".to_string());
     }
+    validate_local_video_model(&app, &request)?;
     if idempotency_key.is_empty() || idempotency_key.len() > 128
         || !idempotency_key.bytes().all(|ch| ch.is_ascii_alphanumeric() || b"_-.:".contains(&ch)) {
         return Err("Video idempotency key must be 1–128 safe ASCII characters".to_string());
