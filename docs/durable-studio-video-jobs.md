@@ -42,8 +42,9 @@ adopted across desktop process crashes. Fixed seeds make retry reproducible
 subject to backend deterministic behavior; randomness, model/runtime changes,
 and nondeterministic kernels can still change output.
 
-Dependencies are *ordering* edges between video jobs, not automatically
-wired media inputs. Image-to-video uses its own saved starting image.
+Dependencies gate execution, and a selected completed source job also
+provides its published video as the next run's initial frame. With no selected
+video source, image-to-video uses the saved starting image.
 
 ## Acceptance
 
@@ -99,43 +100,35 @@ rendering service. Each input is resolved from a published
 \`videoJobId\` gallery entry rather than arbitrary file paths. The optional
 soundtrack is validated as a local regular audio file.
 
-## FreeVideo (user-owned ComfyUI integration)
+## Native continuation from any published Studio video
 
-In Studio's media workflow area, select **FreeVideo (ComfyUI)** and import an
-API-format workflow JSON exported from *your own installed FreeVideo nodes*.
-Pick first frame, last frame, video reference and/or audio reference, provide
-a prompt and seed, then run the workflow through the existing ComfyUI executor.
-Each uploaded file is passed by the typed names
-\`input_image\`, \`last_frame_image\`, \`input_video\`, \`input_audio\`;
-your imported graph must place these placeholder values on its matching
-loader nodes. ComfyUI accepts video/audio files through the \`upload/image\`
-route as generic files in its input directory. The returned outputs go into
-the Studio gallery.
+The Video jobs panel can continue any published MP4/WebM clip, including
+assembled timeline exports, using an installed image-to-video model.
+There is no requirement for a previous native job or external workflow.
 
-FreeVideo's engine-dependent latent/motion conditioning runs **inside the
-actual FreeVideo/ComfyUI graph**, not by pretending FFmpeg last-frame chaining
-equals native latent transfer. Little Monkey does not automatically install
-or redistribute FreeVideo, and this adapter does not claim to resume a native
-FreeVideo sampler across a process crash. Running it requires the user's
-ComfyUI service, FreeVideo nodes, models and a compatible imported API graph.
+The frontend sends only a gallery entry ID, model configuration and prompt.
+The backend resolves the published entry in the current profile, checks its
+media type, reads the content-addressed artifact with integrity validation,
+decodes the actual final PNG via FFmpeg, and passes it as the initial image
+to a native image-to-video render. The gallery source ID and resolved
+artifact hash are saved in the durable job journal, including on retry.
 
-### Validation boundary
+A gallery-sourced run cannot mix dependency edges, source job IDs or a second
+starting frame. The source clip must remain published until media preparation.
+FFmpeg and model weights are runtime prerequisites.
 
-Tests cover journal validation, ordered FFmpeg graph construction, actual
-MP4 creation with FFmpeg and decode, source ownership, and workflow reference
-binding. CI cannot prove visually coherent latent continuity between
-model-generated segments or exercise a user's installed FreeVideo graph.
-Real hardware / model checks and desktop crash/relaunch checks are still
-required to certify those behaviors.
+**Limit:** This is final-frame conditioning, not diffusion latent-state
+transfer, learned temporal reference conditioning, or reference-audio
+conditioning. Optional generic ComfyUI workflows are separate; the native
+path never invokes them. Little Monkey does not ship or require FreeVideo.
 
+### Acceptance
 
-## Gallery-native FreeVideo inputs
-
-The Creator Hub's **FreeVideo (ComfyUI)** and **Extend Video** modes can now use a published Studio clip or exported timeline directly. The video input is resolved by `galleryVideoEntryId` in the backend and loaded from the content-addressed artifact store; the UI sends only the opaque gallery entry ID, never a 256 MiB base64 video. For a video source, the backend uploads the real MP4/WebM to ComfyUI as `input_video`. If the graph requests `input_image` and no explicit start image is selected, it decodes the **last frame of the previous clip** and uploads that PNG as the **first frame of the next clip** (`input_image`). This prevents the subtle error of treating the previous clip's ending frame as the *target ending frame* for the next clip. `last_frame_image` remains a separate optional target/end frame, selected from the Studio image gallery or an uploaded file. FreeVideo can also use a published Studio image as `input_image` and gallery audio as `input_audio`. Local-file upload controls remain supported.
-
-Gallery entries are checked against the published gallery and an allowlist of MIME types before artifact reads. Conflicting direct upload and gallery input for the same slot fails closed. A graph that still contains an unbound media placeholder after substitution is rejected **before** contacting ComfyUI's prompt endpoint. This adapter does not infer node IDs for every possible FreeVideo graph: operators still import their own API-format ComfyUI workflow with explicit `{{input_video}}`, `{{last_frame_image}}`, `{{input_image}}` and/or `{{input_audio}}` placeholders.
-
-Acceptance: render a video in Studio, select it in the FreeVideo preset, confirm ComfyUI receives its actual video and final PNG frame, publish the workflow output to the gallery, and use that output as the next scene/timeline source. Physical FreeVideo node/model acceptance still requires a host with an installed ComfyUI/FreeVideo graph.
-
-
-Continuity semantics: **parent last frame → child first frame**. FreeVideo's `last_frame_image` is the intended *next clip endpoint*, never implicitly the previous clip's final frame. The source clip itself remains available as a video-reference input. The compositor can later assemble its finished segments and audio into MP4.
+- Start from an existing gallery clip or exported timeline even with no
+  native job history, selecting an installed image-to-video model.
+- Verify the job records sourceGalleryEntryId and sourceArtifactId while
+  keeping media bytes in the backend.
+- Verify the last frame is decoded, content integrity is enforced, wrong media
+  types are rejected, and retries use the same gallery ID.
+- Verify restart recovery of queued jobs and failed/interrupted-job retry.
+  Physical native-model and crash/relaunch acceptance are still required.
