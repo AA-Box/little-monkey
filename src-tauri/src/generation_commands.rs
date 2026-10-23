@@ -1847,3 +1847,33 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod native_wan_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_model_digest_validation_rejects_tampered_bytes() {
+        let path = std::env::temp_dir().join(format!("lm-wan-sha-test-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"abc").unwrap();
+        const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_component_sha256(&path, ABC).is_ok());
+        std::fs::write(&path, b"altered").unwrap();
+        assert!(verify_component_sha256(&path, ABC).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_wan_catalog_sources_have_pinned_digests() {
+        let model = crate::studio_wan_preset::native_wan22_ti2v_5b();
+        for item in model.components {
+            match item.source {
+                crate::generation::ComponentSource::HuggingFace { repo, file } => {
+                    assert!(crate::studio_wan_preset::expected_sha256(&repo, &file).is_some(),
+                        "Unverified curated model component: {repo}/{file}");
+                }
+                _ => panic!("Curated Wan preset must not depend on arbitrary user paths"),
+            }
+        }
+    }
+}
