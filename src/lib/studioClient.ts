@@ -220,12 +220,13 @@ export interface GenerationModel {
 }
 
 export type VideoJobStatus = "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled";
-export type VideoJobStage = "waiting_for_dependencies" | "rendering" | "published";
+export type VideoJobStage = "waiting_for_dependencies" | "preparing_input" | "rendering" | "published";
 
 export interface VideoJob {
   id: string;
   dependsOn: string[];
   sourceJobId: string | null;
+  sourceGalleryEntryId: string | null;
   sourceArtifactId: string | null;
   modelId: string;
   prompt: string;
@@ -628,8 +629,8 @@ export const studioClient = {
     invoke<RemoteBackend[]>("generation_remove_backend", { backendId }),
   /** Resolves to every artifact the run produced: one for a clip or an
    *  utterance, `batchCount` of them for a batch of images. */
-  videoSubmit: (request: GenerationRequest, idempotencyKey: string, dependsOn: string[] = [], sourceJobId: string | null = null) =>
-    invoke<VideoJob>("generation_video_submit", { request, idempotencyKey, dependsOn, sourceJobId }),
+  videoSubmit: (request: GenerationRequest, idempotencyKey: string, dependsOn: string[] = [], sourceJobId: string | null = null, sourceGalleryEntryId: string | null = null) =>
+    invoke<VideoJob>("generation_video_submit", { request, idempotencyKey, dependsOn, sourceJobId, sourceGalleryEntryId }),
   videoContinue: (parentJobId: string, prompt: string, idempotencyKey: string) =>
     invoke<VideoJob>("generation_video_continue", { parentJobId, prompt, idempotencyKey }),
   videoJobs: () => invoke<VideoJob[]>("generation_video_jobs"),
