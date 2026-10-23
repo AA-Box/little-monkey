@@ -477,6 +477,8 @@ export interface GenerationRequest {
   /** Speech only: ISO 639-1 code. Null leaves the model's own default. */
   language: string | null;
   initImageBase64: string | null;
+  /** Optional model-native ending frame for video interpolation/conditioning. */
+  endImageBase64?: string | null;
   /** Single-channel mask over the init image: white is repainted, black is
    *  kept. This is inpainting, so it needs an init image to paint over. */
   maskImageBase64: string | null;
