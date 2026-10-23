@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
-import { Download, Play, Square, FolderOpen, RefreshCw } from "lucide-react";
+import { Play, Square, FolderOpen, RefreshCw } from "lucide-react";
 import { Button } from "../ui";
 import { studioClient, type GenerationEntry } from "../../lib/studioClient";
 
@@ -64,7 +64,7 @@ export function StudioVdnPanel({
     return () => { active = false; unlisten?.(); };
   }, [refreshLicense]);
 
-  async function chooseFile(set: (value: string | null) => void) {
+  async function chooseFile(set: (value: string) => void) {
     const value = await open({ multiple: false, directory: false });
     if (typeof value === "string") set(value);
   }
