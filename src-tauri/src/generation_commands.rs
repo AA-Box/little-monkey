@@ -504,6 +504,18 @@ pub fn generation_add_model(
     Ok(models)
 }
 
+/// Adds the verified global-license Wan 2.2 TI2V-5B preset to the user's
+/// Studio library without changing a user-customized entry of the same ID.
+/// Weight transfers remain a separate explicit user-confirmed download.
+#[tauri::command]
+pub fn generation_register_wan22(app: AppHandle) -> Result<Vec<GenerationModelSpec>, String> {
+    let spec = crate::studio_wan_preset::native_wan22_ti2v_5b();
+    if registry(&app)?.iter().any(|model| model.id == spec.id) {
+        return registry(&app);
+    }
+    generation_add_model(app, spec)
+}
+
 /// Forgets a model. Files the app downloaded for it are removed; files the
 /// user pointed at on their own disk are left exactly where they are.
 #[tauri::command]
