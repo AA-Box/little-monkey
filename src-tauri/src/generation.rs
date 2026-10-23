@@ -577,6 +577,24 @@ pub struct GenerationDefaults {
     pub frame_grid: FrameGrid,
 }
 
+/// How to balance available GPU/CPU/disk memory on the *pinned* sd-server.
+/// Segmented graph execution and weight prefetch are already automatic on
+/// master-987-a77d362. In particular, it does NOT accept --stream-layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoMemoryProfile {
+    /// Keep preexisting models unchanged, but use conservative streaming for
+    /// new user-selected profiles.
+    #[default]
+    Default,
+    /// Let the native engine retain as much in GPU memory as it can.
+    MaximumSpeed,
+    /// Automatic GPU segmentation, CPU-resident source weights, VAE tiling.
+    AdaptiveVram,
+    /// Prefer disk-resident diffusion weights when system RAM is constrained.
+    MinimumRam,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationModelSpec {
@@ -613,6 +631,8 @@ pub struct GenerationModelSpec {
     /// FLUX, which drops references on the floor.
     #[serde(default)]
     pub reads_ref_images: bool,
+    #[serde(default)]
+    pub video_memory_profile: VideoMemoryProfile,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1057,8 +1077,34 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
                 .to_string(),
         );
     }
+    args.extend(video_memory_args(spec));
+    // Explicit user-set flags take precedence over automatic tuning.
     args.extend(spec.extra_launch_args.iter().cloned());
     args
+}
+
+/// Use only flags accepted by the app's PINNED managed sd-server.
+/// Its graph-cut engine already detects free GPU memory, reclaims weights,
+/// prefetches parameter-bearing segments and retries tiled VAE decoding.
+/// These flags are passed to the actual resident engine at startup, not a
+/// cosmetic UI configuration.
+fn video_memory_args(spec: &GenerationModelSpec) -> Vec<String> {
+    if spec.engine != GenerationEngineKind::StableDiffusionCpp
+        || !spec.tasks.iter().any(|task| task.is_video()) {
+        return Vec::new();
+    }
+    match spec.video_memory_profile {
+        VideoMemoryProfile::Default | VideoMemoryProfile::MaximumSpeed => Vec::new(),
+        VideoMemoryProfile::AdaptiveVram => vec![
+            "--offload-to-cpu".into(), "--max-vram".into(), "-1".into(),
+            "--vae-tiling".into(), "--temporal-tiling".into(),
+        ],
+        VideoMemoryProfile::MinimumRam => vec![
+            "--params-backend".into(), "diffusion=disk,te=cpu,vae=cpu".into(),
+            "--max-vram".into(), "-1".into(),
+            "--vae-tiling".into(), "--temporal-tiling".into(),
+        ],
+    }
 }
 
 /// What a running engine was launched with, port aside.
@@ -3064,7 +3110,26 @@ mod tests {
             engine: GenerationEngineKind::default(),
             quantization_bits: None,
             reads_ref_images: false,
+            video_memory_profile: VideoMemoryProfile::Default,
         }
+    }
+
+    #[test]
+    fn adaptive_video_memory_uses_only_flags_supported_by_pinned_server() {
+        let mut model = video_model();
+        model.video_memory_profile = VideoMemoryProfile::AdaptiveVram;
+        let args = launch_args(&model, Path::new("/models"), 4444);
+        assert!(args.contains(&"--offload-to-cpu".to_owned()));
+        assert!(args.windows(2).any(|pair| pair == ["--max-vram", "-1"]));
+        assert!(args.contains(&"--vae-tiling".to_owned()));
+        assert!(args.contains(&"--temporal-tiling".to_owned()));
+        assert!(!args.contains(&"--stream-layers".to_owned()));
+        model.video_memory_profile = VideoMemoryProfile::MinimumRam;
+        let args = launch_args(&model, Path::new("/models"), 4444);
+        assert!(args.windows(2).any(|pair| pair == ["--params-backend", "diffusion=disk,te=cpu,vae=cpu"]));
+        model.video_memory_profile = VideoMemoryProfile::Default;
+        let args = launch_args(&model, Path::new("/models"), 4444);
+        assert!(!args.contains(&"--max-vram".to_owned()));
     }
 
     fn video_model() -> GenerationModelSpec {
