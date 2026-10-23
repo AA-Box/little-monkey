@@ -431,6 +431,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rust_engine_selector_never_falls_through_to_unlicensed_diffusers() {
+        assert!(std::ptr::eq(worker_source(VdnBackend::Diffusers), WORKER));
+        assert!(std::ptr::eq(worker_source(VdnBackend::OptimizedSingle), FAST_WORKER));
+        assert!(std::ptr::eq(worker_source(VdnBackend::OptimizedUlysses), FAST_WORKER));
+        assert!(std::ptr::eq(worker_source(VdnBackend::Sglang), FAST_WORKER));
+        let sglang = worker_args(VdnBackend::Sglang, None, None, None, Some(30010)).unwrap();
+        assert!(sglang.windows(2).any(|pair| pair == ["--backend", "sglang"]));
+        assert!(sglang.windows(2).any(|pair| pair == ["--port", "30010"]));
+        assert!(worker_args(VdnBackend::Sglang, None, None, None, Some(0)).is_err());
+        assert!(worker_args(VdnBackend::OptimizedSingle, None, None, None, None).is_err());
+        assert!(worker_args(VdnBackend::OptimizedUlysses, None, None, Some("invalid"), None).is_err());
+    }
+
+    #[test]
+    fn vdn_backend_serde_rejects_unknown_instead_of_running_a_default_engine() {
+        let parsed: VdnBackend = serde_json::from_str("\"optimized_ulysses\"").unwrap();
+        assert_eq!(parsed, VdnBackend::OptimizedUlysses);
+        assert!(serde_json::from_str::<VdnBackend>("\"arbitrary_remote\"").is_err());
+    }
+
+    #[test]
     fn only_actual_mp4_brand_is_published() {
         assert!(!valid_mp4(b"not a video"));
         let mut video = vec![0u8; 32];
