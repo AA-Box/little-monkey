@@ -26,6 +26,7 @@ FPS = 24
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--probe", action="store_true")
     parser.add_argument("--prompt", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--first", default="")
@@ -44,6 +45,32 @@ def parse_args(argv=None):
             "fps": FPS,
             "backend": "openvdn-diffusers",
         }), flush=True)
+        return args
+    if args.probe:
+        # This is a real installed dependency check, not a simulated GPU.
+        # Never loads model remote code or downloads checkpoint bytes.
+        import torch
+        from diffusers import ModularPipeline
+        from diffusers.hooks import apply_group_offloading
+        from accelerate import cpu_offload_with_hook
+        from diffusers.utils.export_utils import encode_video
+        import av
+        if not torch.cuda.is_available():
+            raise RuntimeError("The selected Python environment has no CUDA GPU.")
+        cap = torch.cuda.get_device_capability()
+        report = {
+            "status": "ready",
+            "model": MODEL_REPOSITORY,
+            "backend": "openvdn-diffusers",
+            "device": torch.cuda.get_device_name(),
+            "computeCapability": f"{cap[0]}.{cap[1]}",
+            "vramBytes": torch.cuda.get_device_properties(0).total_memory,
+            "torch": torch.__version__,
+            "fp8Supported": cap[0] >= 9,
+        }
+        if not hasattr(ModularPipeline, "load_components"):
+            raise RuntimeError("Installed Diffusers is missing ModularPipeline.load_components")
+        print(json.dumps(report), flush=True)
         return args
     if not args.prompt.strip() or len(args.prompt.encode("utf-8")) > 8192:
         parser.error("The prompt must be non-empty and no longer than 8192 bytes")
@@ -139,7 +166,7 @@ def run(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    if not args.self_test:
+    if not args.self_test and not args.probe:
         try:
             run(args)
         except Exception as error:
