@@ -222,6 +222,21 @@ export interface GenerationModel {
   fitsInMemory: boolean;
 }
 
+/** Standalone, authorized CUDA VDN-H3 inference (no FreeVideo/ComfyUI). */
+export interface VdnGenerationRequest {
+  jobId: string;
+  pythonExecutable: string;
+  prompt: string;
+  steps: number;
+  frames: number;
+  seed: number;
+  firstImagePath: string | null;
+  lastImagePath: string | null;
+  fp8: boolean;
+  offloadDit: boolean;
+  acknowledgeThirdPartyCode: boolean;
+}
+
 export interface GenerationEntry {
   entryId: string;
   artifactId: string;
@@ -581,6 +596,11 @@ export const studioClient = {
     invoke<void>("generation_import_minimax_entitlement", { grantJson }),
   clearMinimaxEntitlement: () =>
     invoke<void>("generation_clear_minimax_entitlement"),
+  vdnLicenseStatus: () => invoke<string | null>("generation_vdn_license_status"),
+  vdnAcceptTerms: () => invoke<void>("generation_vdn_accept_terms"),
+  vdnRun: (request: VdnGenerationRequest) =>
+    invoke<GenerationEntry>("generation_vdn_run", { request }),
+  vdnCancel: (jobId: string) => invoke<boolean>("generation_vdn_cancel", { jobId }),
   setHuggingFaceToken: (modelId: string, token: string) =>
     invoke<void>("generation_set_hugging_face_token", { modelId, token }),
   downloadModel: (modelId: string) =>
