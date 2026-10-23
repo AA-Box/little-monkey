@@ -978,15 +978,12 @@ fn workflow_uses_binding(value: &Value, name: &str) -> bool {
     }
 }
 
+/// Report missing media in a stable, actionable priority order. JSON objects
+/// are maps, and their key iteration order must never change which required
+/// user-facing input is requested first.
 fn unresolved_media_binding(value: &Value) -> Option<&'static str> {
-    const NAMES: [&str; 4] = ["input_image", "last_frame_image", "input_video", "input_audio"];
-    match value {
-        Value::String(s) => NAMES.into_iter()
-            .find(|name| s.contains(&format!("{{{{{name}}}}}"))),
-        Value::Array(xs) => xs.iter().find_map(unresolved_media_binding),
-        Value::Object(xs) => xs.values().find_map(unresolved_media_binding),
-        _ => None,
-    }
+    const NAMES: [&str; 4] = ["input_image", "input_video", "last_frame_image", "input_audio"];
+    NAMES.into_iter().find(|name| workflow_uses_binding(value, name))
 }
 
 #[tauri::command]
@@ -1194,6 +1191,14 @@ mod tests {
         assert_eq!(value["a"], 12);
         assert_eq!(value["b"], "prefix hello");
     }
+    #[test]
+    fn missing_media_priority_ignores_json_field_order() {
+        let left = json!({"z":{"first":"{{input_audio}}"},"a":[{"start":"{{input_image}}"}],"m":"{{input_video}}"});
+        let right = json!({"m":"{{input_video}}","a":[{"start":"{{input_image}}"}],"z":{"first":"{{input_audio}}"}}); 
+        assert_eq!(unresolved_media_binding(&left), Some("input_image"));
+        assert_eq!(unresolved_media_binding(&right), Some("input_image"));
+    }
+
     #[test]
     fn generic_workflow_references_are_bound_as_typed_values() {
         let mut workflow = json!({"first":"{{input_image}}","last":"{{last_frame_image}}",
