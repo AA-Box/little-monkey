@@ -155,7 +155,9 @@ pub async fn generation_vdn_run(
     let directory = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-vdn-h3");
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let source = directory.join("studio-vdn-h3-worker.py");
+    // A unique staged worker path avoids Windows rename-over-existing-file
+    // errors and cross-job mutation of a script already executing.
+    let source = directory.join(format!("studio-vdn-h3-worker-{}.py", request.job_id));
     let staging = directory.join(format!(".worker-{}.tmp", request.job_id));
     std::fs::write(&staging, WORKER).map_err(|error| error.to_string())?;
     #[cfg(unix)]
@@ -259,7 +261,7 @@ pub async fn generation_vdn_run(
             Err(format!("VDN license no longer permits inference: {reason}"))
         },
     };
-    for path in [&stdout_path, &stderr_path, &output] {
+    for path in [&stdout_path, &stderr_path, &output, &source] {
         let _ = std::fs::remove_file(path);
     }
     let _ = app.emit("studio://vdn-progress", VdnProgress {
