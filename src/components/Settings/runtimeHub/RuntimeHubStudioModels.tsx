@@ -141,6 +141,7 @@ export function RuntimeHubStudioModels() {
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [installingWan, setInstallingWan] = useState(false);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -153,6 +154,28 @@ export function RuntimeHubStudioModels() {
       setRefreshing(false);
     }
   }, []);
+
+  async function installWan22() {
+    if (!window.confirm(
+      "Install native Wan 2.2 TI2V-5B? This downloads approximately 17.5 GB " +
+      "of Apache-2.0 diffusion, VAE and text-encoder weights from Hugging Face. " +
+      "It may require significant RAM, GPU memory, disk space and download time."
+    )) return;
+    setInstallingWan(true);
+    setError(null);
+    try {
+      await studioClient.registerWan22();
+      // Reuse the same backend download pipeline as every installed Studio
+      // model: cancellation, per-file transfers and progress notification.
+      await studioClient.downloadModel("wan22-ti2v-5b-native");
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      await refresh();
+    } finally {
+      setInstallingWan(false);
+    }
+  }
 
   useEffect(() => {
     void refresh();
@@ -176,6 +199,22 @@ export function RuntimeHubStudioModels() {
           </div>
         )}
       />
+
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-background p-3 text-xs">
+        <div className="min-w-0">
+          <div className="font-medium text-foreground">Wan 2.2 TI2V-5B — local text/image to video</div>
+          <div className="text-muted">
+            Worldwide Apache-2.0 model. Native sd-server, no ComfyUI or FreeVideo required.
+            Approx. 17.5 GB of separate model weights. Adaptive VRAM profile enabled.
+          </div>
+        </div>
+        <Button type="button" size="sm" variant="primary"
+          disabled={installingWan}
+          onClick={() => void installWan22()}>
+          <Download size={14} aria-hidden="true" />
+          {installingWan ? "Installing Wan 2.2…" : "Install Wan 2.2"}
+        </Button>
+      </div>
 
       {adding && (
         <div className="rounded-lg border border-border bg-background p-3">
