@@ -60,6 +60,11 @@ struct VideoJob {
     /// Published Studio clip/timeline: use its last frame with the local I2V engine.
     #[serde(default)]
     source_gallery_entry_id: Option<String>,
+    /// Optional target ending image for a native first+last-frame video run.
+    #[serde(default)]
+    target_gallery_image_entry_id: Option<String>,
+    #[serde(default)]
+    target_artifact_id: Option<String>,
     #[serde(default)]
     source_artifact_id: Option<String>,
     request: GenerationRequest,
@@ -79,6 +84,8 @@ pub struct VideoJobView {
     pub(crate) depends_on: Vec<String>,
     pub(crate) source_job_id: Option<String>,
     pub(crate) source_gallery_entry_id: Option<String>,
+    pub(crate) target_gallery_image_entry_id: Option<String>,
+    pub(crate) target_artifact_id: Option<String>,
     pub(crate) source_artifact_id: Option<String>,
     pub(crate) model_id: String,
     pub(crate) prompt: String,
@@ -99,6 +106,8 @@ impl From<&VideoJob> for VideoJobView {
             depends_on: job.depends_on.clone(),
             source_job_id: job.source_job_id.clone(),
             source_gallery_entry_id: job.source_gallery_entry_id.clone(),
+            target_gallery_image_entry_id: job.target_gallery_image_entry_id.clone(),
+            target_artifact_id: job.target_artifact_id.clone(),
             source_artifact_id: job.source_artifact_id.clone(),
             model_id: job.request.model_id.clone(),
             prompt: job.request.prompt.chars().take(240).collect(),
@@ -337,6 +346,16 @@ fn gallery_source_artifact(app: &AppHandle, entry_id: &str) -> Result<Generation
     Ok(entry)
 }
 
+fn gallery_target_image(app: &AppHandle, entry_id: &str) -> Result<GenerationEntry, String> {
+    let gallery = generation_commands::generation_gallery(app.clone())?;
+    let entry = gallery.into_iter().find(|entry| entry.entry_id == entry_id)
+        .ok_or("Target ending frame no longer exists in this profile")?;
+    if !matches!(entry.media_type.as_str(), "image/png" | "image/jpeg") {
+        return Err("Target ending frame must be a published PNG or JPEG".into());
+    }
+    Ok(entry)
+}
+
 /// Persisted gallery inputs are pinned to an artifact when submitted.
 /// Rejecting a replacement is essential for deterministic retries: a reused
 /// gallery ID must not silently switch source media between executions.
@@ -421,8 +440,34 @@ async fn extract_final_frame_in(root: &Path, media: &[u8], mime: &str) -> Result
 /// Resolve a real video blob from the verified artifact store and bind its
 /// decoded last frame to the child's image-to-video request.
 async fn prepared_request(app: &AppHandle, job: &VideoJob) -> Result<GenerationRequest, String> {
+    let mut request = job.request.clone();
+    if let Some(target_id) = job.target_gallery_image_entry_id.as_deref() {
+        let target = gallery_target_image(app, target_id)?;
+        if job.target_artifact_id.as_deref().is_some_and(|hash| hash != target.artifact_id) {
+            return Err("The target ending frame changed since submission".into());
+        }
+        let root = app.profile_data_dir().map_err(|error| error.to_string())?;
+        let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
+            root.join("content-v1"), MAX_HANDOFF_VIDEO_BYTES as u64
+        ).map_err(|error| error.to_string())?;
+        let bytes = store.read(&target.artifact_id).map_err(|error| error.to_string())?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_HANDOFF_PNG_BYTES {
+            return Err("The target ending frame is empty or exceeds 22 MiB".into());
+        }
+        let format_ok = match target.media_type.as_str() {
+            "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            _ => false,
+        };
+        if !format_ok { return Err("Target ending frame bytes do not match the published image format".into()); }
+        request.end_image_base64 = Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+        transition(app, &job.id, |record| {
+            record.target_artifact_id = Some(target.artifact_id.clone());
+            Ok(())
+        })?;
+    }
     if job.source_job_id.is_none() && job.source_gallery_entry_id.is_none() {
-        return Ok(job.request.clone());
+        return Ok(request);
     }
     let entry = if let Some(source_id) = &job.source_job_id {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
@@ -447,7 +492,6 @@ async fn prepared_request(app: &AppHandle, job: &VideoJob) -> Result<GenerationR
         record.source_artifact_id = Some(entry.artifact_id.clone());
         Ok(())
     })?;
-    let mut request = job.request.clone();
     request.task = GenerationTask::ImageToVideo;
     request.init_image_base64 = Some(png);
     Ok(request)
@@ -562,7 +606,7 @@ async fn execute(app: &AppHandle, id: &str) -> Result<(), String> {
 /// Durable video work is always assigned to a locally installed model.
 /// A remote model ID must never be accepted as an accidental fallback to an
 /// external service. Check this in Rust, not only in the frontend picker.
-fn validate_local_video_model(app: &AppHandle, request: &GenerationRequest) -> Result<(), String> {
+fn validate_local_video_model(app: &AppHandle, request: &GenerationRequest, gallery_target_frame: bool) -> Result<(), String> {
     if crate::generation::parse_remote_model_id(&request.model_id).is_some() {
         return Err("Durable native video jobs cannot invoke a remote video backend".into());
     }
@@ -581,6 +625,9 @@ fn validate_local_video_model(app: &AppHandle, request: &GenerationRequest) -> R
     if !model.fits_in_memory {
         return Err("Selected video model requires more RAM than is available on this machine".into());
     }
+    if gallery_target_frame && model.spec.engine != crate::generation::GenerationEngineKind::StableDiffusionCpp {
+        return Err("Native ending-frame conditioning currently requires a compatible sd-server video model".into());
+    }
     Ok(())
 }
 
@@ -592,11 +639,12 @@ pub fn generation_video_submit(
     depends_on: Vec<String>,
     source_job_id: Option<String>,
     source_gallery_entry_id: Option<String>,
+    target_gallery_image_entry_id: Option<String>,
 ) -> Result<VideoJobView, String> {
     if !request.task.is_video() {
         return Err("Durable Studio jobs accept only video tasks".to_string());
     }
-    validate_local_video_model(&app, &request)?;
+    validate_local_video_model(&app, &request, target_gallery_image_entry_id.is_some())?;
     if idempotency_key.is_empty() || idempotency_key.len() > 128
         || !idempotency_key.bytes().all(|ch| ch.is_ascii_alphanumeric() || b"_-.:".contains(&ch)) {
         return Err("Video idempotency key must be 1–128 safe ASCII characters".to_string());
@@ -621,6 +669,12 @@ pub fn generation_video_submit(
     } else {
         None
     };
+    let pinned_target_artifact = if let Some(target_id) = target_gallery_image_entry_id.as_deref() {
+        if request.end_image_base64.is_some() {
+            return Err("Use either a gallery target image or directly supplied end image, not both".into());
+        }
+        Some(gallery_target_image(&app, target_id)?.artifact_id)
+    } else { None };
     let result = {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
         let dir = directory(&app)?;
@@ -630,7 +684,9 @@ pub fn generation_video_submit(
             if !same_effective_request(&old.request, &request)
                 || old.depends_on != depends_on || old.source_job_id != source
                 || old.source_gallery_entry_id != source_gallery_entry_id
-                || (pinned_gallery_artifact.is_some() && old.source_artifact_id != pinned_gallery_artifact) {
+                || old.target_gallery_image_entry_id != target_gallery_image_entry_id
+                || (pinned_gallery_artifact.is_some() && old.source_artifact_id != pinned_gallery_artifact)
+                || (pinned_target_artifact.is_some() && old.target_artifact_id != pinned_target_artifact) {
                 return Err("Video idempotency key already belongs to a different request".to_string());
             }
             VideoJobView::from(old)
@@ -650,6 +706,8 @@ pub fn generation_video_submit(
                 depends_on,
                 source_job_id: source,
                 source_gallery_entry_id: source_gallery_entry_id,
+                target_gallery_image_entry_id: target_gallery_image_entry_id,
+                target_artifact_id: pinned_target_artifact,
                 source_artifact_id: pinned_gallery_artifact,
                 request: pin_seed(request),
                 status: VideoJobStatus::Queued,
@@ -688,7 +746,7 @@ pub fn generation_video_continue(
     request.task = GenerationTask::ImageToVideo;
     request.init_image_base64 = None;
     request.mask_image_base64 = None;
-    generation_video_submit(app, request, idempotency_key, vec![parent_job_id.clone()], Some(parent_job_id), None)
+    generation_video_submit(app, request, idempotency_key, vec![parent_job_id.clone()], Some(parent_job_id), None, None)
 }
 
 #[tauri::command]
@@ -753,7 +811,8 @@ mod tests {
     fn example(id: &str, status: VideoJobStatus, depends_on: Vec<String>) -> VideoJob {
         VideoJob {
             id: id.into(), idempotency_key: id.into(), depends_on,
-            source_job_id: None, source_gallery_entry_id: None, source_artifact_id: None,
+            source_job_id: None, source_gallery_entry_id: None, target_gallery_image_entry_id: None,
+            target_artifact_id: None, source_artifact_id: None,
             request: serde_json::from_value(serde_json::json!({
                 "modelId":"model", "task":"text_to_video","prompt":"test",
                 "width":512,"height":512,"steps":10,"cfgScale":4,"seed":1
