@@ -600,6 +600,11 @@ export const studioClient = {
   vdnAcceptTerms: () => invoke<void>("generation_vdn_accept_terms"),
   vdnRun: (request: VdnGenerationRequest) =>
     invoke<GenerationEntry>("generation_vdn_run", { request }),
+  vdnProbe: (pythonExecutable: string) =>
+    invoke<{status: string; model: string; device: string; computeCapability: string;
+      vramBytes: number; torch: string; fp8Supported: boolean}>(
+      "generation_vdn_probe", { pythonExecutable }
+    ),
   vdnCancel: (jobId: string) => invoke<boolean>("generation_vdn_cancel", { jobId }),
   setHuggingFaceToken: (modelId: string, token: string) =>
     invoke<void>("generation_set_hugging_face_token", { modelId, token }),
