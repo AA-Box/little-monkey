@@ -1112,6 +1112,10 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
 
   const generate = () => {
     if (!selected || !settings) return;
+    if (selected.licenseEligible === false) {
+      setError(selected.licenseBlockReason ?? "This model is not eligible under its local model license.");
+      return;
+    }
     setError(null);
     enqueueRun(prompt.trim() || selected.name, {
       modelId: selected.id,
@@ -1236,6 +1240,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
     !!selected &&
     !!settings &&
     selected.installed &&
+    selected.licenseEligible !== false &&
     prompt.trim().length > 0 &&
     // A run in flight no longer blocks the button: the next one queues behind
     // it, up to the cap that keeps a leaned-on button from queueing forever.
