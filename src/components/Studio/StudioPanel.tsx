@@ -741,9 +741,17 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
       );
       setSelectedId((current) => {
         if (current && usable.some((model) => model.id === current)) return current;
-        // Prefer something already downloaded so the panel opens on a model
-        // the user can actually run.
-        return (usable.find((model) => model.installed) ?? usable[0])?.id ?? null;
+        // Never auto-select a restricted, ineligible local model if an
+        // eligible alternative exists. Prefer an already-installed Wan 2.2
+        // video model as the worldwide default when the user has one.
+        const allowed = usable.filter((model) => model.licenseEligible !== false);
+        const installed = allowed.filter((model) => model.installed);
+        const isWan22 = (model: GenerationModel) =>
+          /wan[\\s._-]*2[\\s._-]*2/i.test(`${model.name} ${model.family} ${model.id}`);
+        return (
+          installed.find(isWan22) ?? installed[0] ??
+          allowed.find(isWan22) ?? allowed[0] ?? usable[0]
+        )?.id ?? null;
       });
     } catch (reason) {
       setError(errorText(reason));
