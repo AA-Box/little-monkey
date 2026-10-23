@@ -7,6 +7,8 @@ import { VideoTimelinePanel } from "./VideoTimelinePanel";
 export function VideoJobsPanel() {
   const [jobs, setJobs] = useState<VideoJob[]>([]);
   const [galleryVideos, setGalleryVideos] = useState<GenerationEntry[]>([]);
+  const [galleryImages, setGalleryImages] = useState<GenerationEntry[]>([]);
+  const [targetImageId, setTargetImageId] = useState("");
   const [nativeModels, setNativeModels] = useState<GenerationModel[]>([]);
   const [sourceGalleryId, setSourceGalleryId] = useState("");
   const [nativeModelId, setNativeModelId] = useState("");
@@ -44,6 +46,7 @@ export function VideoJobsPanel() {
   const refreshSources = async () => {
     const [gallery, models] = await Promise.all([studioClient.gallery(), studioClient.models()]);
     setGalleryVideos(gallery.filter((entry) => entry.mediaType === "video/mp4" || entry.mediaType === "video/webm"));
+    setGalleryImages(gallery.filter((entry) => entry.mediaType === "image/png" || entry.mediaType === "image/jpeg"));
     setNativeModels(models.filter((model) =>
       model.installed && model.licenseAccepted && model.tasks.includes("image_to_video")
     ));
@@ -60,6 +63,10 @@ export function VideoJobsPanel() {
     const prompt = galleryPrompt.trim();
     if (!prompt || !nativeModel || !selectedGalleryId) {
       setError("Choose a published clip, a local image-to-video model, and a next-scene prompt.");
+      return;
+    }
+    if (targetImageId && nativeModel.engine !== "stable_diffusion_cpp") {
+      setError("First+last-frame conditioning requires a compatible local sd-server video model.");
       return;
     }
     const defaults = nativeModel.defaults;
@@ -80,7 +87,7 @@ export function VideoJobsPanel() {
     setBusy("gallery-continuation");
     setError(null);
     try {
-      await studioClient.videoSubmit(request, crypto.randomUUID(), [], null, selectedGalleryId);
+      await studioClient.videoSubmit(request, crypto.randomUUID(), [], null, selectedGalleryId, targetImageId || null);
       setJobs(await studioClient.videoJobs());
       setGalleryPrompt("");
     } catch (cause) {
@@ -144,8 +151,9 @@ export function VideoJobsPanel() {
         </div>
         <p className="text-[11px] text-muted">
           Pick an existing MP4/WebM or exported timeline. Little Monkey decodes the final frame
-          locally and uses it as the first image of the next clip. No FreeVideo nodes or ComfyUI
-          service are required. Motion latents and audio conditioning are not carried between runs.
+          locally and uses it as the next clip's first image. An optional published ending-frame
+          image is sent to the compatible native model as end_image. No external ComfyUI service
+          is used. Motion latents and audio conditioning are not carried between runs.
         </p>
         <label className="grid gap-1 text-[11px]">
           Source video
@@ -165,10 +173,20 @@ export function VideoJobsPanel() {
             {nativeModels.map((model) => <option value={model.id} key={model.id}>{model.name}</option>)}
           </select>
         </label>
+        <label className="grid gap-1 text-[11px]">
+          Target ending frame (optional, compatible sd-server models)
+          <select aria-label="Target gallery ending frame" className="rounded border border-border bg-surface px-2 py-1 text-xs"
+            value={targetImageId} onChange={(event) => setTargetImageId(event.target.value)}>
+            <option value="">No ending frame constraint</option>
+            {galleryImages.map((entry) => <option value={entry.entryId} key={entry.entryId}>
+              {entry.prompt.slice(0, 60) || entry.modelId} · {new Date(entry.createdAtMs).toLocaleString()}
+            </option>)}
+          </select>
+        </label>
         <input aria-label="Gallery continuation prompt" placeholder="Describe the next scene"
           className="rounded border border-border bg-surface px-2 py-1 text-xs"
           value={galleryPrompt} onChange={(event) => setGalleryPrompt(event.target.value)}/>
-        <Button size="sm" variant="secondary" disabled={busy !== null || !selectedGalleryId || !nativeModel || !galleryPrompt.trim()}
+        <Button size="sm" variant="secondary" disabled={busy !== null || !selectedGalleryId || !nativeModel || !galleryPrompt.trim() || Boolean(targetImageId && nativeModel.engine !== "stable_diffusion_cpp")}
           onClick={() => void continueGallery()}>Generate next scene locally</Button>
       </div>
       <div className="max-h-32 space-y-2 overflow-y-auto">
