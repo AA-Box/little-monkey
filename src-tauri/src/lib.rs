@@ -48,6 +48,7 @@ pub mod runtime_adapter;
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
 pub(crate) mod generation_commands;
+pub(crate) mod studio_wan_preset;
 pub mod studio_parity;
 pub mod character_trainer;
 pub mod studio_tools;
@@ -2103,6 +2104,7 @@ pub fn run() {
             generation_commands::generation_engine_status,
             generation_commands::generation_models,
             generation_commands::generation_add_model,
+            generation_commands::generation_register_wan22,
             generation_commands::generation_remove_model,
             generation_commands::generation_accept_license,
             generation_commands::generation_set_hugging_face_token,
