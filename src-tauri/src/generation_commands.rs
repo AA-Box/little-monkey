@@ -612,6 +612,31 @@ pub fn generation_set_hugging_face_token(
     }
 }
 
+/// Stream hashes rather than loading multi-gigabyte weights into RAM.
+/// A curated model cannot silently reuse tampered or half-downloaded files.
+fn verify_component_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut reader = std::io::BufReader::new(
+        std::fs::File::open(path).map_err(|error| error.to_string())?
+    );
+    let mut digest = Sha256::new();
+    let mut chunk = [0_u8; 1024 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+        if n == 0 { break; }
+        digest.update(&chunk[..n]);
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected {
+        return Err(format!(
+            "Model weight checksum mismatch for {}: expected {expected}, received {actual}",
+            path.file_name().and_then(|name| name.to_str()).unwrap_or("model")
+        ));
+    }
+    Ok(())
+}
+
 async fn install_component_file(
     app: &AppHandle,
     repo: &str,
@@ -619,7 +644,11 @@ async fn install_component_file(
     destination: &Path,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    let pinned_sha = crate::studio_wan_preset::expected_sha256(repo, file);
     if destination.is_file() {
+        if let Some(expected) = pinned_sha {
+            verify_component_sha256(destination, expected)?;
+        }
         return Ok(());
     }
     let name = destination
@@ -631,6 +660,12 @@ async fn install_component_file(
     if let Err(error) = outcome {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
+    }
+    if let Some(expected) = pinned_sha {
+        if let Err(error) = verify_component_sha256(&temporary, expected) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
     }
     std::fs::rename(&temporary, destination).map_err(|error| {
         let _ = std::fs::remove_file(&temporary);
