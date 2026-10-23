@@ -595,6 +595,88 @@ pub fn generation_add_model(
     Ok(models)
 }
 
+/// VDN's direct Diffusers worker is deliberately NOT a stable-diffusion.cpp
+/// model and cannot be unlocked by editing a generated model specification.
+/// Apply exactly the same policy before the upstream Hugging Face pipeline
+/// can load or download restricted weights.
+pub(crate) fn ensure_vdn_usage(app: &AppHandle) -> Result<(), String> {
+    let region = license_region(app)?.ok_or(
+        "Declare the territory where the VDN weights will be used before inference"
+    )?;
+    let entitlement: Option<crate::studio_minimax_entitlement::SignedGrant> =
+        read_state(app, MINIMAX_ENTITLEMENT_FILE)?;
+    if entitlement.as_ref().is_some_and(|grant|
+        crate::studio_minimax_entitlement::validate_for_region(grant, region).is_ok()
+    ) {
+        return Ok(());
+    }
+    let accepted: BTreeSet<String> = read_state(app, ACCEPTED_LICENSES_FILE)?;
+    if region == crate::studio_model_policy::LicenseRegion::Other
+        && accepted.contains(crate::studio_model_policy::MINIMAX_H3_LICENSE_ID)
+    {
+        return Ok(());
+    }
+    Err("VDN-H3 weights are restricted in the EU, US, UK and South Korea without a separately verified MiniMax license. Outside these territories, explicitly accept the MiniMax H3 Community License first.".into())
+}
+
+#[tauri::command]
+pub fn generation_vdn_accept_terms(app: AppHandle) -> Result<(), String> {
+    if license_region(&app)? != Some(crate::studio_model_policy::LicenseRegion::Other) {
+        return Err("The community license cannot authorize VDN-H3 weights within an excluded or undeclared region.".into());
+    }
+    let mut accepted: BTreeSet<String> = read_state(&app, ACCEPTED_LICENSES_FILE)?;
+    accepted.insert(crate::studio_model_policy::MINIMAX_H3_LICENSE_ID.into());
+    write_state(&app, ACCEPTED_LICENSES_FILE, &accepted)
+}
+
+#[tauri::command]
+pub fn generation_vdn_license_status(app: AppHandle) -> Result<Option<String>, String> {
+    Ok(ensure_vdn_usage(&app).err())
+}
+
+/// Publish actual VDN worker bytes to the SAME content-addressed Gallery as
+/// the native Wan renderer. Never accept caller-supplied file paths or blob IDs.
+pub(crate) fn publish_vdn_video(
+    app: &AppHandle,
+    prompt: &str,
+    steps: u32,
+    seed: i64,
+    frames: u32,
+    first_keyframe: bool,
+    bytes: &[u8],
+) -> Result<GenerationEntry, String> {
+    let blob = artifacts(app)?.put(bytes).map_err(|error| error.to_string())?;
+    let entry = GenerationEntry {
+        entry_id: format!("studio-{}", Uuid::new_v4()),
+        artifact_id: blob.id,
+        model_id: "vdn-h3-diffusers".into(),
+        task: if first_keyframe {
+            generation::GenerationTask::ImageToVideo
+        } else {
+            generation::GenerationTask::TextToVideo
+        },
+        prompt: prompt.into(),
+        negative_prompt: String::new(),
+        media_type: "video/mp4".into(),
+        size_bytes: blob.size,
+        width: 1344,
+        height: 768,
+        steps,
+        cfg_scale: 1.0,
+        seed,
+        frame_count: frames,
+        fps: 24,
+        duration_ms: frames as u64 * 1000 / 24,
+        created_at_ms: now_ms(),
+    };
+    let mut gallery: Vec<GenerationEntry> = read_state(app, GALLERY_FILE)?;
+    gallery.push(entry.clone());
+    gallery.sort_by_key(|item| item.created_at_ms);
+    write_state(app, GALLERY_FILE, &gallery)?;
+    let _ = app.emit("studio://progress", GenerationProgressEvent::new(&entry.entry_id, "completed"));
+    Ok(entry)
+}
+
 /// Forgets a model. Files the app downloaded for it are removed; files the
 /// user pointed at on their own disk are left exactly where they are.
 #[tauri::command]
