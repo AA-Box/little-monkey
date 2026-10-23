@@ -1126,7 +1126,7 @@ mod tests {
         ));
         std::fs::write(
             &fake,
-            "#!/bin/sh\nwhile IFS= read -r _; do :; done\nprintf '%s\\n' 'execution error: Not authorized to send Apple events to Messages. (-1743)' >&2\nexit 1\n",
+            "#!/bin/sh\nIFS= read -r _ || exit 1\nprintf '%s\\n' 'execution error: Not authorized to send Apple events to Messages. (-1743)' >&2\nexit 1\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
