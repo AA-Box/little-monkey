@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Download, PackagePlus, RefreshCw, Trash2 } from "lucide-react";
 
 import { AddModelForm } from "../../Studio/AddModelForm";
@@ -142,6 +143,7 @@ export function RuntimeHubStudioModels() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [installingWan, setInstallingWan] = useState(false);
+  const [wanProgress, setWanProgress] = useState<Record<string, { downloaded: number; total: number }>>({});
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -155,6 +157,31 @@ export function RuntimeHubStudioModels() {
     }
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    let dispose: (() => void) | undefined;
+    void listen<{ file: string; downloaded: number; total: number }>(
+      "models://download-progress",
+      (event) => {
+        if (!active) return;
+        const name = event.payload.file.split("/").pop() ?? event.payload.file;
+        if (![
+          "wan2.2_ti2v_5B_fp16.safetensors",
+          "wan2.2_vae.safetensors",
+          "umt5-xxl-encoder-Q8_0.gguf",
+        ].includes(name)) return;
+        setWanProgress((value) => ({
+          ...value,
+          [name]: { downloaded: event.payload.downloaded, total: event.payload.total },
+        }));
+      },
+    ).then((unlisten) => {
+      if (active) dispose = unlisten;
+      else unlisten();
+    }).catch(() => {});
+    return () => { active = false; dispose?.(); };
+  }, []);
+
   async function installWan22() {
     if (!window.confirm(
       "Install native Wan 2.2 TI2V-5B? This downloads approximately 17.5 GB " +
@@ -162,6 +189,7 @@ export function RuntimeHubStudioModels() {
       "It may require significant RAM, GPU memory, disk space and download time."
     )) return;
     setInstallingWan(true);
+    setWanProgress({});
     setError(null);
     try {
       await studioClient.registerWan22();
@@ -208,12 +236,34 @@ export function RuntimeHubStudioModels() {
             Approx. 17.5 GB of separate model weights. Adaptive VRAM profile enabled.
           </div>
         </div>
-        <Button type="button" size="sm" variant="primary"
-          disabled={installingWan}
-          onClick={() => void installWan22()}>
-          <Download size={14} aria-hidden="true" />
-          {installingWan ? "Installing Wan 2.2…" : "Install Wan 2.2"}
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" size="sm" variant="primary"
+            disabled={installingWan}
+            onClick={() => void installWan22()}>
+            <Download size={14} aria-hidden="true" />
+            {installingWan ? "Installing Wan 2.2…" : "Install Wan 2.2"}
+          </Button>
+          {installingWan && (
+            <Button type="button" size="sm" variant="secondary"
+              onClick={() => void studioClient.cancelDownload("wan22-ti2v-5b-native")}>
+              Cancel download
+            </Button>
+          )}
+        </div>
+        {Object.keys(wanProgress).length > 0 && (
+          <div className="w-full space-y-2">
+            {Object.entries(wanProgress).map(([file, value]) => (
+              <div key={file} className="grid gap-1">
+                <div className="flex justify-between gap-2 text-muted">
+                  <span className="truncate font-mono">{file}</span>
+                  <span>{formatBytes(value.downloaded)} / {value.total ? formatBytes(value.total) : "unknown"}</span>
+                </div>
+                <progress className="w-full" max={value.total || 1}
+                  value={Math.min(value.downloaded, value.total || 1)} />
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {adding && (
