@@ -29,8 +29,9 @@ https://github.com/Wan-Video/Wan2.2
   overriding a user-authored blank or permissive license on model import and
   existing model registry reads.
 - With no territory declaration, these restricted models are not eligible.
-  In all four excluded regions the community-license weights are not eligible,
-  **even when the user has clicked Accept License**.
+  In all four excluded regions the community-license weights are not eligible
+  merely from **Accept License**; a build-trusted, independently issued signed
+  enterprise entitlement after written MiniMax authorization is required.
 - Outside the four regions, the user must still accept the community agreement.
 - A claim of separate authorization does not create an override. This requires
   a future independently verified rights-holder grant.
@@ -43,6 +44,50 @@ https://github.com/Wan-Video/Wan2.2
   returned by Rust; the frontend exposes reasons but is never the gatekeeper.
 - Public/open-license models without known exclusions are unaffected; Wan 2.2
   may be installed through the existing user-managed Studio model workflow.
+
+## Separately licensed enterprise deployments
+
+A separate **written authorization from MiniMax** is required before the
+community model can be used inside its excluded territories. Little Monkey
+cannot issue those rights. The publisher/distributor may enable enterprise
+entitlements only after checking rights-holder documentation.
+
+An enterprise build may embed an approved distributor's Ed25519 public key at
+compile time in `LITTLE_MONKEY_MINIMAX_GRANT_ED25519_PUBKEY_B64`. It must
+be a real 32-byte Ed25519 verification key of a distributor authorized to
+issue model entitlements; it must never be supplied by the end user at
+runtime.
+
+The distributor signs the **raw JSON bytes** of a payload:
+
+```json
+{
+  "audience": "little-monkey",
+  "modelFamily": "minimax-h3",
+  "licenseReference": "reference-to-verified-written-MiniMax-authorization",
+  "holderId": "the-authorized-organization",
+  "allowedRegions": ["eu"],
+  "notBeforeUnix": 1800000000,
+  "expiresAtUnix": 1830000000
+}
+```
+
+Wrap the UTF-8 payload and its Ed25519 signature as base64 in
+`{"payloadBase64":"…","signatureBase64":"…"}`. Both are input to the
+**Verify & import signed entitlement** control in Studio model settings.
+
+Rust cryptographically validates the signature against the embedded issuer key,
+the fixed application audience/model family, license reference, territory,
+validity window and expiry. It revalidates on *every* download, model run,
+and profile model status refresh, even when the weight files were imported
+manually. A changed region or expired receipt closes the gate immediately.
+Users can revoke the receipt from the same control.
+
+**Standard releases have no trusted entitlement issuer key**, and imported
+receipts are rejected. This is intentional. A user's own self-signed JSON,
+checkbox or unverifiable PDF does not create MiniMax licensing rights. Issuing a
+certificate without examining the upstream written authorization is strictly
+outside the application's contract.
 
 ## Limitations and security boundaries
 
