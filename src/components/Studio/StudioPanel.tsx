@@ -1337,7 +1337,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
           {visible.map((model) => {
             const blockedByLicense =
               model.licenseEligible === false || (model.licenseEligible === undefined && model.license.acceptanceRequired && !model.licenseAccepted);
-            const canAcceptLicense = model.license.acceptanceRequired && !model.licenseAccepted
+            const canAcceptLicense = model.licenseEligible !== true && model.license.acceptanceRequired && !model.licenseAccepted
               && (!model.licenseBlockReason || model.licenseBlockReason.startsWith("Accept the "));
             return (
               <div
