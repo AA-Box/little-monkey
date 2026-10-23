@@ -32,6 +32,9 @@ export function StudioVdnPanel({
   const [region, setRegion] = useState<Region>(null);
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState("");
+  const [probeInfo, setProbeInfo] = useState<string | null>(null);
+  const [probing, setProbing] = useState(false);
+  const [gpuFp8, setGpuFp8] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<GenerationEntry | null>(null);
   const job = useRef<string | null>(null);
@@ -69,6 +72,28 @@ export function StudioVdnPanel({
     if (typeof value === "string") set(value);
   }
 
+  async function probeRuntime() {
+    if (!python || probing || running) return;
+    setError(null);
+    setProbInfoPlaceholder();
+    setProbing(true);
+    try {
+      const report = await studioClient.vdnProbe(python);
+      setProbeInfo(`${report.device} · compute capability ${report.computeCapability} · ${(report.vramBytes / (1024 ** 3)).toFixed(1)} GiB VRAM · PyTorch ${report.torch}`);
+      setGpuFp8(report.fp8Supported);
+      if (!report.fp8Supported) setFp8(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      setProbeInfo(null);
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  function setProbInfoPlaceholder() {
+    setProbeInfo(null);
+  }
+
   async function acceptCommunityTerms() {
     try {
       await studioClient.vdnAcceptTerms();
@@ -79,7 +104,7 @@ export function StudioVdnPanel({
   }
 
   async function run() {
-    if (!python || !prompt.trim() || licenseReason !== null ||
+    if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
         !trustRemoteCode || running) return;
     const id = crypto.randomUUID();
     job.current = id;
@@ -170,12 +195,21 @@ export function StudioVdnPanel({
           <div className="flex items-center gap-2">
             <input className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-foreground"
               placeholder="/path/to/vdn-venv/bin/python"
-              value={python} onChange={(event) => setPython(event.target.value)}
+              value={python} onChange={(event) => { setPython(event.target.value); setProbeInfo(null); }}
               disabled={running} />
             <Button size="sm" variant="secondary" disabled={running}
-              onClick={() => void chooseFile(setPython)}><FolderOpen size={13} /> Browse</Button>
+              onClick={() => void chooseFile((value) => { setPython(value); setProbeInfo(null); })}>
+              <FolderOpen size={13} /> Browse</Button>
           </div>
         </label>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button size="sm" variant="secondary" disabled={!python || running || probing}
+            onClick={() => void probeRuntime()}>
+            <RefreshCw size={13} /> {probing ? "Checking GPU…" : "Check installed VDN runtime"}
+          </Button>
+          {probeInfo && <span role="status" className="text-muted">{probeInfo}</span>}
+        </div>
 
         <label className="grid gap-1 text-muted">
           Prompt
@@ -233,7 +267,7 @@ export function StudioVdnPanel({
             Stream transformer blocks to GPU (24 GB VRAM)
           </label>
           <label className="flex items-center gap-2 text-muted">
-            <input type="checkbox" checked={fp8} disabled={running}
+            <input type="checkbox" checked={fp8} disabled={running || !gpuFp8}
               onChange={(event) => setFp8(event.target.checked)} />
             TorchAO FP8 (supported GPU only)
           </label>
@@ -248,7 +282,7 @@ export function StudioVdnPanel({
 
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="primary"
-            disabled={running || !python || !prompt.trim() ||
+            disabled={running || !python || !probeInfo || !prompt.trim() ||
               licenseReason !== null || !trustRemoteCode}
             onClick={() => void run()}>
             <Play size={13} /> Generate with VDN-H3
