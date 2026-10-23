@@ -100,6 +100,28 @@ rendering service. Each input is resolved from a published
 \`videoJobId\` gallery entry rather than arbitrary file paths. The optional
 soundtrack is validated as a local regular audio file.
 
+## Native first-frame / ending-frame conditioning
+
+When an installed compatible stable-diffusion.cpp video model exposes native
+`end_image` conditioning, Studio Video jobs offers an optional target ending
+image from the active profile's published PNG/JPEG gallery. The worker pins both
+the selected source video's content hash and the target image's content hash
+before sampling. It decodes the prior clip's final PNG in the backend, reads
+the target image from the integrity-checked content store, and sends a single
+`/sdcpp/v1/vid_gen` request with `init_image` and `end_image`.
+
+The end-frame request is not passed through a ComfyUI graph. It is rejected
+for engines other than stable-diffusion.cpp and for still-image tasks.
+The actual video model must implement end-frame conditioning; the presence of
+an API field alone cannot guarantee that an arbitrary checkpoint supports it.
+If the model does not support the feature, engine validation must surface a
+failure rather than silently removing the requested end-frame constraint.
+
+A model-installed host must verify the *rendered* ending frame is consistent
+with the supplied target. Current CI checks request mapping, media type,
+source integrity and decoded first-frame preparation, **not** end-frame quality
+or temporal latent continuity.
+
 ## Native continuation from any published Studio video
 
 The Video jobs panel can continue any published MP4/WebM clip, including
@@ -129,6 +151,9 @@ path never invokes them. Little Monkey does not ship or require FreeVideo.
 - Verify the job records sourceGalleryEntryId and sourceArtifactId while
   keeping media bytes in the backend.
 - Verify the last frame is decoded, content integrity is enforced, wrong media
-  types are rejected, and retries use the same gallery ID.
+  types are rejected, and retries use the same gallery ID and pinned digest.
+- Select a published target PNG/JPEG and verify the local sampler receives
+  both initial `init_image` and final `end_image` conditioning bytes, and that
+  a real model produces the expected first/last-frame transition.
 - Verify restart recovery of queued jobs and failed/interrupted-job retry.
   Physical native-model and crash/relaunch acceptance are still required.
