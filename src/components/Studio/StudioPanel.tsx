@@ -747,7 +747,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
         const allowed = usable.filter((model) => model.licenseEligible !== false);
         const installed = allowed.filter((model) => model.installed);
         const isWan22 = (model: GenerationModel) =>
-          /wan[\\s._-]*2[\\s._-]*2/i.test(`${model.name} ${model.family} ${model.id}`);
+          /wan[\s._-]*2[\s._-]*2/i.test(`${model.name} ${model.family} ${model.id}`);
         return (
           installed.find(isWan22) ?? installed[0] ??
           allowed.find(isWan22) ?? allowed[0] ?? usable[0]
