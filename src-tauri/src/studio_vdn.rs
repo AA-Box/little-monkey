@@ -218,6 +218,19 @@ fn brief_error(path: &Path) -> String {
     compact.chars().take(400).collect()
 }
 
+/// Terminate worker children (torchrun process groups) before killing the wrapper.
+async fn stop_vdn_worker(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Python worker forwards SIGTERM to its CUDA/torchrun process group.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+        if tokio::time::timeout(Duration::from_secs(12), child.wait()).await.is_ok() {
+            return;
+        }
+    }
+    let _ = child.kill().await;
+}
+
 #[tauri::command]
 pub async fn generation_vdn_run(
     app: AppHandle,
@@ -271,7 +284,7 @@ pub async fn generation_vdn_run(
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true);
     if request.backend == VdnBackend::Diffusers && request.offload_dit {
-        process.arg("--offload_dit");
+        process.arg("--offload-dit");
     }
     process.args(&fast_args);
     if request.fp8 { process.arg("--fp8"); }
@@ -337,15 +350,15 @@ pub async fn generation_vdn_run(
             "VDN worker failed: {}", brief_error(&stderr_path)
         )),
         Outcome::Cancelled => {
-            let _ = child.kill().await;
+            stop_vdn_worker(&mut child).await;
             Err("VDN generation cancelled".into())
         },
         Outcome::TimedOut => {
-            let _ = child.kill().await;
+            stop_vdn_worker(&mut child).await;
             Err("VDN inference exceeded the four-hour limit".into())
         },
         Outcome::RightsRevoked(reason) => {
-            let _ = child.kill().await;
+            stop_vdn_worker(&mut child).await;
             Err(format!("VDN license no longer permits inference: {reason}"))
         },
     };
@@ -366,20 +379,27 @@ pub async fn generation_vdn_run(
 pub async fn generation_vdn_probe(
     app: AppHandle,
     python_executable: String,
+    backend: VdnBackend,
+    repo_root: Option<String>,
+    checkpoint_root: Option<String>,
+    gpu_class: Option<String>,
+    server_port: Option<u16>,
 ) -> Result<serde_json::Value, String> {
     let python = Path::new(&python_executable).canonicalize()
         .map_err(|_| "Choose a real Python executable in the OpenVDN environment")?;
     if !python.is_file() {
         return Err("VDN Python executable is not a file".into());
     }
+    let extra = worker_args(backend, repo_root.as_deref(),
+        checkpoint_root.as_deref(), gpu_class.as_deref(), server_port)?;
     let dir = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-vdn-h3");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let script = dir.join(format!(".vdn-probe-{}.py", uuid::Uuid::new_v4()));
-    std::fs::write(&script, WORKER).map_err(|error| error.to_string())?;
+    std::fs::write(&script, worker_source(backend)).map_err(|error| error.to_string())?;
     let outcome = async {
         let mut cmd = tokio::process::Command::new(python);
-        cmd.arg("-u").arg(&script).arg("--probe")
+        cmd.arg("-u").arg(&script).arg("--probe").args(&extra)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .kill_on_drop(true);
