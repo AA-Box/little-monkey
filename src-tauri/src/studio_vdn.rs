@@ -275,6 +275,44 @@ pub async fn generation_vdn_run(
     result
 }
 
+/// Real preflight of the chosen Python/CUDA environment, without downloading
+/// the restricted weights or invoking any Hugging Face remote model code.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn generation_vdn_probe(
+    app: AppHandle,
+    python_executable: String,
+) -> Result<serde_json::Value, String> {
+    let python = Path::new(&python_executable).canonicalize()
+        .map_err(|_| "Choose a real Python executable in the OpenVDN environment")?;
+    if !python.is_file() {
+        return Err("VDN Python executable is not a file".into());
+    }
+    let dir = app.profile_data_dir().map_err(|error| error.to_string())?
+        .join("studio-vdn-h3");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let script = dir.join(format!(".vdn-probe-{}.py", uuid::Uuid::new_v4()));
+    std::fs::write(&script, WORKER).map_err(|error| error.to_string())?;
+    let outcome = async {
+        let mut cmd = tokio::process::Command::new(python);
+        cmd.arg("-u").arg(&script).arg("--probe")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(90), cmd.output())
+            .await.map_err(|_| "VDN environment probe timed out".to_string())?
+            .map_err(|error| format!("Cannot probe the Python environment: {error}"))?;
+        if !output.status.success() {
+            let details = String::from_utf8_lossy(&output.stderr);
+            let last = details.lines().last().unwrap_or("The OpenVDN runtime was not available");
+            return Err(last.chars().take(350).collect());
+        }
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .map_err(|_| "VDN environment returned no valid capability report".to_string())
+    }.await;
+    let _ = std::fs::remove_file(&script);
+    outcome
+}
+
 #[tauri::command]
 pub fn generation_vdn_cancel(job_id: String) -> Result<bool, String> {
     let jobs = running().lock().map_err(|error| error.to_string())?;
