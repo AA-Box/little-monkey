@@ -337,6 +337,18 @@ fn gallery_source_artifact(app: &AppHandle, entry_id: &str) -> Result<Generation
     Ok(entry)
 }
 
+/// Persisted gallery inputs are pinned to an artifact when submitted.
+/// Rejecting a replacement is essential for deterministic retries: a reused
+/// gallery ID must not silently switch source media between executions.
+fn verify_source_artifact(job: &VideoJob, entry: &GenerationEntry) -> Result<(), String> {
+    if let Some(expected) = job.source_artifact_id.as_deref() {
+        if expected != entry.artifact_id {
+            return Err("Source video changed since the job was submitted; refusing to render different media on retry".into());
+        }
+    }
+    Ok(())
+}
+
 /// FFmpeg's image2 -update 1 overwrites one PNG for every decoded input frame.
 /// The final PNG is therefore the decoded last frame rather than a thumbnail.
 pub(crate) async fn extract_final_frame(app: &AppHandle, media: &[u8], mime: &str) -> Result<String, String> {
@@ -423,6 +435,7 @@ async fn prepared_request(app: &AppHandle, job: &VideoJob) -> Result<GenerationR
     } else {
         return Err("No video source selected".into());
     };
+    verify_source_artifact(job, &entry)?;
     let base = app.profile_data_dir().map_err(|error| error.to_string())?;
     let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
         base.join("content-v1"), MAX_HANDOFF_VIDEO_BYTES as u64
@@ -569,16 +582,19 @@ pub fn generation_video_submit(
     if source.is_some() && request.init_image_base64.is_some() {
         return Err("A chained video cannot also supply another starting frame".into());
     }
-    if let Some(entry_id) = source_gallery_entry_id.as_deref() {
+    let pinned_gallery_artifact = if let Some(entry_id) = source_gallery_entry_id.as_deref() {
         if source.is_some() || !depends_on.is_empty() || request.init_image_base64.is_some() {
             return Err("A gallery continuation cannot mix job dependencies or another starting frame".into());
         }
         if request.task != GenerationTask::ImageToVideo {
             return Err("Gallery continuation requires an image-to-video model".into());
         }
-        // Validate the publication and MIME before committing a durable job.
-        gallery_source_artifact(&app, entry_id)?;
-    }
+        // Resolve the immutable content hash before journaling, not only when
+        // a queued worker finally starts. This pins the input across restarts.
+        Some(gallery_source_artifact(&app, entry_id)?.artifact_id)
+    } else {
+        None
+    };
     let result = {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
         let dir = directory(&app)?;
@@ -587,7 +603,8 @@ pub fn generation_video_submit(
         if let Some(old) = jobs.iter().find(|job| job.idempotency_key == idempotency_key) {
             if !same_effective_request(&old.request, &request)
                 || old.depends_on != depends_on || old.source_job_id != source
-                || old.source_gallery_entry_id != source_gallery_entry_id {
+                || old.source_gallery_entry_id != source_gallery_entry_id
+                || (pinned_gallery_artifact.is_some() && old.source_artifact_id != pinned_gallery_artifact) {
                 return Err("Video idempotency key already belongs to a different request".to_string());
             }
             VideoJobView::from(old)
@@ -607,7 +624,7 @@ pub fn generation_video_submit(
                 depends_on,
                 source_job_id: source,
                 source_gallery_entry_id: source_gallery_entry_id,
-                source_artifact_id: None,
+                source_artifact_id: pinned_gallery_artifact,
                 request: pin_seed(request),
                 status: VideoJobStatus::Queued,
                 stage: VideoJobStage::WaitingForDependencies,
@@ -797,6 +814,39 @@ mod tests {
         let mut sourced = restored;
         sourced.source_gallery_entry_id = Some("gallery-clip".into());
         assert_eq!(serde_json::to_value(&sourced).unwrap()["sourceGalleryEntryId"], "gallery-clip");
+    }
+
+    #[test]
+    fn pinned_gallery_source_refuses_replacement_on_retry() {
+        let mut job = example("job", VideoJobStatus::Queued, vec![]);
+        job.source_gallery_entry_id = Some("source".into());
+        job.source_artifact_id = Some("a".repeat(64));
+        let mut source = GenerationEntry {
+            entry_id: "source".into(),
+            artifact_id: "a".repeat(64),
+            video_job_id: None,
+            model_id: "test".into(),
+            task: GenerationTask::TextToVideo,
+            prompt: String::new(),
+            negative_prompt: String::new(),
+            media_type: "video/mp4".into(),
+            size_bytes: 10,
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 1.0,
+            seed: 1,
+            frame_count: 1,
+            fps: 1,
+            duration_ms: 1000,
+            created_at_ms: 1,
+        };
+        assert!(verify_source_artifact(&job, &source).is_ok());
+        source.artifact_id = "b".repeat(64);
+        assert!(verify_source_artifact(&job, &source).is_err());
+        // Old journals without a pinned digest remain readable.
+        job.source_artifact_id = None;
+        assert!(verify_source_artifact(&job, &source).is_ok());
     }
 
     #[test]
