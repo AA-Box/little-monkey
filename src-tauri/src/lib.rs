@@ -2115,6 +2115,7 @@ pub fn run() {
             generation_commands::generation_vdn_accept_terms,
             generation_commands::generation_vdn_license_status,
             studio_vdn::generation_vdn_run,
+            studio_vdn::generation_vdn_probe,
             studio_vdn::generation_vdn_cancel,
             generation_commands::generation_set_hugging_face_token,
             generation_commands::generation_download_model,
