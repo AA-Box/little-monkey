@@ -116,7 +116,7 @@ export function VideoTimelinePanel({ jobs }: { jobs: VideoJob[] }) {
     <section className="mt-3 rounded-lg border border-border bg-surface p-3" aria-label="Video timeline editor">
       <h3 className="text-xs font-semibold">Timeline and MP4 export</h3>
       <p className="mt-1 text-[11px] text-muted">
-        Arrange native or FreeVideo/ComfyUI gallery clips, trim and optionally add a soundtrack.
+        Arrange native or optional external workflows gallery clips, trim and optionally add a soundtrack.
         Export waits for unfinished clips, preserves their audio (or replaces it with your soundtrack), and publishes one MP4 using FFmpeg.
       </p>
       <label className="mt-3 grid gap-1 text-[11px] text-muted">
