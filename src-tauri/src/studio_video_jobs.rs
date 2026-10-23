@@ -443,7 +443,7 @@ async fn prepared_request(app: &AppHandle, job: &VideoJob) -> Result<GenerationR
     let mut request = job.request.clone();
     if let Some(target_id) = job.target_gallery_image_entry_id.as_deref() {
         let target = gallery_target_image(app, target_id)?;
-        if job.target_artifact_id.as_deref().is_some_and(|hash| hash != target.artifact_id) {
+        if job.target_artifact_id.as_deref().is_some_and(|hash| hash != target.artifact_id.as_str()) {
             return Err("The target ending frame changed since submission".into());
         }
         let root = app.profile_data_dir().map_err(|error| error.to_string())?;
