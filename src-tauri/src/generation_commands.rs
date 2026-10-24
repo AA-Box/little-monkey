@@ -713,10 +713,14 @@ pub(crate) fn publish_vdn_video(
     first_keyframe: bool,
     bytes: &[u8],
 ) -> Result<GenerationEntry, String> {
+    let _gallery_guard = gallery_write_lock()
+        .lock()
+        .map_err(|error| error.to_string())?;
     let blob = artifacts(app)?.put(bytes).map_err(|error| error.to_string())?;
     let entry = GenerationEntry {
         entry_id: format!("studio-{}", Uuid::new_v4()),
         artifact_id: blob.id,
+        video_job_id: None,
         model_id: "vdn-h3-diffusers".into(),
         task: if first_keyframe {
             generation::GenerationTask::ImageToVideo
