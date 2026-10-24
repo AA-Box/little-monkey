@@ -39,6 +39,7 @@ import { ModelFiles } from "./ModelFiles";
 import { SettingsCard } from "./SettingsCard";
 import type { StudioMode } from "./StudioNav";
 import { ToolPanel } from "./ToolPanel";
+import { VideoJobsPanel } from "./VideoJobsPanel";
 import { useT } from "../../lib/i18n";
 import { MAX_STUDIO_QUEUE, useStudioRunStore } from "../../store/studioRunStore";
 import { useRuntimeHubStore } from "../../store/runtimeHubStore";
@@ -1710,6 +1711,8 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
         </div>
       </section>
       ) : null}
+
+      {mode === "video" && <VideoJobsPanel />}
 
       {/* The canvas keeps the prompt, the button and the result together where
           the work happens. The rail of controls that used to sit beside it is

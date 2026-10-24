@@ -48,6 +48,9 @@ pub mod runtime_adapter;
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
 pub(crate) mod generation_commands;
+pub(crate) mod studio_wan_preset;
+mod studio_video_jobs;
+mod studio_video_timeline;
 pub(crate) mod studio_model_policy;
 pub(crate) mod studio_minimax_entitlement;
 pub(crate) mod studio_vdn;
@@ -1343,6 +1346,12 @@ pub fn run() {
             // commands keep it in sync as the catalog changes.
             knowledge_service::sync_watched_folder_watchers(app.handle());
 
+            // Recover Studio's persistent video journal *after* managed
+            // runtimes were materialized and profile restore was recovered.
+            // No Studio window, tab, or listing IPC is needed to dispatch.
+            studio_video_jobs::start_background_recovery(app.handle().clone());
+            studio_video_timeline::start_background_recovery(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2106,6 +2115,7 @@ pub fn run() {
             generation_commands::generation_engine_status,
             generation_commands::generation_models,
             generation_commands::generation_add_model,
+            generation_commands::generation_register_wan22,
             generation_commands::generation_remove_model,
             generation_commands::generation_accept_license,
             generation_commands::generation_license_region,
@@ -2130,6 +2140,15 @@ pub fn run() {
             generation_commands::generation_add_backend,
             generation_commands::generation_remove_backend,
             generation_commands::generation_run,
+            studio_video_jobs::generation_video_submit,
+            studio_video_jobs::generation_video_jobs,
+            studio_video_jobs::generation_video_resume,
+            studio_video_jobs::generation_video_cancel,
+            studio_video_jobs::generation_video_continue,
+            studio_video_timeline::generation_video_timeline_submit,
+            studio_video_timeline::generation_video_timelines,
+            studio_video_timeline::generation_video_timeline_retry,
+            studio_video_timeline::generation_video_timeline_cancel,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
             generation_commands::generation_delete_entry,
