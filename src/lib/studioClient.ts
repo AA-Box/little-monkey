@@ -231,6 +231,8 @@ export interface GenerationModel {
 }
 
 /** Standalone, authorized CUDA VDN-H3 inference (no FreeVideo/ComfyUI). */
+export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang";
+
 export interface VdnGenerationRequest {
   jobId: string;
   pythonExecutable: string;
@@ -242,6 +244,11 @@ export interface VdnGenerationRequest {
   lastImagePath: string | null;
   fp8: boolean;
   offloadDit: boolean;
+  backend: VdnBackend;
+  repoRoot: string | null;
+  checkpointRoot: string | null;
+  gpuClass: "h200" | "b200" | null;
+  serverPort: number | null;
   acknowledgeThirdPartyCode: boolean;
 }
 
@@ -654,10 +661,15 @@ export const studioClient = {
   vdnAcceptTerms: () => invoke<void>("generation_vdn_accept_terms"),
   vdnRun: (request: VdnGenerationRequest) =>
     invoke<GenerationEntry>("generation_vdn_run", { request }),
-  vdnProbe: (pythonExecutable: string) =>
-    invoke<{status: string; model: string; device: string; computeCapability: string;
-      vramBytes: number; torch: string; fp8Supported: boolean}>(
-      "generation_vdn_probe", { pythonExecutable }
+  vdnProbe: (
+    pythonExecutable: string, backend: VdnBackend, repoRoot: string | null,
+    checkpointRoot: string | null, gpuClass: "h200" | "b200" | null,
+    serverPort: number | null,
+  ) => invoke<{status?: string; phase?: string; backend: string; model: string;
+    device?: string; computeCapability?: string; vramBytes?: number;
+    torch?: string; fp8Supported?: boolean; visibleGpuCount?: number; port?: number}>(
+      "generation_vdn_probe",
+      { pythonExecutable, backend, repoRoot, checkpointRoot, gpuClass, serverPort }
     ),
   vdnCancel: (jobId: string) => invoke<boolean>("generation_vdn_cancel", { jobId }),
   setHuggingFaceToken: (modelId: string, token: string) =>

@@ -21,6 +21,68 @@ const MAX_VIDEO_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOG_BYTES: u64 = 256 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
+const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
+
+/// An independent real rendering runtime. Each shares licensing, cancellation
+/// and gallery storage; none is implemented by relabeling the Diffusers mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VdnBackend {
+    #[default]
+    Diffusers,
+    OptimizedSingle,
+    OptimizedUlysses,
+    Sglang,
+}
+
+fn worker_source(backend: VdnBackend) -> &'static str {
+    match backend {
+        VdnBackend::Diffusers => WORKER,
+        _ => FAST_WORKER,
+    }
+}
+
+fn worker_args(
+    backend: VdnBackend, repo_root: Option<&str>, checkpoint_root: Option<&str>,
+    gpu_class: Option<&str>, server_port: Option<u16>,
+) -> Result<Vec<String>, String> {
+    if backend == VdnBackend::Diffusers { return Ok(Vec::new()); }
+    let mut args = vec!["--backend".into(), match backend {
+        VdnBackend::OptimizedSingle => "optimized_single",
+        VdnBackend::OptimizedUlysses => "optimized_ulysses",
+        VdnBackend::Sglang => "sglang",
+        VdnBackend::Diffusers => unreachable!(),
+    }.into()];
+    if backend == VdnBackend::Sglang {
+        let port = server_port.unwrap_or(30010);
+        if port == 0 { return Err("SGLang must have a nonzero loopback port".into()); }
+        args.extend(["--port".into(), port.to_string()]);
+    } else {
+        if !cfg!(target_os = "linux") {
+            return Err("Native tuned OpenVDN inference currently requires Linux CUDA; use Diffusers or Wan on this host".into());
+        }
+        let root = repo_root.ok_or("Select the original OpenVDN source checkout")?;
+        let ckpt = checkpoint_root.ok_or("Select the official OpenVDN weights directory")?;
+        let root = Path::new(root).canonicalize()
+            .map_err(|_| "OpenVDN source checkout does not exist")?;
+        let ckpt = Path::new(ckpt).canonicalize()
+            .map_err(|_| "OpenVDN checkpoint directory does not exist")?;
+        if !root.is_dir() || !ckpt.is_dir() {
+            return Err("OpenVDN source and checkpoint roots must both exist".into());
+        }
+        args.extend(["--repo-root".into(), root.to_string_lossy().into_owned(),
+                     "--checkpoint-root".into(), ckpt.to_string_lossy().into_owned()]);
+        if backend == VdnBackend::OptimizedUlysses {
+            let gpu = gpu_class.unwrap_or("h200");
+            if gpu != "h200" && gpu != "b200" {
+                return Err("Native Ulysses has only H200 and B200 validated profiles".into());
+            }
+            args.extend(["--gpus".into(), "8".into(), "--gpu-class".into(), gpu.into()]);
+        }
+    }
+    Ok(args)
+}
+
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +97,16 @@ pub struct VdnRunRequest {
     pub last_image_path: Option<String>,
     pub fp8: bool,
     pub offload_dit: bool,
+    #[serde(default)]
+    pub backend: VdnBackend,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    #[serde(default)]
+    pub checkpoint_root: Option<String>,
+    #[serde(default)]
+    pub gpu_class: Option<String>,
+    #[serde(default)]
+    pub server_port: Option<u16>,
     /// The official modular VDN component executes code downloaded from HF.
     /// Do not do that without explicit per-invocation user confirmation.
     pub acknowledge_third_party_code: bool,
@@ -107,6 +179,9 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         || (request.frames - 5) % 17 != 0 {
         return Err("VDN requires 1-50 inference steps and 17n+5 frames in 120..360".into());
     }
+    if request.backend != VdnBackend::Diffusers && request.steps != 8 {
+        return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
+    }
     if request.seed < 0 {
         return Err("VDN seed must be nonnegative".into());
     }
@@ -143,6 +218,19 @@ fn brief_error(path: &Path) -> String {
     compact.chars().take(400).collect()
 }
 
+/// Terminate worker children (torchrun process groups) before killing the wrapper.
+async fn stop_vdn_worker(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Python worker forwards SIGTERM to its CUDA/torchrun process group.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+        if tokio::time::timeout(Duration::from_secs(12), child.wait()).await.is_ok() {
+            return;
+        }
+    }
+    let _ = child.kill().await;
+}
+
 #[tauri::command]
 pub async fn generation_vdn_run(
     app: AppHandle,
@@ -151,6 +239,11 @@ pub async fn generation_vdn_run(
     // The check precedes ALL subprocess execution and Hugging Face downloads.
     crate::generation_commands::ensure_vdn_usage(&app)?;
     let (python, first, last) = validate_request(&request)?;
+    let fast_args = worker_args(
+        request.backend, request.repo_root.as_deref(),
+        request.checkpoint_root.as_deref(),
+        request.gpu_class.as_deref(), request.server_port,
+    )?;
     let (cancel, _registration) = register(&request.job_id)?;
     let directory = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-vdn-h3");
@@ -159,7 +252,8 @@ pub async fn generation_vdn_run(
     // errors and cross-job mutation of a script already executing.
     let source = directory.join(format!("studio-vdn-h3-worker-{}.py", request.job_id));
     let staging = directory.join(format!(".worker-{}.tmp", request.job_id));
-    std::fs::write(&staging, WORKER).map_err(|error| error.to_string())?;
+    std::fs::write(&staging, worker_source(request.backend))
+        .map_err(|error| error.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -183,12 +277,16 @@ pub async fn generation_vdn_run(
         .arg("--steps").arg(request.steps.to_string())
         .arg("--frames").arg(request.frames.to_string())
         .arg("--seed").arg(request.seed.to_string())
-        .arg("--offload-dit").arg("--device").arg("cuda")
+        .arg("--device").arg("cuda")
         .current_dir(&directory)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true);
+    if request.backend == VdnBackend::Diffusers && request.offload_dit {
+        process.arg("--offload-dit");
+    }
+    process.args(&fast_args);
     if request.fp8 { process.arg("--fp8"); }
     if let Some(ref image) = first { process.arg("--first").arg(image); }
     if let Some(ref image) = last { process.arg("--last").arg(image); }
@@ -252,15 +350,15 @@ pub async fn generation_vdn_run(
             "VDN worker failed: {}", brief_error(&stderr_path)
         )),
         Outcome::Cancelled => {
-            let _ = child.kill().await;
+            stop_vdn_worker(&mut child).await;
             Err("VDN generation cancelled".into())
         },
         Outcome::TimedOut => {
-            let _ = child.kill().await;
+            stop_vdn_worker(&mut child).await;
             Err("VDN inference exceeded the four-hour limit".into())
         },
         Outcome::RightsRevoked(reason) => {
-            let _ = child.kill().await;
+            stop_vdn_worker(&mut child).await;
             Err(format!("VDN license no longer permits inference: {reason}"))
         },
     };
@@ -281,20 +379,27 @@ pub async fn generation_vdn_run(
 pub async fn generation_vdn_probe(
     app: AppHandle,
     python_executable: String,
+    backend: VdnBackend,
+    repo_root: Option<String>,
+    checkpoint_root: Option<String>,
+    gpu_class: Option<String>,
+    server_port: Option<u16>,
 ) -> Result<serde_json::Value, String> {
     let python = Path::new(&python_executable).canonicalize()
         .map_err(|_| "Choose a real Python executable in the OpenVDN environment")?;
     if !python.is_file() {
         return Err("VDN Python executable is not a file".into());
     }
+    let extra = worker_args(backend, repo_root.as_deref(),
+        checkpoint_root.as_deref(), gpu_class.as_deref(), server_port)?;
     let dir = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-vdn-h3");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let script = dir.join(format!(".vdn-probe-{}.py", uuid::Uuid::new_v4()));
-    std::fs::write(&script, WORKER).map_err(|error| error.to_string())?;
+    std::fs::write(&script, worker_source(backend)).map_err(|error| error.to_string())?;
     let outcome = async {
         let mut cmd = tokio::process::Command::new(python);
-        cmd.arg("-u").arg(&script).arg("--probe")
+        cmd.arg("-u").arg(&script).arg("--probe").args(&extra)
             .current_dir(&dir)
             .stdin(Stdio::null())
             .kill_on_drop(true);
@@ -324,6 +429,27 @@ pub fn generation_vdn_cancel(job_id: String) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_engine_selector_never_falls_through_to_unlicensed_diffusers() {
+        assert_eq!(worker_source(VdnBackend::Diffusers), WORKER);
+        assert_eq!(worker_source(VdnBackend::OptimizedSingle), FAST_WORKER);
+        assert_eq!(worker_source(VdnBackend::OptimizedUlysses), FAST_WORKER);
+        assert_eq!(worker_source(VdnBackend::Sglang), FAST_WORKER);
+        let sglang = worker_args(VdnBackend::Sglang, None, None, None, Some(30010)).unwrap();
+        assert!(sglang.windows(2).any(|pair| pair == ["--backend", "sglang"]));
+        assert!(sglang.windows(2).any(|pair| pair == ["--port", "30010"]));
+        assert!(worker_args(VdnBackend::Sglang, None, None, None, Some(0)).is_err());
+        assert!(worker_args(VdnBackend::OptimizedSingle, None, None, None, None).is_err());
+        assert!(worker_args(VdnBackend::OptimizedUlysses, None, None, Some("invalid"), None).is_err());
+    }
+
+    #[test]
+    fn vdn_backend_serde_rejects_unknown_instead_of_running_a_default_engine() {
+        let parsed: VdnBackend = serde_json::from_str("\"optimized_ulysses\"").unwrap();
+        assert_eq!(parsed, VdnBackend::OptimizedUlysses);
+        assert!(serde_json::from_str::<VdnBackend>("\"arbitrary_remote\"").is_err());
+    }
 
     #[test]
     fn only_actual_mp4_brand_is_published() {
@@ -357,6 +483,11 @@ mod tests {
             last_image_path: None,
             fp8: false,
             offload_dit: true,
+            backend: VdnBackend::Diffusers,
+            repo_root: None,
+            checkpoint_root: None,
+            gpu_class: None,
+            server_port: None,
             acknowledge_third_party_code: false,
         };
         assert!(validate_request(&invalid).is_err());
