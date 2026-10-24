@@ -216,6 +216,9 @@ export interface GenerationModel {
   totalBytes: number;
   missingBytes: number;
   licenseAccepted: boolean;
+  /** True only when the backend authorizes use in the declared territory. */
+  licenseEligible?: boolean;
+  licenseBlockReason?: string | null;
   fitsInMemory: boolean;
 }
 
@@ -570,6 +573,14 @@ export const studioClient = {
     invoke<void>("generation_remove_model", { modelId }),
   acceptLicense: (licenseId: string) =>
     invoke<void>("generation_accept_license", { licenseId }),
+  licenseRegion: () =>
+    invoke<"eu" | "uk" | "us" | "kr" | "other" | null>("generation_license_region"),
+  setLicenseRegion: (region: "eu" | "uk" | "us" | "kr" | "other") =>
+    invoke<void>("generation_set_license_region", { region, acknowledged: true }),
+  importMinimaxEntitlement: (grantJson: string) =>
+    invoke<void>("generation_import_minimax_entitlement", { grantJson }),
+  clearMinimaxEntitlement: () =>
+    invoke<void>("generation_clear_minimax_entitlement"),
   setHuggingFaceToken: (modelId: string, token: string) =>
     invoke<void>("generation_set_hugging_face_token", { modelId, token }),
   downloadModel: (modelId: string) =>
