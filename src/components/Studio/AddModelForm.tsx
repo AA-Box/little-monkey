@@ -17,6 +17,7 @@ import {
   setLaunchFlag,
   studioClient,
   type GenerationEngineKind,
+  type VideoMemoryProfile,
   type GenerationModelSpec,
   type GenerationTask,
   type ModelComponent,
@@ -400,6 +401,32 @@ export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModel
             </select>
           </label>
         </div>
+      )}
+
+      {spec.engine === "stable_diffusion_cpp" &&
+        spec.tasks.some((task) => task === "text_to_video" || task === "image_to_video") && (
+        <label className="grid gap-1 text-[11px] text-muted">
+          Native video memory profile
+          <select
+            aria-label="Native video memory profile"
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.videoMemoryProfile ?? "default"}
+            onChange={(event) =>
+              patch({ videoMemoryProfile: event.target.value as VideoMemoryProfile })
+            }
+          >
+            <option value="default">Existing behavior (no extra flags)</option>
+            <option value="maximum_speed">Maximum speed / sufficient VRAM</option>
+            <option value="adaptive_vram">Adaptive GPU budget + CPU weight streaming</option>
+            <option value="minimum_ram">Minimum RAM / disk-backed model weights</option>
+          </select>
+          <span className="text-faint">
+            Applied when the managed native sd-server starts. Adaptive mode enables
+            its built-in automatic graph segmentation, asynchronous segment prefetch
+            and spatial/temporal VAE tiling; minimum-RAM mode uses a disk-backed
+            diffusion weight source and may be much slower.
+          </span>
+        </label>
       )}
 
       {/* Canvas size, steps, guidance and sampler are per-generation and live
