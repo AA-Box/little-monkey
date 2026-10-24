@@ -124,6 +124,8 @@ pub struct GenerationModelView {
 pub struct GenerationEntry {
     pub entry_id: String,
     pub artifact_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_job_id: Option<String>,
     pub model_id: String,
     pub task: generation::GenerationTask,
     pub prompt: String,
@@ -214,6 +216,60 @@ fn model_root(app: &AppHandle) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("Failed to create {}: {error}", dir.display()))?;
     Ok(dir)
+}
+
+/// Every local Studio publisher participates in this short-lived write lock,
+/// including the timeline compositor and imported ComfyUI workflow results.
+pub(crate) fn gallery_write_lock() -> &'static Mutex<()> {
+    static GALLERY_WRITE: OnceLock<Mutex<()>> = OnceLock::new();
+    GALLERY_WRITE.get_or_init(|| Mutex::new(()))
+}
+
+/// The output is already encoded; this publishes exactly once by timeline id.
+/// A crash after gallery commit and before timeline journal completion is
+/// recovered from the gallery rather than re-encoding and duplicating it.
+pub(crate) fn publish_timeline_export(
+    app: &AppHandle,
+    timeline: &crate::studio_video_timeline::VideoTimeline,
+    clips: &[GenerationEntry],
+    media: &[u8],
+    canvas: (u32, u32),
+    duration_ms: u64,
+) -> Result<GenerationEntry, String> {
+    let _guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
+    let model_id = format!("studio:timeline:{}", timeline.id);
+    let mut gallery: Vec<GenerationEntry> = read_state(app, GALLERY_FILE)?;
+    if let Some(existing) = gallery.iter().find(|entry| entry.model_id == model_id) {
+        return Ok(existing.clone());
+    }
+    let blob = artifacts(app)?.put(media).map_err(|error| error.to_string())?;
+    let first = clips.first().ok_or("Timeline has no published segments")?;
+    // FFprobe measured this final file. Imported ComfyUI gallery clips may
+    // have no source duration in their metadata, so summing those would lie.
+    let entry = GenerationEntry {
+        entry_id: format!("studio-{}", Uuid::new_v4()),
+        artifact_id: blob.id,
+        video_job_id: None,
+        model_id,
+        task: generation::GenerationTask::TextToVideo,
+        prompt: format!("Timeline: {}", timeline.title),
+        negative_prompt: String::new(),
+        media_type: "video/mp4".to_string(),
+        size_bytes: blob.size,
+        width: canvas.0,
+        height: canvas.1,
+        steps: 0,
+        cfg_scale: 0.0,
+        seed: -1,
+        frame_count: (duration_ms.saturating_mul(24) / 1000).min(u64::from(u32::MAX)) as u32,
+        fps: 24,
+        duration_ms,
+        created_at_ms: now_ms(),
+    };
+    gallery.push(entry.clone());
+    gallery.sort_by_key(|item| item.created_at_ms);
+    write_state(app, GALLERY_FILE, &gallery)?;
+    Ok(entry)
 }
 
 fn artifacts(app: &AppHandle) -> Result<ArtifactStore, String> {
@@ -1144,6 +1200,43 @@ pub async fn generation_run(
     m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
     request: GenerationRequest,
 ) -> Result<Vec<GenerationEntry>, String> {
+    if request.task.is_video() {
+        return Err("Use generation_video_submit for durable video jobs".to_string());
+    }
+    // Background video recovery and ordinary Studio generation share the same
+    // native engine. Never allow an image run to relaunch the engine while a
+    // recovered clip is sampling.
+    let _engine_guard = crate::studio_video_jobs::engine_gate().lock().await;
+    generation_run_impl(app, state, m3, request, None).await
+}
+
+/// Internal worker path. The gallery write is the durable publication
+/// checkpoint; retrying a job never renders twice after it was published.
+pub(crate) async fn generation_run_with_job(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
+    request: GenerationRequest,
+    job_id: &str,
+) -> Result<Vec<GenerationEntry>, String> {
+    generation_run_impl(app, state, m3, request, Some(job_id)).await
+}
+
+async fn generation_run_impl(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
+    request: GenerationRequest,
+    video_job_id: Option<&str>,
+) -> Result<Vec<GenerationEntry>, String> {
+    if let Some(id) = video_job_id {
+        let previous: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
+        let already_published: Vec<_> = previous.into_iter()
+            .filter(|entry| entry.video_job_id.as_deref() == Some(id)).collect();
+        if !already_published.is_empty() {
+            return Ok(already_published);
+        }
+    }
     // A remote backend has no library entry to look up, no components to
     // override and no engine to launch, so it forks before all three rather
     // than threading an "is it local" flag through them.
@@ -1199,6 +1292,7 @@ pub async fn generation_run(
         entries.push(GenerationEntry {
             entry_id: format!("studio-{}", Uuid::new_v4()),
             artifact_id: blob.id,
+            video_job_id: video_job_id.map(str::to_string),
             model_id: model_id.clone(),
             task: request.task,
             prompt: request.prompt.clone(),
@@ -1221,6 +1315,7 @@ pub async fn generation_run(
         });
     }
 
+    let _gallery_guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
     gallery.extend(entries.iter().cloned());
     gallery.sort_by_key(|item| item.created_at_ms);
@@ -1427,6 +1522,7 @@ pub fn generation_gallery(app: AppHandle) -> Result<Vec<GenerationEntry>, String
 /// feature ever starts deleting as well.
 #[tauri::command]
 pub fn generation_delete_entry(app: AppHandle, entry_id: String) -> Result<(), String> {
+    let _gallery_guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
     let Some(at) = gallery.iter().position(|entry| entry.entry_id == entry_id) else {
         return Err("That generation is not in the gallery".to_string());
@@ -1652,6 +1748,7 @@ pub async fn studio_tool_run(
         entries.push(GenerationEntry {
             entry_id: format!("studio-{}", Uuid::new_v4()),
             artifact_id: blob.id,
+            video_job_id: None,
             model_id: format!("tool:{tool_id}"),
             task,
             prompt: summary.clone(),
@@ -1670,6 +1767,7 @@ pub async fn studio_tool_run(
         });
     }
 
+    let _gallery_guard = gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let mut gallery: Vec<GenerationEntry> = read_state(&app, GALLERY_FILE)?;
     gallery.extend(entries.iter().cloned());
     gallery.sort_by_key(|item| item.created_at_ms);

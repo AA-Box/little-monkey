@@ -1,7 +1,7 @@
 import { create } from "zustand";
 
 import { errorMessage } from "../lib/errors";
-import { studioClient, type GenerationRequest } from "../lib/studioClient";
+import { isVideoTask, studioClient, type GenerationRequest } from "../lib/studioClient";
 
 /**
  * Studio's in-flight generations, held outside the panel that starts them.
@@ -26,6 +26,7 @@ export interface StudioQueueItem {
   /** What the user sees in the queue list — the run's prompt, trimmed. */
   label: string;
   request: GenerationRequest;
+  videoJobId?: string;
 }
 
 /** The active run's progress, as the engine last reported it. Phase codes are
@@ -102,8 +103,29 @@ async function drain(): Promise<void> {
       progress: { jobId: null, phase: "submitted", queuePosition: 0, percent: null, step: null, totalSteps: null },
     }));
     try {
-      await studioClient.run(next.request);
-      useStudioRunStore.setState((state) => ({ completions: state.completions + 1 }));
+      if (isVideoTask(next.request.task)) {
+        // Persist *before* sampling. The backend owns the render even if this
+        // webview is destroyed; reopening Studio recovers the durable ledger.
+        const job = await studioClient.videoSubmit(next.request, next.id);
+        useStudioRunStore.setState({ active: { ...next, videoJobId: job.id } });
+        if (stopped.has(next.id)) {
+          await studioClient.videoCancel(job.id);
+        }
+        for (;;) {
+          const latest = (await studioClient.videoJobs()).find((record) => record.id === job.id);
+          if (!latest) throw new Error("Durable video job disappeared");
+          if (latest.status === "completed") break;
+          if (latest.status === "failed" || latest.status === "interrupted" || latest.status === "cancelled") {
+            throw new Error(latest.error ?? `Video job ${latest.status}`);
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 1200));
+        }
+      } else {
+        await studioClient.run(next.request);
+      }
+      if (!stopped.has(next.id)) {
+        useStudioRunStore.setState((state) => ({ completions: state.completions + 1 }));
+      }
     } catch (reason) {
       if (!stopped.has(next.id)) {
         // Whatever refused this run — a missing weight, a bad size — refuses
@@ -147,6 +169,14 @@ export const useStudioRunStore = create<StudioRunStore>((set, get) => ({
       // sampling (`cancel_generating: false` in its capabilities), so stopping
       // a running generation means stopping the engine running it. That also
       // releases its weights, which is what the user wanted from a stop.
+      const current = get().active;
+      if (current && isVideoTask(current.request.task)) {
+        if (current.videoJobId) {
+          await studioClient.videoCancel(current.videoJobId);
+        }
+        // If submission is in progress, drain() cancels immediately on receipt.
+        return;
+      }
       const jobId = get().progress?.jobId;
       if (!jobId || !(await studioClient.cancel(jobId))) {
         await studioClient.unloadEngine();

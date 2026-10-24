@@ -1264,7 +1264,7 @@ pub struct HiresSettings {
 }
 
 /// One generation job's user-controlled inputs.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationRequest {
     pub model_id: String,
@@ -1318,6 +1318,10 @@ pub struct GenerationRequest {
     /// Base64 PNG/JPEG starting frame, required by the image-driven tasks.
     #[serde(default)]
     pub init_image_base64: Option<String>,
+    /// Optional native video target frame, decoded by sd-server as end_image.
+    /// Only supported by compatible video models through stable-diffusion.cpp.
+    #[serde(default)]
+    pub end_image_base64: Option<String>,
     /// Base64 single-channel mask over [`Self::init_image_base64`]: white is
     /// repainted, black is kept. This is inpainting — it is meaningless without
     /// an init image to mask, and [`validate_request`] enforces that rather
@@ -1559,6 +1563,7 @@ pub fn validate_request(
         }
         if request.hires.is_some()
             || request.mask_image_base64.is_some()
+            || request.end_image_base64.is_some()
             || request.control_image_base64.is_some()
             || request.ip_adapter_image_base64.is_some()
             || !request.ref_images_base64.is_empty()
@@ -1667,6 +1672,18 @@ pub fn validate_request(
             return Err("Source image exceeds its size limit".to_string())
         }
         _ => {}
+    }
+
+    if let Some(end_image) = &request.end_image_base64 {
+        if !request.task.is_video() {
+            return Err("End-frame conditioning is available only for video generation".into());
+        }
+        if spec.engine != GenerationEngineKind::StableDiffusionCpp {
+            return Err("The selected local video engine does not support an end-frame image".into());
+        }
+        if end_image.trim().is_empty() || end_image.len() > MAX_INIT_IMAGE_BYTES {
+            return Err("End-frame image is empty or exceeds its size limit".into());
+        }
     }
 
     // A mask names which pixels of the source image to repaint, so without one
@@ -1858,6 +1875,9 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
         body["increase_ref_index"] = json!(request.increase_ref_index);
     }
     if request.task.is_video() {
+        if let Some(end_image) = &request.end_image_base64 {
+            body["end_image"] = json!(end_image);
+        }
         body["video_frames"] = json!(request.video_frames);
         body["fps"] = json!(request.fps);
         body["output_format"] = json!("webm");
@@ -2991,6 +3011,7 @@ pub fn validate_remote_request(
     normalized.component_overrides.clear();
     normalized.hires = None;
     normalized.mask_image_base64 = None;
+    normalized.end_image_base64 = None;
     normalized.ad_prompt = None;
     normalized.ad_negative_prompt = None;
     normalized.control_image_base64 = None;
@@ -3165,6 +3186,7 @@ mod tests {
             speaker_file: None,
             language: None,
             init_image_base64: None,
+            end_image_base64: None,
             mask_image_base64: None,
             control_image_base64: None,
             control_strength: None,
@@ -3175,6 +3197,22 @@ mod tests {
             loras: Vec::new(),
             component_overrides: Vec::new(),
         }
+    }
+
+    #[test]
+    fn native_video_end_frame_reaches_real_vid_gen_request() {
+        let spec = video_model();
+        let mut request = video_request(GenerationTask::ImageToVideo);
+        request.init_image_base64 = Some("aW5pdA==".to_owned());
+        request.end_image_base64 = Some("ZW5k".to_owned());
+        let validated = validate_request(&spec, &request).unwrap();
+        let body = request_body(&spec, &validated);
+        assert_eq!(body["init_image"], "aW5pdA==");
+        assert_eq!(body["end_image"], "ZW5k");
+        assert_eq!(body["video_frames"], validated.video_frames);
+        let mut image = image_request(GenerationTask::TextToImage);
+        image.end_image_base64 = Some("ZW5k".to_owned());
+        assert!(validate_request(&image_model(), &image).is_err());
     }
 
     /// The registry is the user's, so validation is the only thing standing
