@@ -432,10 +432,10 @@ mod tests {
 
     #[test]
     fn rust_engine_selector_never_falls_through_to_unlicensed_diffusers() {
-        assert!(std::ptr::eq(worker_source(VdnBackend::Diffusers), WORKER));
-        assert!(std::ptr::eq(worker_source(VdnBackend::OptimizedSingle), FAST_WORKER));
-        assert!(std::ptr::eq(worker_source(VdnBackend::OptimizedUlysses), FAST_WORKER));
-        assert!(std::ptr::eq(worker_source(VdnBackend::Sglang), FAST_WORKER));
+        assert_eq!(worker_source(VdnBackend::Diffusers), WORKER);
+        assert_eq!(worker_source(VdnBackend::OptimizedSingle), FAST_WORKER);
+        assert_eq!(worker_source(VdnBackend::OptimizedUlysses), FAST_WORKER);
+        assert_eq!(worker_source(VdnBackend::Sglang), FAST_WORKER);
         let sglang = worker_args(VdnBackend::Sglang, None, None, None, Some(30010)).unwrap();
         assert!(sglang.windows(2).any(|pair| pair == ["--backend", "sglang"]));
         assert!(sglang.windows(2).any(|pair| pair == ["--port", "30010"]));
