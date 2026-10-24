@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 pub const MINIMAX_H3_LICENSE_URL: &str =
     "https://huggingface.co/OpenVDN/vdn-minimax-h3-edge/blob/main/LICENSE";
-const MINIMAX_H3_LICENSE_ID: &str = "minimax-h3-community-2026-08-02";
+pub const MINIMAX_H3_LICENSE_ID: &str = "minimax-h3-community-2026-08-02";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

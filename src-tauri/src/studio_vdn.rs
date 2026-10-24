@@ -1,0 +1,364 @@
+//! Standalone OpenVDN VDN-H3 generator (NOT FreeVideo/ComfyUI).
+//!
+//! A bounded, cancelable subprocess runs the published OpenVDN Diffusers
+//! ModularPipeline through a Little Monkey-owned Python worker, then stores
+//! the real MP4 in Studio's content-addressed Gallery. The license policy is
+//! checked before any Hugging Face model code or weights can load, at runtime,
+//! and before publication. Without a valid territorial grant it fails closed.
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio_util::sync::CancellationToken;
+use crate::profiles::ProfileScopedPaths;
+
+const MAX_PROMPT: usize = 8192;
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_VIDEO_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 256 * 1024;
+const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
+const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VdnRunRequest {
+    pub job_id: String,
+    pub python_executable: String,
+    pub prompt: String,
+    pub steps: u32,
+    pub frames: u32,
+    pub seed: i64,
+    pub first_image_path: Option<String>,
+    pub last_image_path: Option<String>,
+    pub fp8: bool,
+    pub offload_dit: bool,
+    /// The official modular VDN component executes code downloaded from HF.
+    /// Do not do that without explicit per-invocation user confirmation.
+    pub acknowledge_third_party_code: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VdnProgress<'a> {
+    job_id: &'a str,
+    phase: &'a str,
+    detail: &'a str,
+}
+
+fn running() -> &'static Mutex<HashMap<String, CancellationToken>> {
+    static RUNNING: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+    RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct RegisteredJob(String);
+impl Drop for RegisteredJob {
+    fn drop(&mut self) {
+        if let Ok(mut active) = running().lock() {
+            active.remove(&self.0);
+        }
+    }
+}
+
+fn register(id: &str) -> Result<(CancellationToken, RegisteredJob), String> {
+    let mut jobs = running().lock().map_err(|error| error.to_string())?;
+    if !jobs.is_empty() {
+        return Err("Another VDN-H3 generation is already running on this computer".into());
+    }
+    let cancellation = CancellationToken::new();
+    jobs.insert(id.to_string(), cancellation.clone());
+    Ok((cancellation, RegisteredJob(id.into())))
+}
+
+fn validate_image(path: &Option<String>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = path.as_deref() else { return Ok(None); };
+    let resolved = Path::new(path).canonicalize()
+        .map_err(|_| "Keyframe does not exist or cannot be read")?;
+    let info = std::fs::metadata(&resolved).map_err(|e| e.to_string())?;
+    if !info.is_file() || info.len() < 8 || info.len() > MAX_IMAGE_BYTES {
+        return Err("A first/last-frame image must be a readable PNG/JPEG of at most 32 MB".into());
+    }
+    let mut header = [0u8; 8];
+    use std::io::Read as _;
+    std::fs::File::open(&resolved).map_err(|e| e.to_string())?
+        .read_exact(&mut header).map_err(|e| e.to_string())?;
+    let png = header == [137,80,78,71,13,10,26,10];
+    let jpeg = header[0..3] == [255,216,255];
+    if !png && !jpeg {
+        return Err("VDN first/last frame must contain PNG or JPEG bytes".into());
+    }
+    Ok(Some(resolved))
+}
+
+fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>, Option<PathBuf>), String> {
+    uuid::Uuid::parse_str(&request.job_id)
+        .map_err(|_| "VDN job ID must be a UUID")?;
+    if request.prompt.trim().is_empty() || request.prompt.len() > MAX_PROMPT
+        || request.prompt.chars().any(|c| c == '\0') {
+        return Err("A nonempty VDN prompt of at most 8192 bytes is required".into());
+    }
+    if !request.acknowledge_third_party_code {
+        return Err("Confirm execution of the official upstream OpenVDN model component code".into());
+    }
+    if !(1..=50).contains(&request.steps)
+        || !(120..=360).contains(&request.frames)
+        || (request.frames - 5) % 17 != 0 {
+        return Err("VDN requires 1-50 inference steps and 17n+5 frames in 120..360".into());
+    }
+    if request.seed < 0 {
+        return Err("VDN seed must be nonnegative".into());
+    }
+    let python = Path::new(&request.python_executable).canonicalize()
+        .map_err(|_| "Choose the Python executable from the OpenVDN-compatible environment")?;
+    if !python.is_file() {
+        return Err("Python executable is not a file".into());
+    }
+    let first = validate_image(&request.first_image_path)?;
+    let last = validate_image(&request.last_image_path)?;
+    Ok((python, first, last))
+}
+
+fn valid_mp4(bytes: &[u8]) -> bool {
+    bytes.len() >= 32 && bytes.get(4..8) == Some(b"ftyp".as_slice())
+}
+
+fn read_last_phase(log: &Path) -> Option<String> {
+    let bytes = std::fs::read(log).ok()?;
+    if bytes.len() as u64 > MAX_LOG_BYTES {
+        return None;
+    }
+    let s = String::from_utf8(bytes).ok()?;
+    s.lines().filter_map(|line| {
+        let row: serde_json::Value = serde_json::from_str(line).ok()?;
+        row.get("phase")?.as_str().map(str::to_owned)
+    }).last()
+}
+
+fn brief_error(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let compact = text.lines().rev().find(|line| line.contains("reason"))
+        .unwrap_or_else(|| text.lines().last().unwrap_or("VDN worker failed"));
+    compact.chars().take(400).collect()
+}
+
+#[tauri::command]
+pub async fn generation_vdn_run(
+    app: AppHandle,
+    request: VdnRunRequest,
+) -> Result<crate::generation_commands::GenerationEntry, String> {
+    // The check precedes ALL subprocess execution and Hugging Face downloads.
+    crate::generation_commands::ensure_vdn_usage(&app)?;
+    let (python, first, last) = validate_request(&request)?;
+    let (cancel, _registration) = register(&request.job_id)?;
+    let directory = app.profile_data_dir().map_err(|error| error.to_string())?
+        .join("studio-vdn-h3");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    // A unique staged worker path avoids Windows rename-over-existing-file
+    // errors and cross-job mutation of a script already executing.
+    let source = directory.join(format!("studio-vdn-h3-worker-{}.py", request.job_id));
+    let staging = directory.join(format!(".worker-{}.tmp", request.job_id));
+    std::fs::write(&staging, WORKER).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(&staging, &source).map_err(|error| error.to_string())?;
+    let output = directory.join(format!("{}.mp4", request.job_id));
+    let stdout_path = directory.join(format!("{}.stdout", request.job_id));
+    let stderr_path = directory.join(format!("{}.stderr", request.job_id));
+    // Clear leftovers from an interrupted run, but never touch other jobs.
+    for path in [&output, &stdout_path, &stderr_path] {
+        let _ = std::fs::remove_file(path);
+    }
+    let stdout = std::fs::File::create(&stdout_path).map_err(|e| e.to_string())?;
+    let stderr = std::fs::File::create(&stderr_path).map_err(|e| e.to_string())?;
+    let mut process = tokio::process::Command::new(python);
+    process.arg("-u").arg(&source)
+        .arg("--prompt").arg(&request.prompt)
+        .arg("--output").arg(&output)
+        .arg("--steps").arg(request.steps.to_string())
+        .arg("--frames").arg(request.frames.to_string())
+        .arg("--seed").arg(request.seed.to_string())
+        .arg("--offload-dit").arg("--device").arg("cuda")
+        .current_dir(&directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .kill_on_drop(true);
+    if request.fp8 { process.arg("--fp8"); }
+    if let Some(ref image) = first { process.arg("--first").arg(image); }
+    if let Some(ref image) = last { process.arg("--last").arg(image); }
+    let mut child = process.spawn().map_err(|error|
+        format!("Could not start the installed Python VDN environment: {error}"))?;
+    let _ = app.emit("studio://vdn-progress", VdnProgress {
+        job_id: &request.job_id, phase: "running", detail: "OpenVDN model loading",
+    });
+
+    enum Outcome { Completed(std::process::ExitStatus), Cancelled, TimedOut, RightsRevoked(String) }
+    let mut health = tokio::time::interval(Duration::from_secs(3));
+    let expiry = tokio::time::sleep(MAX_DURATION);
+    tokio::pin!(expiry);
+    let outcome = loop {
+        let event = tokio::select! {
+            finished = child.wait() => Outcome::Completed(
+                finished.map_err(|error| format!("VDN process wait failed: {error}"))?
+            ),
+            _ = cancel.cancelled() => Outcome::Cancelled,
+            _ = &mut expiry => Outcome::TimedOut,
+            _ = health.tick() => {
+                match crate::generation_commands::ensure_vdn_usage(&app) {
+                    Ok(()) => {
+                        if let Some(phase) = read_last_phase(&stdout_path) {
+                            let _ = app.emit("studio://vdn-progress", VdnProgress {
+                                job_id: &request.job_id, phase: &phase, detail: "",
+                            });
+                        }
+                        continue;
+                    },
+                    Err(error) => Outcome::RightsRevoked(error),
+                }
+            },
+        };
+        break event;
+    };
+    let result = match outcome {
+        Outcome::Completed(status) if status.success() => (|| -> Result<
+            crate::generation_commands::GenerationEntry, String
+        > {
+            // Recheck immediately before publication; region and entitlement
+            // may have changed during a long-running GPU operation.
+            crate::generation_commands::ensure_vdn_usage(&app)?;
+            let info = std::fs::metadata(&output)
+                .map_err(|_| "OpenVDN did not produce an MP4".to_string())?;
+            if info.len() < 32 || info.len() > MAX_VIDEO_BYTES {
+                Err("OpenVDN output must be a nonempty MP4 smaller than 256 MB".into())
+            } else {
+                let bytes = std::fs::read(&output).map_err(|error| error.to_string())?;
+                if !valid_mp4(&bytes) {
+                    Err("VDN worker output is not a valid MP4 header".into())
+                } else {
+                    crate::generation_commands::publish_vdn_video(
+                        &app, &request.prompt, request.steps, request.seed,
+                        request.frames, first.is_some(), &bytes
+                    )
+                }
+            }
+        })(),
+        Outcome::Completed(_status) => Err(format!(
+            "VDN worker failed: {}", brief_error(&stderr_path)
+        )),
+        Outcome::Cancelled => {
+            let _ = child.kill().await;
+            Err("VDN generation cancelled".into())
+        },
+        Outcome::TimedOut => {
+            let _ = child.kill().await;
+            Err("VDN inference exceeded the four-hour limit".into())
+        },
+        Outcome::RightsRevoked(reason) => {
+            let _ = child.kill().await;
+            Err(format!("VDN license no longer permits inference: {reason}"))
+        },
+    };
+    for path in [&stdout_path, &stderr_path, &output, &source] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = app.emit("studio://vdn-progress", VdnProgress {
+        job_id: &request.job_id,
+        phase: if result.is_ok() { "completed" } else { "failed" },
+        detail: "",
+    });
+    result
+}
+
+/// Real preflight of the chosen Python/CUDA environment, without downloading
+/// the restricted weights or invoking any Hugging Face remote model code.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn generation_vdn_probe(
+    app: AppHandle,
+    python_executable: String,
+) -> Result<serde_json::Value, String> {
+    let python = Path::new(&python_executable).canonicalize()
+        .map_err(|_| "Choose a real Python executable in the OpenVDN environment")?;
+    if !python.is_file() {
+        return Err("VDN Python executable is not a file".into());
+    }
+    let dir = app.profile_data_dir().map_err(|error| error.to_string())?
+        .join("studio-vdn-h3");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let script = dir.join(format!(".vdn-probe-{}.py", uuid::Uuid::new_v4()));
+    std::fs::write(&script, WORKER).map_err(|error| error.to_string())?;
+    let outcome = async {
+        let mut cmd = tokio::process::Command::new(python);
+        cmd.arg("-u").arg(&script).arg("--probe")
+            .current_dir(&dir)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(90), cmd.output())
+            .await.map_err(|_| "VDN environment probe timed out".to_string())?
+            .map_err(|error| format!("Cannot probe the Python environment: {error}"))?;
+        if !output.status.success() {
+            let details = String::from_utf8_lossy(&output.stderr);
+            let last = details.lines().last().unwrap_or("The OpenVDN runtime was not available");
+            return Err(last.chars().take(350).collect());
+        }
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .map_err(|_| "VDN environment returned no valid capability report".to_string())
+    }.await;
+    let _ = std::fs::remove_file(&script);
+    outcome
+}
+
+#[tauri::command]
+pub fn generation_vdn_cancel(job_id: String) -> Result<bool, String> {
+    let jobs = running().lock().map_err(|error| error.to_string())?;
+    let Some(token) = jobs.get(&job_id) else { return Ok(false); };
+    token.cancel();
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_actual_mp4_brand_is_published() {
+        assert!(!valid_mp4(b"not a video"));
+        let mut video = vec![0u8; 32];
+        video[4..8].copy_from_slice(b"ftyp");
+        assert!(valid_mp4(&video));
+        video[4..8].copy_from_slice(b"free");
+        assert!(!valid_mp4(&video));
+    }
+
+    #[test]
+    fn worker_declares_original_vdn_hybrid_pipeline_not_comfyui() {
+        assert!(WORKER.contains("ModularPipeline.from_pretrained"));
+        assert!(WORKER.contains("OpenVDN/vdn-minimax-h3"));
+        assert!(WORKER.contains("num_inference_steps=args.steps + 1"));
+        assert!(WORKER.contains("apply_group_offloading"));
+        assert!(!WORKER.contains("import comfyui"));
+    }
+
+    #[test]
+    fn malformed_requests_are_rejected_before_launch() {
+        let invalid = VdnRunRequest {
+            job_id: uuid::Uuid::new_v4().to_string(),
+            python_executable: "missing-python".into(),
+            prompt: "sample".into(),
+            steps: 8,
+            frames: 345,
+            seed: 0,
+            first_image_path: None,
+            last_image_path: None,
+            fp8: false,
+            offload_dit: true,
+            acknowledge_third_party_code: false,
+        };
+        assert!(validate_request(&invalid).is_err());
+    }
+}
