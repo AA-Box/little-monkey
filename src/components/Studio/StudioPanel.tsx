@@ -31,6 +31,7 @@ import {
 import { Button, IconButton, Listbox, StatusPill } from "../ui";
 import { AddBackendForm } from "./AddBackendForm";
 import { AddModelForm } from "./AddModelForm";
+import { StudioLicenseRegionControl } from "./StudioLicenseRegionControl";
 import { LoraStack } from "./LoraStack";
 import { MaskCanvas } from "./MaskCanvas";
 import { ModelFiles } from "./ModelFiles";
@@ -739,10 +740,18 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
         mode === "models" || model.tasks.some((entry) => tasksFor(mode).includes(entry)),
       );
       setSelectedId((current) => {
-        if (current && usable.some((model) => model.id === current)) return current;
-        // Prefer something already downloaded so the panel opens on a model
-        // the user can actually run.
-        return (usable.find((model) => model.installed) ?? usable[0])?.id ?? null;
+        if (current && usable.some((model) => model.id === current && model.licenseEligible !== false)) return current;
+        // Never auto-select a restricted, ineligible local model if an
+        // eligible alternative exists. Prefer an already-installed Wan 2.2
+        // video model as the worldwide default when the user has one.
+        const allowed = usable.filter((model) => model.licenseEligible !== false);
+        const installed = allowed.filter((model) => model.installed);
+        const isWan22 = (model: GenerationModel) =>
+          /wan[\s._-]*2[\s._-]*2/i.test(`${model.name} ${model.family} ${model.id}`);
+        return (
+          installed.find(isWan22) ?? installed[0] ??
+          allowed.find(isWan22) ?? allowed[0] ?? usable[0]
+        )?.id ?? null;
       });
     } catch (reason) {
       setError(errorText(reason));
@@ -876,7 +885,8 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
 
   const download = async (model: GenerationModel) => {
     setError(null);
-    if (model.license.acceptanceRequired && !model.licenseAccepted) {
+    if (model.licenseEligible === false || (model.licenseEligible === undefined && model.license.acceptanceRequired && !model.licenseAccepted)) {
+      setError(model.licenseBlockReason ?? "Accept this model's license before downloading.");
       return;
     }
     setDownloadingId(model.id);
@@ -1102,6 +1112,10 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
 
   const generate = () => {
     if (!selected || !settings) return;
+    if (selected.licenseEligible === false) {
+      setError(selected.licenseBlockReason ?? "This model is not eligible under its local model license.");
+      return;
+    }
     setError(null);
     enqueueRun(prompt.trim() || selected.name, {
       modelId: selected.id,
@@ -1226,6 +1240,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
     !!selected &&
     !!settings &&
     selected.installed &&
+    selected.licenseEligible !== false &&
     prompt.trim().length > 0 &&
     // A run in flight no longer blocks the button: the next one queues behind
     // it, up to the cap that keeps a leaned-on button from queueing forever.
@@ -1314,13 +1329,16 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
             />
           </div>
         )}
+        <StudioLicenseRegionControl onChanged={() => void refresh()} />
         {visible.length === 0 && !adding && (
           <p className="mb-2 text-xs text-faint">{t("Studio.emptyLibrary")}</p>
         )}
         <div className="grid gap-2">
           {visible.map((model) => {
             const blockedByLicense =
-              model.license.acceptanceRequired && !model.licenseAccepted;
+              model.licenseEligible === false || (model.licenseEligible === undefined && model.license.acceptanceRequired && !model.licenseAccepted);
+            const canAcceptLicense = model.licenseEligible !== true && model.license.acceptanceRequired && !model.licenseAccepted
+              && (!model.licenseBlockReason || model.licenseBlockReason.startsWith("Accept the "));
             return (
               <div
                 key={model.id}
@@ -1464,7 +1482,7 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
                 {blockedByLicense && (
                   <div className="mt-2 rounded bg-background/60 p-2">
                     <p className="text-[11px] text-warning">
-                      {t("Studio.license.restricted", {
+                      {model.licenseBlockReason ?? t("Studio.license.restricted", {
                         name: model.license.name,
                         territories: model.license.excludedTerritories.join(", "),
                       })}
@@ -1478,9 +1496,9 @@ export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props
                       >
                         {t("Studio.license.read")}
                       </a>
-                      <Button size="sm" onClick={() => void acceptLicense(model)}>
+                      {canAcceptLicense && <Button size="sm" onClick={() => void acceptLicense(model)}>
                         {t("Studio.license.accept")}
-                      </Button>
+                      </Button>}
                     </div>
                   </div>
                 )}
