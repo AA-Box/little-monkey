@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Download, PackagePlus, RefreshCw, Trash2 } from "lucide-react";
 
 import { AddModelForm } from "../../Studio/AddModelForm";
+import { StudioLicenseRegionControl } from "../../Studio/StudioLicenseRegionControl";
 import { Button, StatusPill } from "../../ui";
 import { useT } from "../../../lib/i18n";
 import {
@@ -23,7 +24,9 @@ function StudioModelCard({
   const { t } = useT();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const blockedByLicense = model.license.acceptanceRequired && !model.licenseAccepted;
+  const blockedByLicense = model.licenseEligible === false || (model.licenseEligible === undefined && model.license.acceptanceRequired && !model.licenseAccepted);
+  const canAccept = model.licenseEligible !== true && model.license.acceptanceRequired && !model.licenseAccepted
+    && (!model.licenseBlockReason || model.licenseBlockReason.startsWith("Accept the "));
 
   async function acceptLicense() {
     setError(null);
@@ -99,12 +102,14 @@ function StudioModelCard({
 
       {blockedByLicense && (
         <div className="mt-3 rounded-md border border-warning/30 bg-warning-soft p-3 text-xs text-warning">
-          <p>{t("RuntimeHub.studioModels.licenseRequired", { name: model.license.name })}</p>
-          <div className="mt-2 flex justify-end">
+          <p>{model.licenseBlockReason ?? t("RuntimeHub.studioModels.licenseRequired", { name: model.license.name })}</p>
+          {model.license.url && <a href={model.license.url} target="_blank" rel="noreferrer"
+            className="mt-1 inline-block underline">Read model license</a>}
+          {canAccept && <div className="mt-2 flex justify-end">
             <Button type="button" size="sm" onClick={() => void acceptLicense()} disabled={busy}>
               {t("RuntimeHub.studioModels.acceptLicense")}
             </Button>
-          </div>
+          </div>}
         </div>
       )}
 
@@ -176,6 +181,8 @@ export function RuntimeHubStudioModels() {
           </div>
         )}
       />
+
+      <StudioLicenseRegionControl onChanged={() => void refresh()} />
 
       {adding && (
         <div className="rounded-lg border border-border bg-background p-3">

@@ -50,6 +50,8 @@ pub mod generation;
 pub(crate) mod generation_commands;
 mod studio_video_jobs;
 mod studio_video_timeline;
+pub(crate) mod studio_model_policy;
+pub(crate) mod studio_minimax_entitlement;
 pub mod studio_parity;
 pub mod character_trainer;
 pub mod studio_tools;
@@ -2113,6 +2115,10 @@ pub fn run() {
             generation_commands::generation_add_model,
             generation_commands::generation_remove_model,
             generation_commands::generation_accept_license,
+            generation_commands::generation_license_region,
+            generation_commands::generation_set_license_region,
+            generation_commands::generation_import_minimax_entitlement,
+            generation_commands::generation_clear_minimax_entitlement,
             generation_commands::generation_set_hugging_face_token,
             generation_commands::generation_download_model,
             generation_commands::generation_cancel_download,

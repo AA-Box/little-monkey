@@ -36,6 +36,8 @@ const GALLERY_FILE: &str = "studio-gallery.json";
 /// the whole registry, and it starts empty.
 const MODELS_FILE: &str = "studio-models.json";
 const ACCEPTED_LICENSES_FILE: &str = "studio-accepted-licenses.json";
+const LICENSE_REGION_FILE: &str = "studio-license-region.json";
+const MINIMAX_ENTITLEMENT_FILE: &str = "studio-minimax-entitlement.json";
 static HUGGING_FACE_TOKEN_SERVICE: OnceLock<String> = OnceLock::new();
 
 fn hugging_face_token_service() -> &'static str {
@@ -112,6 +114,9 @@ pub struct GenerationModelView {
     /// False when the host has too little memory for this model. The picker
     /// shows it disabled with the reason rather than letting a run stall.
     pub fits_in_memory: bool,
+    /// Runtime eligibility, separate from merely clicking accept.
+    pub license_eligible: bool,
+    pub license_block_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -531,7 +536,91 @@ fn mflux_runtime_installed(_app_data: &Path) -> bool {
 
 /// Every model the user has added.
 fn registry(app: &AppHandle) -> Result<Vec<GenerationModelSpec>, String> {
-    read_state(app, MODELS_FILE)
+    let mut models: Vec<GenerationModelSpec> = read_state(app, MODELS_FILE)?;
+    // Enforce known upstream restrictions even for models registered before
+    // this release and for callers that edited a model's metadata by hand.
+    for model in &mut models {
+        model.license = crate::studio_model_policy::effective_license(model);
+    }
+    Ok(models)
+}
+
+/// The declaration is scoped to the active profile and not inferred from IP,
+/// language or timezone. It is an honesty-based eligibility input, not proof
+/// of a separate license or of physical geolocation.
+fn license_region(app: &AppHandle) -> Result<Option<crate::studio_model_policy::LicenseRegion>, String> {
+    read_state(app, LICENSE_REGION_FILE)
+}
+
+fn license_block_reason(
+    app: &AppHandle,
+    spec: &GenerationModelSpec,
+    region: Option<crate::studio_model_policy::LicenseRegion>,
+    accepted: &BTreeSet<String>,
+) -> Result<Option<String>, String> {
+    if crate::studio_model_policy::is_minimax_h3(spec) {
+        if let Some(region) = region {
+            let grant: Option<crate::studio_minimax_entitlement::SignedGrant> =
+                read_state(app, MINIMAX_ENTITLEMENT_FILE)?;
+            if let Some(grant) = grant {
+                // Verify the rights-holder authorization reference and the
+                // distributor signature on EVERY use, including expiration,
+                // region edits, manual weight imports and restart recovery.
+                if crate::studio_minimax_entitlement::validate_for_region(&grant, region).is_ok() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    Ok(crate::studio_model_policy::block_reason(spec, region, accepted))
+}
+
+fn ensure_model_license(app: &AppHandle, spec: &GenerationModelSpec) -> Result<(), String> {
+    let accepted: BTreeSet<String> = read_state(app, ACCEPTED_LICENSES_FILE)?;
+    let region = license_region(app)?;
+    if let Some(reason) = license_block_reason(app, spec, region, &accepted)? {
+        return Err(reason);
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_import_minimax_entitlement(
+    app: AppHandle,
+    grant_json: String,
+) -> Result<(), String> {
+    if grant_json.len() > 16 * 1024 {
+        return Err("The license receipt is too large".into());
+    }
+    let grant: crate::studio_minimax_entitlement::SignedGrant =
+        serde_json::from_str(&grant_json).map_err(|_| "Malformed signed license receipt")?;
+    let region = license_region(&app)?
+        .ok_or("Declare the intended territory of use before importing an entitlement")?;
+    crate::studio_minimax_entitlement::validate_for_region(&grant, region)?;
+    write_state(&app, MINIMAX_ENTITLEMENT_FILE, &Some(grant))
+}
+
+#[tauri::command]
+pub fn generation_clear_minimax_entitlement(app: AppHandle) -> Result<(), String> {
+    write_state(&app, MINIMAX_ENTITLEMENT_FILE, &Option::<crate::studio_minimax_entitlement::SignedGrant>::None)
+}
+
+#[tauri::command]
+pub fn generation_license_region(app: AppHandle) -> Result<Option<String>, String> {
+    Ok(license_region(&app)?.map(|value| value.code().into()))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_set_license_region(
+    app: AppHandle,
+    region: String,
+    acknowledged: bool,
+) -> Result<(), String> {
+    if !acknowledged {
+        return Err("Confirm that this is where you will use the model weights.".into());
+    }
+    let region = crate::studio_model_policy::LicenseRegion::parse(&region)?;
+    write_state(&app, LICENSE_REGION_FILE, &Some(region))
 }
 
 fn find_registered(app: &AppHandle, id: &str) -> Result<GenerationModelSpec, String> {
@@ -550,6 +639,8 @@ pub fn generation_add_model(
     spec: GenerationModelSpec,
 ) -> Result<Vec<GenerationModelSpec>, String> {
     generation::validate_model_spec(&spec)?;
+    let mut spec = spec;
+    spec.license = crate::studio_model_policy::effective_license(&spec);
     let mut models = registry(&app)?;
     match models.iter_mut().find(|entry| entry.id == spec.id) {
         Some(existing) => *existing = spec,
@@ -582,6 +673,7 @@ pub fn generation_models(app: AppHandle) -> Result<Vec<GenerationModelView>, Str
     let root = model_root(&app)?;
     let accepted: BTreeSet<String> = read_state(&app, ACCEPTED_LICENSES_FILE)?;
     let ram = total_ram_bytes();
+    let region = license_region(&app)?;
     Ok(registry(&app)?
         .into_iter()
         .map(|spec| {
@@ -592,8 +684,11 @@ pub fn generation_models(app: AppHandle) -> Result<Vec<GenerationModelView>, Str
                 installed: missing.is_empty() && !missing_source,
                 total_bytes: spec.size_on_disk(&root),
                 missing_bytes,
-                license_accepted: !spec.license.acceptance_required
-                    || accepted.contains(&spec.license.id),
+                license_accepted: crate::studio_model_policy::acceptance_recorded(&spec, &accepted),
+                license_eligible: license_block_reason(&app, &spec, region, &accepted)
+                    .map(|reason| reason.is_none()).unwrap_or(false),
+                license_block_reason: license_block_reason(&app, &spec, region, &accepted)
+                    .unwrap_or_else(|error| Some(error)),
                 // A zero reading means the probe failed, not that the machine
                 // has no memory — do not block the model on a failed probe.
                 fits_in_memory: ram == 0 || ram >= spec.min_ram_bytes,
@@ -610,11 +705,15 @@ pub fn generation_accept_license(app: AppHandle, license_id: String) -> Result<(
     if license_id.is_empty() || license_id.len() > 128 {
         return Err("Invalid license id".to_string());
     }
-    if !registry(&app)?
-        .iter()
-        .any(|spec| spec.license.id == license_id)
-    {
-        return Err("Unknown license".to_string());
+    let models = registry(&app)?;
+    let selected = models.iter().find(|spec| spec.license.id == license_id)
+        .ok_or("Unknown license")?;
+    let region = license_region(&app)?;
+    if crate::studio_model_policy::is_minimax_h3(selected) {
+        // Consent is not a grant of rights for excluded territories.
+        if region.is_none() || region != Some(crate::studio_model_policy::LicenseRegion::Other) {
+            return Err("The MiniMax community license cannot be accepted as permission to use weights in an excluded or undeclared territory.".into());
+        }
     }
     let mut accepted: BTreeSet<String> = read_state(&app, ACCEPTED_LICENSES_FILE)?;
     accepted.insert(license_id);
@@ -693,6 +792,7 @@ pub async fn generation_download_model(
     model_id: String,
 ) -> Result<(), String> {
     let spec = find_registered(&app, &model_id)?;
+    ensure_model_license(&app, &spec)?;
     if spec.engine == GenerationEngineKind::MfluxImage
         && matches!(
             spec.source,
@@ -1101,6 +1201,7 @@ async fn generation_run_impl(
             (request.model_id.clone(), validated, vec![media])
         } else {
             let spec = find_registered(&app, &request.model_id)?;
+            ensure_model_license(&app, &spec)?;
             let validated = generation::validate_request(&spec, &request)?;
             // A swapped VAE or text encoder changes what the engine loads, so it
             // is resolved before anything launches. The engine keys reuse on its
