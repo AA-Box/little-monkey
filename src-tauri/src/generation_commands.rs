@@ -651,6 +651,18 @@ pub fn generation_add_model(
     Ok(models)
 }
 
+/// Adds the verified global-license Wan 2.2 TI2V-5B preset to the user's
+/// Studio library without changing a user-customized entry of the same ID.
+/// Weight transfers remain a separate explicit user-confirmed download.
+#[tauri::command]
+pub fn generation_register_wan22(app: AppHandle) -> Result<Vec<GenerationModelSpec>, String> {
+    let spec = crate::studio_wan_preset::native_wan22_ti2v_5b();
+    if registry(&app)?.iter().any(|model| model.id == spec.id) {
+        return registry(&app);
+    }
+    generation_add_model(app, spec)
+}
+
 /// Forgets a model. Files the app downloaded for it are removed; files the
 /// user pointed at on their own disk are left exactly where they are.
 #[tauri::command]
@@ -755,6 +767,31 @@ pub fn generation_set_hugging_face_token(
     }
 }
 
+/// Stream hashes rather than loading multi-gigabyte weights into RAM.
+/// A curated model cannot silently reuse tampered or half-downloaded files.
+fn verify_component_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut reader = std::io::BufReader::new(
+        std::fs::File::open(path).map_err(|error| error.to_string())?
+    );
+    let mut digest = Sha256::new();
+    let mut chunk = [0_u8; 1024 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+        if n == 0 { break; }
+        digest.update(&chunk[..n]);
+    }
+    let actual = format!("{:x}", digest.finalize());
+    if actual != expected {
+        return Err(format!(
+            "Model weight checksum mismatch for {}: expected {expected}, received {actual}",
+            path.file_name().and_then(|name| name.to_str()).unwrap_or("model")
+        ));
+    }
+    Ok(())
+}
+
 async fn install_component_file(
     app: &AppHandle,
     repo: &str,
@@ -762,7 +799,11 @@ async fn install_component_file(
     destination: &Path,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    let pinned_sha = crate::studio_wan_preset::expected_sha256(repo, file);
     if destination.is_file() {
+        if let Some(expected) = pinned_sha {
+            verify_component_sha256(destination, expected)?;
+        }
         return Ok(());
     }
     let name = destination
@@ -774,6 +815,12 @@ async fn install_component_file(
     if let Err(error) = outcome {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
+    }
+    if let Some(expected) = pinned_sha {
+        if let Err(error) = verify_component_sha256(&temporary, expected) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
     }
     std::fs::rename(&temporary, destination).map_err(|error| {
         let _ = std::fs::remove_file(&temporary);
@@ -1997,5 +2044,35 @@ mod tests {
             script.contains(&format!("\"{MLX_VIDEO_SERVICE_ENTRY}\"")),
             "build-mlx-package.mjs does not copy the service to {MLX_VIDEO_SERVICE_ENTRY}"
         );
+    }
+}
+
+#[cfg(test)]
+mod native_wan_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_model_digest_validation_rejects_tampered_bytes() {
+        let path = std::env::temp_dir().join(format!("lm-wan-sha-test-{}", Uuid::new_v4()));
+        std::fs::write(&path, b"abc").unwrap();
+        const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_component_sha256(&path, ABC).is_ok());
+        std::fs::write(&path, b"altered").unwrap();
+        assert!(verify_component_sha256(&path, ABC).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_wan_catalog_sources_have_pinned_digests() {
+        let model = crate::studio_wan_preset::native_wan22_ti2v_5b();
+        for item in model.components {
+            match item.source {
+                crate::generation::ComponentSource::HuggingFace { repo, file } => {
+                    assert!(crate::studio_wan_preset::expected_sha256(&repo, &file).is_some(),
+                        "Unverified curated model component: {repo}/{file}");
+                }
+                _ => panic!("Curated Wan preset must not depend on arbitrary user paths"),
+            }
+        }
     }
 }
