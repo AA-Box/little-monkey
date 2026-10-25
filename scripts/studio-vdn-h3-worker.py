@@ -317,32 +317,52 @@ def run(args):
     if args.two_pass:
         original.extend(["--two-pass", "--refine-steps", str(args.refine_steps)])
     for tier in plans:
-        argv = [sys.executable, "-u", *original, "--internal-attempt", tier]
-        if tier.startswith("fp8") or tier == "resident_fp8":
-            argv.append("--fp8")
-        print(json.dumps({"phase": "attempt", "tier": tier}), flush=True)
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1,
-                                 start_new_session=(os.name == "posix"))
-        _forward_signal.child = child
-        errors = []
-        try:
-            for line in child.stdout:
-                print(line, end="", flush=True)
-                errors.append(line)
-                if len(errors) > 100:
-                    errors.pop(0)
-            code = child.wait()
-        finally:
-            _forward_signal.child = None
-        if code == 0:
-            return
-        reason = "".join(errors)[-8000:]
-        if not is_cuda_oom(reason):
-            raise RuntimeError("VDN native inference failed outside memory recovery: " + reason[-1400:])
-        print(json.dumps({"phase": "oom_recovery", "tier": tier,
-                          "next": "fresh_process", "exitCode": code}), flush=True)
+        # Only CUDA OOM causes an additional more-constrained try. Every
+        # retry is a new isolated process; a poisoned CUDA context is never
+        # reused and sampler snapshots carry the effective tiling settings.
+        attempts = [(args.lowmem, args.query_chunk, args.head_chunk, args.ff_chunk)]
+        if args.lowmem != "off":
+            emergency = ("force",
+                         min(args.query_chunk or 128, 128),
+                         min(args.head_chunk or 2, 2),
+                         min(args.ff_chunk or 128, 128))
+            if emergency != attempts[0]:
+                attempts.append(emergency)
+        for attempt_index, (lowmem, query, heads, ff) in enumerate(attempts):
+            argv = [sys.executable, "-u", *original, "--internal-attempt", tier]
+            if tier.startswith("fp8") or tier == "resident_fp8":
+                argv.append("--fp8")
+            # argparse uses the last occurrence for scalar flags, so an
+            # emergency attempt can override the request's original knobs.
+            argv += ["--lowmem", lowmem, "--query-chunk", str(query),
+                     "--head-chunk", str(heads), "--ff-chunk", str(ff)]
+            print(json.dumps({"phase": "attempt", "tier": tier,
+                              "lowmem": lowmem, "retry": attempt_index,
+                              "queryChunk": query, "headChunk": heads,
+                              "ffChunk": ff}), flush=True)
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1,
+                                     start_new_session=(os.name == "posix"))
+            _forward_signal.child = child
+            errors = []
+            try:
+                for line in child.stdout:
+                    print(line, end="", flush=True)
+                    errors.append(line)
+                    if len(errors) > 100:
+                        errors.pop(0)
+                code = child.wait()
+            finally:
+                _forward_signal.child = None
+            if code == 0:
+                return
+            reason = "".join(errors)[-8000:]
+            if not is_cuda_oom(reason):
+                raise RuntimeError("VDN native inference failed outside memory recovery: " + reason[-1400:])
+            print(json.dumps({"phase": "oom_recovery", "tier": tier,
+                              "next": "smaller_tiles_or_next_tier_in_fresh_process",
+                              "retry": attempt_index, "exitCode": code}), flush=True)
     raise RuntimeError("All native CUDA placement tiers exhausted their memory budget")
 
 
@@ -520,6 +540,7 @@ def _run_once(args):
 
     if not torch.cuda.is_available():
         raise RuntimeError("VDN-H3 requires a CUDA GPU. Choose Wan on this machine.")
+    torch.cuda.reset_peak_memory_stats()
     keyframes = {}
     references = []
     if args.refs or args.reference_video or args.reference_audio:
@@ -677,6 +698,21 @@ def _run_once(args):
         raise RuntimeError("OpenVDN produced no video bytes")
     os.replace(temporary, output)
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
+    host_peak = None
+    if os.path.isfile("/proc/self/status"):
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmHWM:"):
+                    host_peak = int(line.split()[1]) * 1024
+                    break
+    print(json.dumps({"phase": "native_memory_metrics",
+                      "peakCudaAllocatedBytes": torch.cuda.max_memory_allocated(),
+                      "peakCudaReservedBytes": torch.cuda.max_memory_reserved(),
+                      "peakProcessRssBytes": host_peak,
+                      "streamedFromDisk": bool(args.disk_offload),
+                      "int8Weights": bool(args.int8),
+                      "nativeAttentionTiling": args.lowmem == "force" or
+                          (args.lowmem == "auto" and args.offload_dit)}), flush=True)
     print(json.dumps({"phase": "completed", "path": str(output),
                       "frames": len(videos[0]), "fps": FPS}), flush=True)
 
