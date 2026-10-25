@@ -786,8 +786,8 @@ pub fn generation_video_jobs(app: AppHandle) -> Result<Vec<VideoJobView>, String
             attempts: vdn.attempts,
             result_entry_ids: vdn.result_entry_id.into_iter().collect(),
             error: vdn.error,
-            created_at_ms: 0,
-            updated_at_ms: 0,
+            created_at_ms: vdn.created_at_ms,
+            updated_at_ms: vdn.updated_at_ms,
         });
     }
     dispatch(&app)?;
