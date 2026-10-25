@@ -235,15 +235,17 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         }
     }
     if request.continuation_mode == "video_reference" {
-        if request.source_gallery_entry_id.is_none() && request.source_vdn_job_id.is_none() {
-            return Err("Video reference continuation needs a Gallery clip or predecessor VDN job".into());
+        let linked = request.source_gallery_entry_id.is_some()
+            || request.source_vdn_job_id.is_some();
+        if !linked && request.reference_video_path.is_none() {
+            return Err("Video reference continuation needs a Gallery clip, predecessor job or resolved local video".into());
         }
         if request.backend != VdnBackend::Diffusers {
             return Err("Motion/audio reference continuation requires native Diffusers Ref2VA".into());
         }
-        if request.reference_video_path.is_some() || request.first_image_path.is_some()
-            || request.last_image_path.is_some() {
-            return Err("Cannot mix video continuation with another video/keyframe".into());
+        if (linked && request.reference_video_path.is_some())
+            || request.first_image_path.is_some() || request.last_image_path.is_some() {
+            return Err("Cannot mix pending video continuation with another video/keyframe".into());
         }
     }
     if request.native_two_pass && request.backend != VdnBackend::Diffusers {
