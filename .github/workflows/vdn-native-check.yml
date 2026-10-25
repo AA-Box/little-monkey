@@ -5,6 +5,12 @@ permissions:
   contents: read
 
 on:
+  push:
+    paths:
+      - "scripts/studio-vdn-h3-worker.py"
+      - "scripts/studio_vdn_*.py"
+      - "tests/test_studio_vdn_*.py"
+      - ".github/workflows/vdn-native-check.yml"
   pull_request:
     paths:
       - "scripts/studio-vdn-h3-worker.py"
