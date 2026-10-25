@@ -517,6 +517,8 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
               flush=True)
 
     validate_preview_layout(tuple(latents.shape), tuple(audio_latents.shape))
+    preview_video_cpu = latents.detach().float().cpu().contiguous().clone()
+    preview_audio_cpu = audio_latents.detach().float().cpu().contiguous().clone()
     latents = latents.to(device=device, dtype=torch.float32)
     audio_latents = audio_latents.to(device=device, dtype=torch.float32)
     target_frames = latents.shape[2]
@@ -533,7 +535,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
                       "steps": args.refine_steps, "latentReuse": True}), flush=True)
     with native_sampler_recovery(args, "refine", pipe, model_identity=(
             REF_MODEL_REPOSITORY if references else MODEL_REPOSITORY)):
-        return pipe(
+        result = pipe(
         prompt=args.prompt, num_frames=args.frames, height=768, width=1344,
         num_inference_steps=args.refine_steps + 1,
         generator=torch.Generator(device).manual_seed(args.seed + 2),
@@ -541,6 +543,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
         output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
         **({"references": references} if references else keyframes),
         )
+    return result, preview_video_cpu, preview_audio_cpu
 
 
 def _run_once(args):
@@ -689,7 +692,8 @@ def _run_once(args):
                           "nativeTemporal": True}), flush=True)
         return
     if args.two_pass:
-        sample = native_two_pass(pipe, args, torch, device, keyframes, references)
+        sample, preview_video, preview_audio = native_two_pass(
+            pipe, args, torch, device, keyframes, references)
     else:
         with native_sampler_recovery(args, "single", pipe, model_identity=checkpoint):
             sample = pipe(
@@ -716,7 +720,9 @@ def _run_once(args):
     os.replace(temporary, output)
     if args.temporal_context_out:
         captured = capture_context(sample["latents"], sample["audio_latents"], 0, args.frames)
-        save_context(args.temporal_context_out, captured, preview_fallback(captured),
+        low = (capture_context(preview_video, preview_audio, 0, args.frames)
+               if args.two_pass else preview_fallback(captured))
+        save_context(args.temporal_context_out, captured, low,
                      output, checkpoint, args.job_id, args.frames)
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
     print(json.dumps({"phase": "completed", "path": str(output),
