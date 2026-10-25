@@ -231,7 +231,7 @@ export interface GenerationModel {
 }
 
 /** Standalone, authorized CUDA VDN-H3 inference (no FreeVideo/ComfyUI). */
-export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang";
+export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang" | "free_video_adaptive";
 
 export interface VdnGenerationRequest {
   jobId: string;

@@ -93,7 +93,10 @@ export function StudioVdnPanel({
         python, backend, repoRoot || null, checkpointRoot || null,
         gpuClass, serverPort,
       );
-      if (backend === "sglang") {
+      if (backend === "free_video_adaptive") {
+        setProbeInfo("FreeVideo adaptive runtime detected; weights checked during rendering.");
+        setGpuFp8(false);
+      } else if (backend === "sglang") {
         setProbeInfo(`Serving ${report.model} through 127.0.0.1:${report.port ?? serverPort}`);
         setGpuFp8(false);
         setFp8(false);
@@ -241,15 +244,32 @@ export function StudioVdnPanel({
               const next = event.target.value as VdnBackend;
               setBackend(next);
               setProbeInfo(null);
-              if (next !== "diffusers") setSteps(8);
+              if (next !== "diffusers" && next !== "free_video_adaptive") setSteps(8);
             }}>
             <option value="diffusers">Portable Diffusers — single CUDA GPU with offload</option>
             <option value="optimized_single">OpenVDN tuned kernels — Linux, one large CUDA GPU</option>
             <option value="optimized_ulysses">OpenVDN Ulysses — Linux, 8 H200/B200 GPUs</option>
             <option value="sglang">SGLang Diffusion — local accelerated server (1/2/4/8 GPUs)</option>
+            <option value="free_video_adaptive">Adaptive FreeVideo — installed low-memory model runtime</option>
           </select>
         </label>
 
+        {backend === "free_video_adaptive" && (
+          <label className="grid gap-1 text-muted">
+            Prepared FreeVideo model cache
+            <div className="flex flex-wrap gap-2">
+              <input className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-foreground"
+                value={checkpointRoot} disabled={running}
+                onChange={(event) => { setCheckpointRoot(event.target.value); setProbeInfo(null); }}
+                placeholder="/path/to/prepared-freevideo-cache" />
+              <Button size="sm" variant="secondary" disabled={running}
+                onClick={() => void chooseFile((path) => { setCheckpointRoot(path); setProbeInfo(null); }, true)}>
+                <FolderOpen size={13} /> Choose cache
+              </Button>
+            </div>
+            <span>This optional backend uses the installed FreeVideo engine and its own adaptive planner. It does not remove model license restrictions.</span>
+          </label>
+        )}
         {(backend === "optimized_single" || backend === "optimized_ulysses") && (
           <div className="grid gap-2">
             <label className="grid gap-1 text-muted">
