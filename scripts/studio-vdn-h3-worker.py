@@ -144,6 +144,9 @@ def run(args):
         fp8_supported=major >= 9,
     )
     args.offload_dit = policy["offload"]
+    # FreeVideo's INT8 runtime is distinct; use TorchAO's supported
+    # weight-only INT8 path on consumer CUDA, never label it FP8.
+    args.int8 = major < 9 and not args.fp8
     available_ram = available_host_ram()
     free_disk = shutil.disk_usage(Path(args.output).parent).free
     args.disk_offload = args.offload_dit and should_disk_offload(available_ram, free_disk)
@@ -151,7 +154,8 @@ def run(args):
                       "hostRamAvailableBytes": available_ram,
                       "diskFreeBytes": free_disk,
                       "diskOffload": args.disk_offload,
-                      "offloadDit": args.offload_dit, "fp8": args.fp8}),
+                      "offloadDit": args.offload_dit, "fp8": args.fp8,
+                      "int8WeightOnly": args.int8}),
           flush=True)
     # Isolate each attempt's spilled weights in an automatically cleaned folder.
     with tempfile.TemporaryDirectory(prefix="vdn-layer-spill-",
@@ -209,6 +213,16 @@ def _run_once(args):
     if args.fp8:
         kwargs["fp8"] = {"transformer": True}
     pipe.load_components(**kwargs)
+    if args.int8:
+        try:
+            from torchao.quantization import Int8WeightOnlyConfig, quantize_
+        except ImportError as error:
+            raise RuntimeError(
+                "Consumer CUDA INT8 requires torchao in the selected VDN environment"
+            ) from error
+        print(json.dumps({"phase": "quantizing", "precision": "int8_weight_only"}),
+              flush=True)
+        quantize_(pipe.transformer, Int8WeightOnlyConfig())
     if any(getattr(pipe, name, None) is None for name in
            ("text_encoder", "vae", "audio_vae", "transformer")):
         raise RuntimeError("An OpenVDN component did not load successfully.")
