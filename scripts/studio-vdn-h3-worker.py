@@ -39,6 +39,11 @@ if "native_sampler_recovery" not in globals():
 if "install_native_h3_tiles" not in globals():
     from studio_vdn_lowmem import install_native_h3_tiles, weight_stream_policy
 
+if "load_native_h3_components" not in globals():
+    from studio_vdn_native_shards import load_native_h3_components
+if "install_lowmem_decoders" not in globals():
+    from studio_vdn_decoder import install_lowmem_decoders
+
 if "low_ram_disk_budget" not in globals():
     from studio_vdn_disk_loader import (
         low_ram_disk_budget, disk_component_kwargs, verify_model_indexes,
@@ -70,6 +75,7 @@ def parse_args(argv=None):
     parser.add_argument("--offload-dit", action="store_true")
     parser.add_argument("--memory-mode", choices=("auto", "resident", "stream_cpu", "stream_disk"), default="auto")
     parser.add_argument("--lowmem", choices=("auto", "off", "force"), default="auto")
+    parser.add_argument("--weight-loader", choices=("native_original", "accelerate"), default="native_original")
     parser.add_argument("--query-chunk", type=int, default=0)
     parser.add_argument("--head-chunk", type=int, default=0)
     parser.add_argument("--ff-chunk", type=int, default=256)
@@ -241,8 +247,8 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
             raise ValueError("CPU streaming needs 136 GiB available host RAM (80 GiB FP8)")
         add("fp8_cpu" if fp8 else "stream_cpu")
     elif mode == "stream_disk":
-        if fp8:
-            raise ValueError("FP8 disk-dispatched loading is not supported; choose BF16 disk streaming")
+        if fp8 and (capability < 9 or not torchao_available):
+            raise ValueError("FP8 direct streaming requires CUDA 9.0+ and torchao")
         if not disk_ok:
             raise ValueError("Disk streaming requires 8 GiB free VRAM, 12 GiB available RAM and 180 GiB free storage")
         add("fp8_disk" if fp8 else "stream_disk")
@@ -255,8 +261,8 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
             add("stream_cpu")
         if not fp8 and torchao_available and quant_cpu_ok:
             add("int8_cpu")
-        if disk_ok and not fp8:
-            add("stream_disk")
+        if disk_ok and (not fp8 or (capability >= 9 and torchao_available)):
+            add("fp8_disk" if fp8 else "stream_disk")
     if not plans:
         raise ValueError("Native H3 requires substantial host RAM or disk-backed model streaming; available resources are insufficient")
     return plans
@@ -306,7 +312,7 @@ def run(args):
                 "--output", args.output, "--frames", str(args.frames),
                 "--steps", str(args.steps), "--seed", str(args.seed),
                 "--device", args.device,
-                "--lowmem", args.lowmem,
+                "--lowmem", args.lowmem, "--weight-loader", args.weight_loader,
                 "--query-chunk", str(args.query_chunk),
                 "--head-chunk", str(args.head_chunk),
                 "--ff-chunk", str(args.ff_chunk)]
@@ -581,11 +587,12 @@ def _run_once(args):
                       "hybridVDN": not references}), flush=True)
     pipe = ModularPipeline.from_pretrained(checkpoint, workflow=mode)
     denoiser_partition = "transformer_ref" if references else "transformer"
-    if args.disk_offload and args.fp8:
+    native_direct = args.disk_offload and args.weight_loader == "native_original"
+    if args.disk_offload and args.fp8 and not native_direct:
         # The native disk-dispatch path requires exact pre-sharded SafeTensors
         # representations, not a silent unvalidated FP8 conversion.
         raise RuntimeError("Native FP8 disk-dispatched loading is not validated; use BF16 stream_disk or FP8 CPU tier")
-    if args.disk_offload:
+    if args.disk_offload and not native_direct:
         # These are the actual MiniMax-H3 and Qwen component sources selected
         # by ModularPipeline, not guessed paths inside the VDN model repo.
         verified = verify_model_indexes(pipe, denoiser_partition)
@@ -625,8 +632,12 @@ def _run_once(args):
                 ),
             ),
         })
+    if native_direct:
+        load_native_h3_components(
+            pipe, denoiser_partition, device=args.device, fp8=args.fp8,
+            lora_files=args.lora, video_vram_bytes=torch.cuda.mem_get_info()[0])
     kwargs = {"trust_remote_code": True, "dtype": torch.bfloat16}
-    if args.disk_offload:
+    if args.disk_offload and not native_direct:
         budget = low_ram_disk_budget(
             torch.cuda.mem_get_info()[0], available_host_ram(),
             shutil.disk_usage(args.disk_offload_path).free)
@@ -639,8 +650,9 @@ def _run_once(args):
               flush=True)
     if args.fp8:
         kwargs["fp8"] = {denoiser_partition: True}
-    pipe.load_components(**kwargs)
-    if args.disk_offload:
+    if not native_direct:
+        pipe.load_components(**kwargs)
+    if args.disk_offload and not native_direct:
         # No continuation into sampling unless both original components
         # REALLY have disk-dispatched layers. Avoid false-positive support.
         report = assert_disk_mapped_components(pipe, denoiser_partition)
@@ -650,9 +662,9 @@ def _run_once(args):
     if denoiser is None:
         raise RuntimeError("Selected VDN weights do not contain the required "
                            "Ref2VA transformer partition; refusing unconditioned fallback")
-    if args.disk_offload and args.lora:
-        raise RuntimeError("LoRA injection into disk-dispatched H3 has not been validated; use CPU-stream tier")
-    for lora in args.lora:
+    if args.disk_offload and args.lora and not native_direct:
+        raise RuntimeError("LoRA with Accelerate disk dispatch is unsupported; select native_original")
+    for lora in ([] if native_direct else args.lora):
         if not lora.endswith(".safetensors"):
             raise RuntimeError("LoRA must be a safetensors file")
         if not hasattr(pipe, "load_lora_weights"):
@@ -661,7 +673,7 @@ def _run_once(args):
     # Tile the actual H3 transformer after LoRA loading but before placing
     # layers/offload hooks. The processor retains full cross-modal context;
     # unlike spatial windows it changes no attention connectivity.
-    if args.lowmem == "force" or (args.lowmem == "auto" and args.offload_dit):
+    if args.lowmem == "force" or (args.lowmem == "auto" and (args.offload_dit or native_direct)):
         install_native_h3_tiles(
             denoiser, query_chunk=args.query_chunk,
             head_chunk=args.head_chunk, ff_chunk=args.ff_chunk)
@@ -689,21 +701,24 @@ def _run_once(args):
         text_path = Path(args.disk_offload_path) / "text_encoder"
         text_path.mkdir(parents=True, exist_ok=True)
         text_stream_kwargs["offload_to_disk_path"] = str(text_path)
+    if not native_direct:
+        install_lowmem_decoders(pipe.vae, pipe.audio_vae,
+                                free_vram=torch.cuda.mem_get_info()[0])
     # Stream the language-model layers; Qwen's visual encoder is invoked by
     # the same real Diffusers text-encoding block.
-    if not args.disk_offload:
+    if not args.disk_offload and not native_direct:
         # Accelerate's disk-dispatched modules already carry execution
         # hooks. Installing an additional Diffusers group hook here would
         # conflict and can load all weights again.
         apply_group_offloading(pipe.text_encoder.model, **text_stream_kwargs)
-    _, vae = cpu_offload_with_hook(pipe.vae, execution_device=device)
-    cpu_offload_with_hook(pipe.audio_vae, execution_device=device,
-                          prev_module_hook=vae)
-
-    def decoder_back(module, inputs):
-        vae.offload()
-    denoiser.register_forward_pre_hook(decoder_back)
-    if args.offload_dit and not args.disk_offload:
+    if not native_direct:
+        _, vae = cpu_offload_with_hook(pipe.vae, execution_device=device)
+        cpu_offload_with_hook(pipe.audio_vae, execution_device=device,
+                              prev_module_hook=vae)
+        def decoder_back(module, inputs):
+            vae.offload()
+        denoiser.register_forward_pre_hook(decoder_back)
+    if args.offload_dit and not args.disk_offload and not native_direct:
         stream_kwargs = {
             "onload_device": device, "offload_device": "cpu",
             "offload_type": "block_level",
@@ -715,7 +730,7 @@ def _run_once(args):
             dit_path.mkdir(parents=True, exist_ok=True)
             stream_kwargs["offload_to_disk_path"] = str(dit_path)
         apply_group_offloading(denoiser, **stream_kwargs)
-    elif not args.disk_offload:
+    elif not args.disk_offload and not native_direct:
         denoiser.to(device)
 
     print(json.dumps({"phase": "sampling", "steps": args.steps,
