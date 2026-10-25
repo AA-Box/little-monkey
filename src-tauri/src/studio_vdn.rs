@@ -26,7 +26,7 @@ const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-w
 
 /// An independent real rendering runtime. Each shares licensing, cancellation
 /// and gallery storage; none is implemented by relabeling the Diffusers mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VdnBackend {
     #[default]
@@ -94,7 +94,7 @@ fn worker_args(
 }
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VdnRunRequest {
     pub job_id: String,
@@ -105,6 +105,8 @@ pub struct VdnRunRequest {
     pub seed: i64,
     pub first_image_path: Option<String>,
     pub last_image_path: Option<String>,
+    #[serde(default)]
+    pub source_gallery_entry_id: Option<String>,
     #[serde(default)]
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
@@ -252,9 +254,16 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     for reference in &request.reference_image_paths {
         validate_image(&Some(reference.clone()))?;
     }
+    if request.source_gallery_entry_id.is_some() && request.first_image_path.is_some() {
+        return Err("Cannot combine continuation with first image".into());
+    }
     let first = validate_image(&request.first_image_path)?;
     let last = validate_image(&request.last_image_path)?;
     Ok((python, first, last))
+}
+
+pub(crate) fn validate_for_durable_submit(request: &VdnRunRequest) -> Result<(), String> {
+    validate_request(request).map(|_| ())
 }
 
 fn valid_mp4(bytes: &[u8]) -> bool {
@@ -306,6 +315,14 @@ pub async fn generation_vdn_run(
         request.checkpoint_root.as_deref(),
         request.gpu_class.as_deref(), request.server_port,
     )?;
+    let _video_engine_guard = crate::studio_video_jobs::engine_gate().lock().await;
+    if crate::studio_vdn_jobs::is_cancelled(&app, &request.job_id)? {
+        return Err("VDN job cancelled before GPU allocation".into());
+    }
+    if request.source_gallery_entry_id.is_some() {
+        return Err("Use durable VDN queue for Gallery continuation".into());
+    }
+    crate::generation_commands::ensure_vdn_usage(&app)?;
     let (cancel, _registration) = register(&request.job_id)?;
     let directory = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-vdn-h3");
@@ -413,7 +430,7 @@ pub async fn generation_vdn_run(
                     Err("VDN worker output is not a valid MP4 header".into())
                 } else {
                     crate::generation_commands::publish_vdn_video(
-                        &app, &request.prompt, request.steps, request.seed,
+                        &app, &request.job_id, &request.prompt, request.steps, request.seed,
                         request.frames, first.is_some(), &bytes
                     )
                 }
@@ -555,6 +572,7 @@ mod tests {
             seed: 0,
             first_image_path: None,
             last_image_path: None,
+            source_gallery_entry_id: None,
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],

@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Play, Square, FolderOpen, RefreshCw } from "lucide-react";
 import { Button } from "../ui";
-import { studioClient, type GenerationEntry, type VdnBackend } from "../../lib/studioClient";
+import { studioClient, type GenerationEntry, type VdnBackend, type DurableVdnJob } from "../../lib/studioClient";
 
 type PhaseEvent = { jobId: string; phase: string; detail: string };
 type Region = "eu" | "uk" | "us" | "kr" | "other" | null;
@@ -27,6 +27,9 @@ export function StudioVdnPanel({
   const [prompt, setPrompt] = useState("");
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
+  const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
+  const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
+  const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
   const [references, setReferences] = useState<string[]>([]);
   const [referenceVideo, setReferenceVideo] = useState<string | null>(null);
   const [referenceAudio, setReferenceAudio] = useState<string | null>(null);
@@ -64,6 +67,8 @@ export function StudioVdnPanel({
 
   useEffect(() => {
     void refreshLicense();
+    void studioClient.vdnJobs().then(setDurableJobs).catch(() => {});
+    void studioClient.gallery().then(items => setAvailableClips(items.filter(item => item.mediaType === "video/mp4" || item.mediaType === "video/webm"))).catch(() => {});
     let active = true;
     let unlisten: (() => void) | undefined;
     void listen<PhaseEvent>("studio://vdn-progress", (event) => {
@@ -142,6 +147,7 @@ export function StudioVdnPanel({
         prompt: prompt.trim(),
         firstImagePath: first,
         lastImagePath: last,
+        sourceGalleryEntryId: sourceGalleryId,
         referenceImagePaths: references,
         referenceVideoPath: referenceVideo,
         referenceAudioPath: referenceAudio,
@@ -443,6 +449,19 @@ export function StudioVdnPanel({
               <span>{loraPaths.length}/4</span>
             </div>
           </div>}
+        <label className="grid gap-1 text-muted">
+          Continue from a previous Gallery clip (true final frame)
+          <select className="rounded border border-border bg-background p-1 text-foreground"
+            value={sourceGalleryId ?? ""} disabled={running || Boolean(first)}
+            onChange={(event) => setSourceGalleryId(event.target.value || null)}>
+            <option value="">No previous clip</option>
+            {availableClips.map((entry) =>
+              <option key={entry.entryId} value={entry.entryId}>
+                {entry.prompt.slice(0, 48)} · {entry.entryId.slice(-8)}
+              </option>
+            )}
+          </select>
+        </label>
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />

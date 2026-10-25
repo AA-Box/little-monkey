@@ -706,6 +706,7 @@ pub fn generation_vdn_license_status(app: AppHandle) -> Result<Option<String>, S
 /// the native Wan renderer. Never accept caller-supplied file paths or blob IDs.
 pub(crate) fn publish_vdn_video(
     app: &AppHandle,
+    job_id: &str,
     prompt: &str,
     steps: u32,
     seed: i64,
@@ -720,7 +721,7 @@ pub(crate) fn publish_vdn_video(
     let entry = GenerationEntry {
         entry_id: format!("studio-{}", Uuid::new_v4()),
         artifact_id: blob.id,
-        video_job_id: None,
+        video_job_id: Some(job_id.to_owned()),
         model_id: "vdn-h3-diffusers".into(),
         task: if first_keyframe {
             generation::GenerationTask::ImageToVideo

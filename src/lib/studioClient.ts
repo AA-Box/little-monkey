@@ -242,6 +242,7 @@ export interface VdnGenerationRequest {
   seed: number;
   firstImagePath: string | null;
   lastImagePath: string | null;
+  sourceGalleryEntryId: string | null;
   referenceImagePaths: string[];
   referenceVideoPath: string | null;
   loraPaths: string[];
@@ -254,6 +255,15 @@ export interface VdnGenerationRequest {
   gpuClass: "h200" | "b200" | null;
   serverPort: number | null;
   acknowledgeThirdPartyCode: boolean;
+}
+
+export interface DurableVdnJob {
+  id: string;
+  request: VdnGenerationRequest;
+  status: "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled";
+  attempts: number;
+  resultEntryId: string | null;
+  error: string | null;
 }
 
 export type VideoJobStatus = "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled";
@@ -663,6 +673,12 @@ export const studioClient = {
     invoke<void>("generation_clear_minimax_entitlement"),
   vdnLicenseStatus: () => invoke<string | null>("generation_vdn_license_status"),
   vdnAcceptTerms: () => invoke<void>("generation_vdn_accept_terms"),
+  vdnSubmit: (request: VdnGenerationRequest) =>
+    invoke<DurableVdnJob>("generation_vdn_submit", { request }),
+  vdnJobs: () => invoke<DurableVdnJob[]>("generation_vdn_jobs"),
+  vdnResume: (jobId: string) => invoke<DurableVdnJob>("generation_vdn_resume", { jobId }),
+  vdnCancelJob: (jobId: string) =>
+    invoke<DurableVdnJob>("generation_vdn_cancel_job", { jobId }),
   vdnRun: (request: VdnGenerationRequest) =>
     invoke<GenerationEntry>("generation_vdn_run", { request }),
   vdnProbe: (

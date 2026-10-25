@@ -751,19 +751,58 @@ pub fn generation_video_continue(
 
 #[tauri::command]
 pub fn generation_video_jobs(app: AppHandle) -> Result<Vec<VideoJobView>, String> {
-    let views = {
+    let mut views = {
         let _guard = journal_lock().lock().map_err(|error| error.to_string())?;
         let dir = directory(&app)?;
         let mut jobs = read_all(&dir)?;
         reconcile(&app, &dir, &mut jobs)?;
         jobs.iter().rev().map(VideoJobView::from).collect::<Vec<_>>()
     };
+    // Present VDN and native jobs in one Studio history/Timeline model.
+    // The VDN journal owns recovery; this method only materializes the view.
+    for vdn in crate::studio_vdn_jobs::generation_vdn_jobs(app.clone())? {
+        let status = match vdn.status {
+            crate::studio_vdn_jobs::VdnJobStatus::Queued => VideoJobStatus::Queued,
+            crate::studio_vdn_jobs::VdnJobStatus::Running => VideoJobStatus::Running,
+            crate::studio_vdn_jobs::VdnJobStatus::Interrupted => VideoJobStatus::Interrupted,
+            crate::studio_vdn_jobs::VdnJobStatus::Completed => VideoJobStatus::Completed,
+            crate::studio_vdn_jobs::VdnJobStatus::Failed => VideoJobStatus::Failed,
+            crate::studio_vdn_jobs::VdnJobStatus::Cancelled => VideoJobStatus::Cancelled,
+        };
+        let published = matches!(status, VideoJobStatus::Completed);
+        views.push(VideoJobView {
+            id: vdn.id,
+            depends_on: vec![],
+            source_job_id: None,
+            source_gallery_entry_id: None,
+            target_gallery_image_entry_id: None,
+            target_artifact_id: None,
+            source_artifact_id: None,
+            model_id: "OpenVDN/vdn-minimax-h3".into(),
+            prompt: vdn.request.prompt.chars().take(240).collect(),
+            seed: vdn.request.seed,
+            status,
+            stage: if published { VideoJobStage::Published } else { VideoJobStage::Rendering },
+            attempts: vdn.attempts,
+            result_entry_ids: vdn.result_entry_id.into_iter().collect(),
+            error: vdn.error,
+            created_at_ms: vdn.created_at_ms,
+            updated_at_ms: vdn.updated_at_ms,
+        });
+    }
     dispatch(&app)?;
     Ok(views)
 }
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn generation_video_resume(app: AppHandle, job_id: String) -> Result<VideoJobView, String> {
+    if crate::studio_vdn_jobs::generation_vdn_jobs(app.clone())?
+        .iter().any(|record| record.id == job_id) {
+        crate::studio_vdn_jobs::generation_vdn_resume(app.clone(), job_id.clone())?;
+        return generation_video_jobs(app)?.into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or_else(|| "VDN job disappeared after resume".to_string());
+    }
     let job = transition(&app, &job_id, |job| {
         if !matches!(job.status, VideoJobStatus::Interrupted | VideoJobStatus::Failed) {
             return Err("Only interrupted or failed video jobs can be resumed".to_string());
@@ -785,6 +824,13 @@ pub fn generation_video_resume(app: AppHandle, job_id: String) -> Result<VideoJo
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn generation_video_cancel(app: AppHandle, job_id: String) -> Result<VideoJobView, String> {
+    if crate::studio_vdn_jobs::generation_vdn_jobs(app.clone())?
+        .iter().any(|record| record.id == job_id) {
+        crate::studio_vdn_jobs::generation_vdn_cancel_job(app.clone(), job_id.clone())?;
+        return generation_video_jobs(app)?.into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or_else(|| "VDN job disappeared after cancellation".to_string());
+    }
     let mut was_rendering = false;
     let job = transition(&app, &job_id, |job| {
         if !matches!(job.status, VideoJobStatus::Queued | VideoJobStatus::Running | VideoJobStatus::Interrupted) {

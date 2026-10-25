@@ -61,6 +61,9 @@ jobs:
       - name: VDN adaptive audio and multimedia contract tests
         run: python3 -m unittest discover -s tests -p test_studio_vdn_adaptive_contract.py
 
+      - name: VDN adaptive memory policy tests
+        run: python3 -m unittest discover -s tests -p test_studio_vdn_memory.py
+
       - name: Syntax-check live real-model benchmark harness (no model mocks)
         run: pnpm test:swarm-models:syntax
 
