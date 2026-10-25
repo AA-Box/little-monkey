@@ -243,6 +243,7 @@ export interface VdnGenerationRequest {
   firstImagePath: string | null;
   lastImagePath: string | null;
   sourceGalleryEntryId: string | null;
+  continuationMode: "last_frame" | "video_reference";
   referenceImagePaths: string[];
   referenceVideoPath: string | null;
   loraPaths: string[];
