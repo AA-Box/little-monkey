@@ -570,7 +570,8 @@ export function StudioVdnPanel({
               if (id) setSourceGalleryId(null);
             }}>
             <option value="">No prerequisite VDN job</option>
-            {durableJobs.filter((entry) => entry.status !== "failed" && entry.status !== "cancelled")
+            {durableJobs.filter((entry) => entry.request.backend === "diffusers" &&
+                entry.status !== "failed" && entry.status !== "cancelled")
               .map((entry) => <option key={entry.id} value={entry.id}>
                 {entry.id.slice(0, 8)} · {entry.status} · {entry.request.prompt.slice(0, 30)}
               </option>)}
