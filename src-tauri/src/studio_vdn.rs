@@ -22,6 +22,7 @@ const MAX_LOG_BYTES: u64 = 256 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
+const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
 /// An independent real rendering runtime. Each shares licensing, cancellation
 /// and gallery storage; none is implemented by relabeling the Diffusers mode.
@@ -33,11 +34,13 @@ pub enum VdnBackend {
     OptimizedSingle,
     OptimizedUlysses,
     Sglang,
+    FreeVideoAdaptive,
 }
 
 fn worker_source(backend: VdnBackend) -> &'static str {
     match backend {
         VdnBackend::Diffusers => WORKER,
+        VdnBackend::FreeVideoAdaptive => ADAPTIVE_WORKER,
         _ => FAST_WORKER,
     }
 }
@@ -47,11 +50,18 @@ fn worker_args(
     gpu_class: Option<&str>, server_port: Option<u16>,
 ) -> Result<Vec<String>, String> {
     if backend == VdnBackend::Diffusers { return Ok(Vec::new()); }
+    if backend == VdnBackend::FreeVideoAdaptive {
+        let cache = checkpoint_root.ok_or(
+            "Select the already prepared FreeVideo model cache")?;
+        let cache = Path::new(cache).canonicalize().map_err(|_|
+            "Prepared FreeVideo model cache cannot be found")?;
+        return Ok(vec!["--cache".into(), cache.to_string_lossy().into_owned()]);
+    }
     let mut args = vec!["--backend".into(), match backend {
         VdnBackend::OptimizedSingle => "optimized_single",
         VdnBackend::OptimizedUlysses => "optimized_ulysses",
         VdnBackend::Sglang => "sglang",
-        VdnBackend::Diffusers => unreachable!(),
+        VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive => unreachable!(),
     }.into()];
     if backend == VdnBackend::Sglang {
         let port = server_port.unwrap_or(30010);
@@ -101,6 +111,8 @@ pub struct VdnRunRequest {
     pub reference_video_path: Option<String>,
     #[serde(default)]
     pub lora_paths: Vec<String>,
+    #[serde(default)]
+    pub reference_audio_path: Option<String>,
     pub fp8: bool,
     pub offload_dit: bool,
     #[serde(default)]
@@ -185,7 +197,7 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         || (request.frames - 5) % 17 != 0 {
         return Err("VDN requires 1-50 inference steps and 17n+5 frames in 120..360".into());
     }
-    if request.backend != VdnBackend::Diffusers && request.steps != 8 {
+    if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) && request.steps != 8 {
         return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
     }
     if request.seed < 0 {
@@ -198,7 +210,7 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if request.lora_paths.len() > 4 { return Err("VDN supports at most four LoRAs".into()); }
     if !request.lora_paths.is_empty() &&
-        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses | VdnBackend::FreeVideoAdaptive) {
         return Err("External LoRA requires native optimized OpenVDN".into());
     }
     for lora in &request.lora_paths {
@@ -207,6 +219,16 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         if !metadata.is_file() || metadata.len() < 128 || metadata.len() > 8 * 1024 * 1024 * 1024 ||
             path.extension().and_then(|x| x.to_str()) != Some("safetensors") {
             return Err("VDN LoRA must be a local .safetensors file up to 8 GiB".into());
+        }
+    }
+    if let Some(audio) = &request.reference_audio_path {
+        if request.backend != VdnBackend::FreeVideoAdaptive {
+            return Err("Audio-conditioned references require the optional adaptive backend".into());
+        }
+        let path = Path::new(audio).canonicalize().map_err(|_| "Reference audio not found")?;
+        let info = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !info.is_file() || info.len() < 32 || info.len() > 64 * 1024 * 1024 {
+            return Err("Audio reference must be a local file of at most 64 MiB".into());
         }
     }
     if request.reference_video_path.is_some() &&
@@ -331,6 +353,9 @@ pub async fn generation_vdn_run(
     if let Some(ref image) = first { process.arg("--first").arg(image); }
     if let Some(ref image) = last { process.arg("--last").arg(image); }
     for lora in &request.lora_paths { process.arg("--lora").arg(lora); }
+    if let Some(audio) = &request.reference_audio_path {
+        process.arg("--reference-audio").arg(audio);
+    }
     if let Some(reference_video) = &request.reference_video_path {
         process.arg("--reference-video").arg(reference_video);
     }
@@ -484,6 +509,7 @@ mod tests {
         assert_eq!(worker_source(VdnBackend::OptimizedSingle), FAST_WORKER);
         assert_eq!(worker_source(VdnBackend::OptimizedUlysses), FAST_WORKER);
         assert_eq!(worker_source(VdnBackend::Sglang), FAST_WORKER);
+        assert_eq!(worker_source(VdnBackend::FreeVideoAdaptive), ADAPTIVE_WORKER);
         let sglang = worker_args(VdnBackend::Sglang, None, None, None, Some(30010)).unwrap();
         assert!(sglang.windows(2).any(|pair| pair == ["--backend", "sglang"]));
         assert!(sglang.windows(2).any(|pair| pair == ["--port", "30010"]));
@@ -532,6 +558,7 @@ mod tests {
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],
+            reference_audio_path: None,
             fp8: false,
             offload_dit: true,
             backend: VdnBackend::Diffusers,
