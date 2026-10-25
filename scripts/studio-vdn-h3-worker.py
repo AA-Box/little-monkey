@@ -482,11 +482,44 @@ def _run_once(args):
                       "audio": bool(args.reference_audio),
                       "hybridVDN": not references}), flush=True)
     pipe = ModularPipeline.from_pretrained(checkpoint, workflow=mode)
-    kwargs = {"trust_remote_code": True, "torch_dtype": torch.bfloat16}
+    denoiser_partition = "transformer_ref" if references else "transformer"
+    if args.int8:
+        # The documented H3 consumer-GPU recipe quantizes BOTH large models
+        # during loading. Quantizing just the transformer after loading all
+        # BF16 weights still requires well over 120 GB of host memory.
+        from diffusers import MiniMaxH3Transformer3DModel, TorchAoConfig
+        from transformers import Qwen3VLForConditionalGeneration
+        from transformers import TorchAoConfig as TransformersTorchAoConfig
+        from torchao.quantization import Int8WeightOnlyConfig
+        pipe.update_components(**{
+            denoiser_partition: MiniMaxH3Transformer3DModel.from_pretrained(
+                checkpoint, subfolder=denoiser_partition, dtype=torch.bfloat16,
+                quantization_config=TorchAoConfig(
+                    Int8WeightOnlyConfig(version=2),
+                    modules_to_not_convert=[
+                        "proj_in", "audio_proj_in", "context_embedder",
+                        "time_embedder", "time_proj", "token_refiner",
+                        "norm_out", "proj_out", "audio_proj_out",
+                    ],
+                ),
+                low_cpu_mem_usage=False,
+            ),
+            "text_encoder": Qwen3VLForConditionalGeneration.from_pretrained(
+                checkpoint, subfolder="text_encoder", dtype=torch.bfloat16,
+                quantization_config=TransformersTorchAoConfig(
+                    Int8WeightOnlyConfig(version=2),
+                    modules_to_not_convert=[
+                        "model.visual", "model.language_model.embed_tokens",
+                        "model.language_model.norm", "lm_head",
+                    ],
+                ),
+            ),
+        })
+    kwargs = {"trust_remote_code": True, "dtype": torch.bfloat16}
     if args.fp8:
-        kwargs["fp8"] = {"transformer_ref" if references else "transformer": True}
+        kwargs["fp8"] = {denoiser_partition: True}
     pipe.load_components(**kwargs)
-    denoiser = getattr(pipe, "transformer_ref" if references else "transformer", None)
+    denoiser = getattr(pipe, denoiser_partition, None)
     if denoiser is None:
         raise RuntimeError("Selected VDN weights do not contain the required "
                            "Ref2VA transformer partition; refusing unconditioned fallback")
@@ -497,23 +530,27 @@ def _run_once(args):
             raise RuntimeError("Installed Diffusers lacks native H3 LoRA loading")
         pipe.load_lora_weights(lora)
     if args.int8:
-        try:
-            from torchao.quantization import Int8WeightOnlyConfig, quantize_
-        except ImportError as error:
-            raise RuntimeError(
-                "Consumer CUDA INT8 requires torchao in the selected VDN environment"
-            ) from error
-        print(json.dumps({"phase": "quantizing", "precision": "int8_weight_only"}),
-              flush=True)
-        quantize_(denoiser, Int8WeightOnlyConfig())
+        denoiser.requires_grad_(False)
+        pipe.text_encoder.requires_grad_(False)
+        print(json.dumps({"phase": "quantization", "precision": "int8_weight_only",
+                          "models": [denoiser_partition, "text_encoder"],
+                          "loadTimeQuantization": True}), flush=True)
     if any(getattr(pipe, name, None) is None for name in
            ("text_encoder", "vae", "audio_vae")):
         raise RuntimeError("An OpenVDN component did not load successfully.")
 
     device = torch.device(args.device)
-    apply_group_offloading(pipe.text_encoder, onload_device=device,
-                           offload_device="cpu", offload_type="leaf_level",
-                           use_stream=True)
+    text_stream_kwargs = {
+        "onload_device": device, "offload_device": "cpu",
+        "offload_type": "leaf_level", "use_stream": True,
+    }
+    if args.disk_offload:
+        text_path = Path(args.disk_offload_path) / "text_encoder"
+        text_path.mkdir(parents=True, exist_ok=True)
+        text_stream_kwargs["offload_to_disk_path"] = str(text_path)
+    # Stream the language-model layers; Qwen's visual encoder is invoked by
+    # the same real Diffusers text-encoding block.
+    apply_group_offloading(pipe.text_encoder.model, **text_stream_kwargs)
     _, vae = cpu_offload_with_hook(pipe.vae, execution_device=device)
     cpu_offload_with_hook(pipe.audio_vae, execution_device=device,
                           prev_module_hook=vae)
@@ -528,7 +565,9 @@ def _run_once(args):
             "num_blocks_per_group": 1, "use_stream": True,
         }
         if args.disk_offload_path:
-            stream_kwargs["offload_to_disk_path"] = args.disk_offload_path
+            dit_path = Path(args.disk_offload_path) / "denoiser"
+            dit_path.mkdir(parents=True, exist_ok=True)
+            stream_kwargs["offload_to_disk_path"] = str(dit_path)
         apply_group_offloading(denoiser, **stream_kwargs)
     else:
         denoiser.to(device)
