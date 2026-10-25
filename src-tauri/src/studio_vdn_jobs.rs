@@ -190,6 +190,38 @@ async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
         root.join("content-v1"), 256 * 1024 * 1024
     ).map_err(|e| e.to_string())?;
     let bytes = store.read(&entry.artifact_id).map_err(|e| e.to_string())?;
+    if request.continuation_mode == "latent_context" {
+        let original_job_id = entry.video_job_id.as_deref()
+            .ok_or("AV latent continuation requires a native VDN Gallery job")?;
+        let parent = {
+            let _guard = lock().lock().map_err(|e| e.to_string())?;
+            load(&directory(app)?, original_job_id)?
+        };
+        if !matches!(parent.status, VdnJobStatus::Completed)
+            || parent.request.backend != crate::studio_vdn::VdnBackend::Diffusers
+            || parent.result_entry_id.as_deref() != Some(entry.entry_id.as_str()) {
+            return Err("AV latent source must be a completed native Diffusers Gallery job".into());
+        }
+        let source_root = root.join("studio-vdn-h3").join("temporal-contexts");
+        let root_meta = fs::symlink_metadata(&source_root)
+            .map_err(|_| "Previous video has no saved AV latent context")?;
+        if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+            return Err("Unsafe native AV latent context directory".into());
+        }
+        let saved = source_root.join(format!("{original_job_id}.safetensors"));
+        let meta = fs::symlink_metadata(&saved)
+            .map_err(|_| "Previous video predates native AV context support; regenerate it")?;
+        if !meta.is_file() || meta.file_type().is_symlink()
+            || !(128..=64 * 1024 * 1024).contains(&meta.len()) {
+            return Err("Unsafe or oversized saved native AV latent context".into());
+        }
+        request.resolved_temporal_context_path = Some(saved.to_string_lossy().into_owned());
+        request.resolved_temporal_source_sha256 =
+            Some(format!("{:x}", Sha256::digest(&bytes)));
+        request.resolved_temporal_source_job_id = Some(original_job_id.into());
+        // The decoded previous final frame is also an optional FL2VA anchor;
+        // the source's verified AV latent tail, not this image, supplies context.
+    }
     if request.continuation_mode == "video_reference" {
         // Retain temporal motion *and* the original soundtrack by supplying the
         // pinned clip directly to native MiniMax-H3 Ref2VA reference decoding.
@@ -237,9 +269,19 @@ pub(crate) fn completed_with_preview(app: &AppHandle, id: &str) -> Result<bool, 
         return Err("Native VDN checkpoint directory is unsafe".into());
     }
     let preview = checkpoint_root.join(format!("{id}.safetensors"));
-    let metadata = fs::symlink_metadata(&preview).map_err(|error| error.to_string())?;
-    Ok(metadata.is_file() && !metadata.file_type().is_symlink()
-       && metadata.len() > 128 && metadata.len() <= 64 * 1024 * 1024)
+    let clips: Vec<PathBuf> = if job.request.segments > 1 {
+        (0..job.request.segments)
+            .map(|part| PathBuf::from(format!("{}.segment{part}.safetensors",
+                preview.display())))
+            .collect()
+    } else {
+        vec![preview]
+    };
+    Ok(clips.iter().all(|path| {
+        fs::symlink_metadata(path).is_ok_and(|m|
+            m.is_file() && !m.file_type().is_symlink()
+            && m.len() > 128 && m.len() <= 64 * 1024 * 1024)
+    }))
 }
 
 fn published_entry(app: &AppHandle, id: &str) -> Result<Option<String>, String> {
