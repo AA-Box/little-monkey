@@ -23,6 +23,7 @@ const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
 const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py");
 const TEMPORAL_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal.py");
+const TEMPORAL_STORE_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal_store.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -51,7 +52,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
@@ -130,6 +131,13 @@ pub struct VdnRunRequest {
     pub source_vdn_job_id: Option<String>,
     #[serde(default = "default_continuation_mode")]
     pub continuation_mode: String,
+    // Dispatch-only, never accepted from a frontend or persisted in a journal.
+    #[serde(skip)]
+    pub resolved_temporal_context_path: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_source_sha256: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_source_job_id: Option<String>,
     #[serde(default)]
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
@@ -236,9 +244,6 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if request.segments != 1 && request.backend != VdnBackend::Diffusers {
         return Err("Native temporal continuity requires the Little Monkey Diffusers backend".into());
     }
-    if request.segments > 1 && request.native_two_pass {
-        return Err("Multi-segment native continuation cannot reuse a single two-pass checkpoint".into());
-    }
     if request.segments > 1 && request.last_image_path.is_some() {
         return Err("Multi-segment native continuation cannot use a fixed terminal keyframe".into());
     }
@@ -248,7 +253,7 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if !matches!(request.memory_mode.as_str(), "auto" | "resident" | "stream_cpu" | "stream_disk") {
         return Err("Invalid Little Monkey native memory policy".into());
     }
-    if !matches!(request.continuation_mode.as_str(), "last_frame" | "video_reference") {
+    if !matches!(request.continuation_mode.as_str(), "last_frame" | "video_reference" | "latent_context") {
         return Err("Unsupported native continuation mode".into());
     }
     if let Some(source_id) = &request.source_vdn_job_id {
@@ -259,6 +264,19 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         }
         if request.first_image_path.is_some() {
             return Err("VDN predecessor supplies its own first frame".into());
+        }
+    }
+    if request.continuation_mode == "latent_context" {
+        if request.backend != VdnBackend::Diffusers {
+            return Err("AV latent continuation requires native Diffusers".into());
+        }
+        if request.source_gallery_entry_id.is_none()
+            && request.source_vdn_job_id.is_none()
+            && request.resolved_temporal_context_path.is_none() {
+            return Err("AV latent continuation must resolve a pinned Gallery source".into());
+        }
+        if request.reference_video_path.is_some() || request.last_image_path.is_some() {
+            return Err("Native AV latent continuation cannot mix motion video or final-frame anchors".into());
         }
     }
     if request.continuation_mode == "video_reference" {
@@ -477,6 +495,24 @@ pub async fn generation_vdn_run(
         .kill_on_drop(true);
     if request.backend == VdnBackend::Diffusers {
         process.arg("--segments").arg(request.segments.to_string());
+        process.arg("--job-id").arg(&request.job_id);
+        let continuation_root = directory.join("temporal-contexts");
+        std::fs::create_dir_all(&continuation_root).map_err(|e| e.to_string())?;
+        let meta = std::fs::symlink_metadata(&continuation_root).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("Unsafe native temporal context directory".into());
+        }
+        process.arg("--temporal-context-out")
+            .arg(continuation_root.join(format!("{}.safetensors", request.job_id)));
+        if let Some(source) = &request.resolved_temporal_context_path {
+            let digest = request.resolved_temporal_source_sha256.as_ref()
+                .ok_or("Unpinned native temporal source SHA-256")?;
+            let source_job = request.resolved_temporal_source_job_id.as_ref()
+                .ok_or("Unpinned native temporal source job")?;
+            process.arg("--temporal-context-in").arg(source)
+                .arg("--temporal-source-video-sha256").arg(digest)
+                .arg("--temporal-source-job-id").arg(source_job);
+        }
         process.arg("--memory-mode").arg(&request.memory_mode);
         let checkpoint_home = directory.join("step-checkpoints");
         std::fs::create_dir_all(&checkpoint_home).map_err(|e| e.to_string())?;
@@ -588,7 +624,11 @@ pub async fn generation_vdn_run(
                             VdnBackend::FreeVideoAdaptive => "vdn-h3-freevideo-adaptive",
                         },
                         &request.prompt, request.steps, request.seed,
-                        request.frames, first.is_some() || !request.reference_image_paths.is_empty()
+                        (if request.resolved_temporal_context_path.is_some() {
+                            request.segments * (request.frames - 22)
+                        } else {
+                            request.frames + (request.segments - 1) * (request.frames - 22)
+                        }), first.is_some() || !request.reference_image_paths.is_empty()
                             || request.reference_video_path.is_some(), &bytes
                     )
                 }
@@ -782,6 +822,9 @@ mod tests {
             source_gallery_entry_id: None,
             source_vdn_job_id: None,
             continuation_mode: "last_frame".into(),
+            resolved_temporal_context_path: None,
+            resolved_temporal_source_sha256: None,
+            resolved_temporal_source_job_id: None,
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],
