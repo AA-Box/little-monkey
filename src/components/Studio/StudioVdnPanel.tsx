@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Play, Square, FolderOpen, RefreshCw } from "lucide-react";
 import { Button } from "../ui";
-import { studioClient, type GenerationEntry, type VdnBackend } from "../../lib/studioClient";
+import { studioClient, type GenerationEntry, type VdnBackend, type DurableVdnJob } from "../../lib/studioClient";
 
 type PhaseEvent = { jobId: string; phase: string; detail: string };
 type Region = "eu" | "uk" | "us" | "kr" | "other" | null;
@@ -42,6 +42,7 @@ export function StudioVdnPanel({
   const [gpuFp8, setGpuFp8] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<GenerationEntry | null>(null);
+  const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
   const job = useRef<string | null>(null);
 
   const refreshLicense = useCallback(async () => {
@@ -59,6 +60,7 @@ export function StudioVdnPanel({
 
   useEffect(() => {
     void refreshLicense();
+    void studioClient.vdnJobs().then(setDurableJobs).catch(() => {});
     let active = true;
     let unlisten: (() => void) | undefined;
     void listen<PhaseEvent>("studio://vdn-progress", (event) => {
@@ -127,7 +129,7 @@ export function StudioVdnPanel({
     setError(null);
     setCreated(null);
     try {
-      const entry = await studioClient.vdnRun({
+      await studioClient.vdnSubmit({
         jobId: id,
         pythonExecutable: python,
         prompt: prompt.trim(),
@@ -145,9 +147,26 @@ export function StudioVdnPanel({
         serverPort: backend === "sglang" ? serverPort : null,
         acknowledgeThirdPartyCode: trustRemoteCode,
       });
-      setCreated(entry);
-      setPhase("completed");
-      await onCompleted();
+      // Persisted backend queue continues even if this React view unmounts.
+      for (;;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1200));
+        const jobs = await studioClient.vdnJobs();
+        setDurableJobs(jobs);
+        const latest = jobs.find((record) => record.id === id);
+        if (!latest) throw new Error("Persisted VDN job disappeared");
+        setPhase(latest.status);
+        if (latest.status === "completed") {
+          const entry = (await studioClient.gallery()).find((item) =>
+            item.entryId === latest.resultEntryId);
+          if (entry) setCreated(entry);
+          await onCompleted();
+          break;
+        }
+        if (latest.status === "failed" || latest.status === "cancelled" ||
+            latest.status === "interrupted") {
+          throw new Error(latest.error ?? `VDN job ${latest.status}`);
+        }
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setPhase("failed");
@@ -162,8 +181,8 @@ export function StudioVdnPanel({
     const id = job.current;
     if (!id) return;
     try {
-      const cancelled = await studioClient.vdnCancel(id);
-      setPhase(cancelled ? "cancelling" : "already finished");
+      await studioClient.vdnCancelJob(id);
+      setPhase("cancelling");
     } catch (cause) {
       setError(String(cause));
     }
@@ -382,6 +401,24 @@ export function StudioVdnPanel({
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
+        {durableJobs.length > 0 && <div className="grid gap-1" aria-label="VDN job history">
+          <span className="font-semibold">Persisted VDN jobs</span>
+          {durableJobs.slice(-8).reverse().map((record) =>
+            <div key={record.id} className="flex items-center gap-2 text-muted">
+              <span>{record.id.slice(0, 8)} · {record.status} · attempt {record.attempts}</span>
+              {(record.status === "failed" || record.status === "interrupted") &&
+                <Button size="sm" variant="secondary" onClick={() => void studioClient.vdnResume(record.id)
+                  .then(() => studioClient.vdnJobs()).then(setDurableJobs).catch((e) => setError(String(e)))}>
+                  Retry
+                </Button>}
+              {(record.status === "queued" || record.status === "running") &&
+                <Button size="sm" variant="secondary" onClick={() => void studioClient.vdnCancelJob(record.id)
+                  .then(() => studioClient.vdnJobs()).then(setDurableJobs).catch((e) => setError(String(e)))}>
+                  Cancel
+                </Button>}
+            </div>
+          )}
+        </div>}
         {error && <p role="alert" className="text-danger">{error}</p>}
         {created && <p className="text-foreground">
           Video saved to Studio Gallery: {created.frameCount} frames,
