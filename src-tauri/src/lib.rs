@@ -54,6 +54,7 @@ mod studio_video_timeline;
 pub(crate) mod studio_model_policy;
 pub(crate) mod studio_minimax_entitlement;
 pub(crate) mod studio_vdn;
+pub(crate) mod studio_vdn_jobs;
 pub mod studio_parity;
 pub mod character_trainer;
 pub mod studio_tools;
@@ -1350,6 +1351,7 @@ pub fn run() {
             // runtimes were materialized and profile restore was recovered.
             // No Studio window, tab, or listing IPC is needed to dispatch.
             studio_video_jobs::start_background_recovery(app.handle().clone());
+            studio_vdn_jobs::start_background_recovery(app.handle().clone());
             studio_video_timeline::start_background_recovery(app.handle().clone());
 
             Ok(())
@@ -2125,6 +2127,10 @@ pub fn run() {
             generation_commands::generation_vdn_accept_terms,
             generation_commands::generation_vdn_license_status,
             studio_vdn::generation_vdn_run,
+            studio_vdn_jobs::generation_vdn_submit,
+            studio_vdn_jobs::generation_vdn_jobs,
+            studio_vdn_jobs::generation_vdn_resume,
+            studio_vdn_jobs::generation_vdn_cancel_job,
             studio_vdn::generation_vdn_probe,
             studio_vdn::generation_vdn_cancel,
             generation_commands::generation_set_hugging_face_token,

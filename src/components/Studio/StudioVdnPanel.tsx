@@ -3,14 +3,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Play, Square, FolderOpen, RefreshCw } from "lucide-react";
 import { Button } from "../ui";
-import { studioClient, type GenerationEntry, type VdnBackend } from "../../lib/studioClient";
+import { studioClient, type GenerationEntry, type VdnBackend, type DurableVdnJob } from "../../lib/studioClient";
 
 type PhaseEvent = { jobId: string; phase: string; detail: string };
 type Region = "eu" | "uk" | "us" | "kr" | "other" | null;
 
 /** Executes OpenVDN's actual hybrid-attention model through an app-owned
- * standalone Python worker. The optional adaptive backend uses a separately
- * installed FreeVideo package; the default OpenVDN modes remain independent.
+ * standalone Python worker. No FreeVideo process or ComfyUI server.
  * The Rust backend, never UI state, controls local model licensing. */
 export function StudioVdnPanel({
   onCompleted,
@@ -28,6 +27,8 @@ export function StudioVdnPanel({
   const [prompt, setPrompt] = useState("");
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
+  const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
+  const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
   const [seed, setSeed] = useState("0");
@@ -43,6 +44,7 @@ export function StudioVdnPanel({
   const [gpuFp8, setGpuFp8] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<GenerationEntry | null>(null);
+  const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
   const job = useRef<string | null>(null);
 
   const refreshLicense = useCallback(async () => {
@@ -60,6 +62,9 @@ export function StudioVdnPanel({
 
   useEffect(() => {
     void refreshLicense();
+    void studioClient.vdnJobs().then(setDurableJobs).catch(() => {});
+    void studioClient.gallery().then((entries) => setAvailableClips(entries.filter((entry) =>
+      entry.mediaType === "video/mp4" || entry.mediaType === "video/webm"))).catch(() => {});
     let active = true;
     let unlisten: (() => void) | undefined;
     void listen<PhaseEvent>("studio://vdn-progress", (event) => {
@@ -89,9 +94,8 @@ export function StudioVdnPanel({
         gpuClass, serverPort,
       );
       if (backend === "free_video_adaptive") {
-        setProbeInfo("Optional FreeVideo adaptive runtime detected; prepared weights and hardware must still be validated when rendering.");
+        setProbeInfo("FreeVideo adaptive runtime detected; weights checked during rendering.");
         setGpuFp8(false);
-        setFp8(false);
       } else if (backend === "sglang") {
         setProbeInfo(`Serving ${report.model} through 127.0.0.1:${report.port ?? serverPort}`);
         setGpuFp8(false);
@@ -132,12 +136,13 @@ export function StudioVdnPanel({
     setError(null);
     setCreated(null);
     try {
-      const entry = await studioClient.vdnRun({
+      await studioClient.vdnSubmit({
         jobId: id,
         pythonExecutable: python,
         prompt: prompt.trim(),
         firstImagePath: first,
         lastImagePath: last,
+        sourceGalleryEntryId: sourceGalleryId,
         steps,
         frames,
         seed: Number(seed) || 0,
@@ -150,9 +155,26 @@ export function StudioVdnPanel({
         serverPort: backend === "sglang" ? serverPort : null,
         acknowledgeThirdPartyCode: trustRemoteCode,
       });
-      setCreated(entry);
-      setPhase("completed");
-      await onCompleted();
+      // Persisted backend queue continues even if this React view unmounts.
+      for (;;) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1200));
+        const jobs = await studioClient.vdnJobs();
+        setDurableJobs(jobs);
+        const latest = jobs.find((record) => record.id === id);
+        if (!latest) throw new Error("Persisted VDN job disappeared");
+        setPhase(latest.status);
+        if (latest.status === "completed") {
+          const entry = (await studioClient.gallery()).find((item) =>
+            item.entryId === latest.resultEntryId);
+          if (entry) setCreated(entry);
+          await onCompleted();
+          break;
+        }
+        if (latest.status === "failed" || latest.status === "cancelled" ||
+            latest.status === "interrupted") {
+          throw new Error(latest.error ?? `VDN job ${latest.status}`);
+        }
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setPhase("failed");
@@ -167,8 +189,8 @@ export function StudioVdnPanel({
     const id = job.current;
     if (!id) return;
     try {
-      const cancelled = await studioClient.vdnCancel(id);
-      setPhase(cancelled ? "cancelling" : "already finished");
+      await studioClient.vdnCancelJob(id);
+      setPhase("cancelling");
     } catch (cause) {
       setError(String(cause));
     }
@@ -222,13 +244,13 @@ export function StudioVdnPanel({
               const next = event.target.value as VdnBackend;
               setBackend(next);
               setProbeInfo(null);
-              if (next !== "diffusers") setSteps(8);
+              if (next !== "diffusers" && next !== "free_video_adaptive") setSteps(8);
             }}>
             <option value="diffusers">Portable Diffusers — single CUDA GPU with offload</option>
             <option value="optimized_single">OpenVDN tuned kernels — Linux, one large CUDA GPU</option>
             <option value="optimized_ulysses">OpenVDN Ulysses — Linux, 8 H200/B200 GPUs</option>
             <option value="sglang">SGLang Diffusion — local accelerated server (1/2/4/8 GPUs)</option>
-            <option value="free_video_adaptive">Adaptive low-memory — installed FreeVideo engine (CPU/disk/INT8/FP8)</option>
+            <option value="free_video_adaptive">Adaptive FreeVideo — installed low-memory model runtime</option>
           </select>
         </label>
 
@@ -385,11 +407,24 @@ export function StudioVdnPanel({
           </label>}
         </div>
 
+        <label className="grid gap-1 text-muted">
+          Continue from a previous Gallery clip (true final frame)
+          <select className="rounded border border-border bg-background p-1 text-foreground"
+            value={sourceGalleryId ?? ""} disabled={running || Boolean(first)}
+            onChange={(event) => setSourceGalleryId(event.target.value || null)}>
+            <option value="">No previous clip</option>
+            {availableClips.map((entry) =>
+              <option key={entry.entryId} value={entry.entryId}>
+                {entry.prompt.slice(0, 48)} · {entry.entryId.slice(-8)}
+              </option>
+            )}
+          </select>
+        </label>
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />
-          I have verified and authorize running the selected third-party VDN
-          runtime and model components, which may execute Python code.
+          I have verified and authorize running the selected official OpenVDN
+          source/runtime and the upstream model components, which may execute Python code.
         </label>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -404,6 +439,24 @@ export function StudioVdnPanel({
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
+        {durableJobs.length > 0 && <div className="grid gap-1" aria-label="VDN job history">
+          <span className="font-semibold">Persisted VDN jobs</span>
+          {durableJobs.slice(-8).reverse().map((record) =>
+            <div key={record.id} className="flex items-center gap-2 text-muted">
+              <span>{record.id.slice(0, 8)} · {record.status} · attempt {record.attempts}</span>
+              {(record.status === "failed" || record.status === "interrupted") &&
+                <Button size="sm" variant="secondary" onClick={() => void studioClient.vdnResume(record.id)
+                  .then(() => studioClient.vdnJobs()).then(setDurableJobs).catch((e) => setError(String(e)))}>
+                  Retry
+                </Button>}
+              {(record.status === "queued" || record.status === "running") &&
+                <Button size="sm" variant="secondary" onClick={() => void studioClient.vdnCancelJob(record.id)
+                  .then(() => studioClient.vdnJobs()).then(setDurableJobs).catch((e) => setError(String(e)))}>
+                  Cancel
+                </Button>}
+            </div>
+          )}
+        </div>}
         {error && <p role="alert" className="text-danger">{error}</p>}
         {created && <p className="text-foreground">
           Video saved to Studio Gallery: {created.frameCount} frames,
