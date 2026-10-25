@@ -231,7 +231,7 @@ export interface GenerationModel {
 }
 
 /** Standalone, authorized CUDA VDN-H3 inference (no FreeVideo/ComfyUI). */
-export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang";
+export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang" | "free_video_adaptive";
 
 export interface VdnGenerationRequest {
   jobId: string;
@@ -245,6 +245,7 @@ export interface VdnGenerationRequest {
   referenceImagePaths: string[];
   referenceVideoPath: string | null;
   loraPaths: string[];
+  referenceAudioPath: string | null;
   fp8: boolean;
   offloadDit: boolean;
   backend: VdnBackend;
