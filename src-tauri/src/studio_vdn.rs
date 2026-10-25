@@ -355,16 +355,27 @@ fn valid_mp4(bytes: &[u8]) -> bool {
     bytes.len() >= 32 && bytes.get(4..8) == Some(b"ftyp".as_slice())
 }
 
-fn read_last_phase(log: &Path) -> Option<String> {
+fn read_last_phase(log: &Path) -> Option<(String, String)> {
     let bytes = std::fs::read(log).ok()?;
     if bytes.len() as u64 > MAX_LOG_BYTES {
         return None;
     }
     let s = String::from_utf8(bytes).ok()?;
-    s.lines().filter_map(|line| {
+    s.lines().rev().find_map(|line| {
         let row: serde_json::Value = serde_json::from_str(line).ok()?;
-        row.get("phase")?.as_str().map(str::to_owned)
-    }).last()
+        let phase = row.get("phase")?.as_str()?.to_owned();
+        let detail = match (
+            row.get("stage").and_then(|v| v.as_str()),
+            row.get("completedSteps").and_then(|v| v.as_u64()),
+            row.get("totalSteps").and_then(|v| v.as_u64()),
+        ) {
+            (Some(stage), Some(done), Some(total)) if done <= total && total <= 100 => {
+                format!("{stage}: completed {done}/{total} sampler steps")
+            }
+            _ => String::new(),
+        };
+        Some((phase, detail))
+    })
 }
 
 fn brief_error(path: &Path) -> String {
@@ -516,9 +527,9 @@ pub async fn generation_vdn_run(
             _ = health.tick() => {
                 match crate::generation_commands::ensure_vdn_usage(&app) {
                     Ok(()) => {
-                        if let Some(phase) = read_last_phase(&stdout_path) {
+                        if let Some((phase, detail)) = read_last_phase(&stdout_path) {
                             let _ = app.emit("studio://vdn-progress", VdnProgress {
-                                job_id: &request.job_id, phase: &phase, detail: "",
+                                job_id: &request.job_id, phase: &phase, detail: &detail,
                             });
                         }
                         continue;
