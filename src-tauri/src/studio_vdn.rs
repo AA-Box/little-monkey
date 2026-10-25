@@ -305,7 +305,7 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         return Err("VDN supports at most eight reference images".into());
     }
     if !request.reference_image_paths.is_empty() &&
-        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
         return Err("Ref2VA requires native OpenVDN or Diffusers".into());
     }
     for reference in &request.reference_image_paths {
