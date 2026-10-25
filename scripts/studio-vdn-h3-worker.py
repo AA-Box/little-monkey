@@ -359,6 +359,18 @@ def validate_reference_media(args):
                     raise RuntimeError("Reference image exceeds 16 megapixels")
 
 
+def validate_preview_layout(video_shape, audio_shape):
+    """Prevent malformed/corrupt checkpoints from allocating arbitrary GPU shapes."""
+    if len(video_shape) != 5 or video_shape[0] != 1 or video_shape[1] != 24:
+        raise ValueError("Native preview must hold 1 x 24-channel video latents")
+    if not 1 <= video_shape[2] <= 32 or tuple(video_shape[3:]) != (24, 42):
+        raise ValueError("Native preview geometry must be half-canvas video latents")
+    if len(audio_shape) != 3 or audio_shape[0:2] != (2, 32):
+        raise ValueError("Native preview must hold stereo-channel H3 audio latents")
+    if not 1 <= audio_shape[2] <= 500:
+        raise ValueError("Native preview audio latent length invalid")
+
+
 def native_two_pass(pipe, args, torch, device, keyframes, references):
     """Native latent-space two-pass using Diffusers' actual MiniMax-H3 state I/O.
 
@@ -374,7 +386,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
     fingerprint = checkpoint_identity(args)
     source = args.refine_from or args.checkpoint
     def read(path):
-        if not os.path.isfile(path) or os.path.getsize(path) > 2 * GiB:
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > 64 * 1024**2:
             raise RuntimeError("Native preview checkpoint is absent or too large")
         with safe_open(path, framework="pt", device="cpu") as handle:
             meta = handle.metadata() or {}
@@ -401,8 +413,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
             **({"references": references} if references else keyframes),
         )
         latents, audio_latents = preview["latents"], preview["audio_latents"]
-        if latents.ndim != 5 or audio_latents.ndim != 3:
-            raise RuntimeError("MiniMax-H3 did not return reusable video/audio latents")
+        validate_preview_layout(tuple(latents.shape), tuple(audio_latents.shape))
         from pathlib import Path
         destination = Path(args.checkpoint)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -411,10 +422,19 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
                    "audio": audio_latents.detach().float().cpu().contiguous()},
                   temp, metadata={"schema": "little-monkey-vdn-latents-v1",
                                   "identity": fingerprint})
+        with open(temp, "rb") as written:
+            os.fsync(written.fileno())
         os.replace(temp, destination)
+        if os.name == "posix":
+            folder = os.open(str(destination.parent), os.O_RDONLY)
+            try:
+                os.fsync(folder)
+            finally:
+                os.close(folder)
         print(json.dumps({"phase": "preview_checkpointed", "path": str(destination)}),
               flush=True)
 
+    validate_preview_layout(tuple(latents.shape), tuple(audio_latents.shape))
     latents = latents.to(device=device, dtype=torch.float32)
     audio_latents = audio_latents.to(device=device, dtype=torch.float32)
     target_frames = latents.shape[2]
