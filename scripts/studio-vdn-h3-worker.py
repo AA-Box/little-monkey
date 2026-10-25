@@ -135,6 +135,8 @@ def parse_args(argv=None):
         parser.error(str(error))
     if args.segments > 1 and args.two_pass:
         parser.error("Native multi-segment continuity cannot share one two-pass checkpoint")
+    if args.segments > 1 and args.last:
+        parser.error("A fixed last-frame keyframe is unsupported in multi-segment native continuity")
     if args.step_checkpoint_root and not Path(args.step_checkpoint_root).is_absolute():
         parser.error("Native step checkpoint location must be absolute and app-owned")
     if args.refine_from and not args.two_pass:
