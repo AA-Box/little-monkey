@@ -515,6 +515,17 @@ mod tests {
         assert_eq!(loaded.source_artifact_id, record.source_artifact_id);
         assert_eq!(loaded.attempts, 1);
         assert_eq!(loaded.created_at_ms, 10);
+        // Atomic replacement must work repeatedly on Windows as well as Unix.
+        let mut updated = loaded;
+        updated.status = VdnJobStatus::Completed;
+        updated.result_entry_id = Some("published-clip".into());
+        updated.updated_at_ms = 42;
+        store(&root, &updated).unwrap();
+        store(&root, &updated).unwrap();
+        let persisted = load(&root, &id).unwrap();
+        assert!(matches!(persisted.status, VdnJobStatus::Completed));
+        assert_eq!(persisted.result_entry_id.as_deref(), Some("published-clip"));
+        assert_eq!(persisted.updated_at_ms, 42);
         fs::remove_dir_all(root).unwrap();
     }
 
