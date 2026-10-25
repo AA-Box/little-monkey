@@ -22,6 +22,7 @@ const MAX_LOG_BYTES: u64 = 256 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
 const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py");
+const LEARNED_UPSCALER_SOURCE: &str = include_str!("../../scripts/studio_vdn_learned_upscaler.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -50,7 +51,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
@@ -258,6 +259,9 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
             || request.first_image_path.is_some() || request.last_image_path.is_some() {
             return Err("Cannot mix pending video continuation with another video/keyframe".into());
         }
+    }
+    if request.native_two_pass && (request.steps != 8 || request.refine_steps != 3) {
+        return Err("Trained H3 latent upscaler requires exactly 8 preview + 3 refinement steps".into());
     }
     if request.native_two_pass && request.backend != VdnBackend::Diffusers {
         return Err("Little Monkey native latent refinement currently requires Diffusers".into());
@@ -481,6 +485,14 @@ pub async fn generation_vdn_run(
             std::fs::create_dir_all(&checkpoints).map_err(|e| e.to_string())?;
             process.arg("--two-pass").arg("--refine-steps").arg(request.refine_steps.to_string());
             process.arg("--checkpoint").arg(checkpoints.join(format!("{}.safetensors", request.job_id)));
+            let upscaler_cache = directory.join("learned-upscaler");
+            std::fs::create_dir_all(&upscaler_cache).map_err(|e| e.to_string())?;
+            let cache_meta = std::fs::symlink_metadata(&upscaler_cache)
+                .map_err(|e| e.to_string())?;
+            if cache_meta.file_type().is_symlink() || !cache_meta.is_dir() {
+                return Err("Unsafe H3 learned upscaler checkpoint cache".into());
+            }
+            process.arg("--upscaler-cache-dir").arg(upscaler_cache);
             if let Some(prior) = &request.refine_from_job_id {
                 if !crate::studio_vdn_jobs::completed_with_preview(&app, prior)? {
                     return Err("Refine-from requires a completed native two-pass source job".into());
@@ -701,6 +713,9 @@ mod tests {
         assert!(WORKER.contains("apply_group_offloading"));
         assert!(SAMPLER_SOURCE.contains("native_sampler_recovery"));
         assert!(staged_worker_source(VdnBackend::Diffusers).contains("NativeStepStore"));
+        assert!(staged_worker_source(VdnBackend::Diffusers).contains("native_learned_upscale"));
+        assert!(LEARNED_UPSCALER_SOURCE.contains("make_h3_resizer"));
+        assert!(!LEARNED_UPSCALER_SOURCE.contains("import freevideo"));
         assert!(!WORKER.contains("import comfyui"));
     }
 
