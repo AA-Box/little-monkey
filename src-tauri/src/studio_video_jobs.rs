@@ -796,6 +796,13 @@ pub fn generation_video_jobs(app: AppHandle) -> Result<Vec<VideoJobView>, String
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn generation_video_resume(app: AppHandle, job_id: String) -> Result<VideoJobView, String> {
+    if crate::studio_vdn_jobs::generation_vdn_jobs(app.clone())?
+        .iter().any(|record| record.id == job_id) {
+        crate::studio_vdn_jobs::generation_vdn_resume(app.clone(), job_id.clone())?;
+        return generation_video_jobs(app)?.into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or_else(|| "VDN job disappeared after resume".to_string());
+    }
     let job = transition(&app, &job_id, |job| {
         if !matches!(job.status, VideoJobStatus::Interrupted | VideoJobStatus::Failed) {
             return Err("Only interrupted or failed video jobs can be resumed".to_string());
@@ -817,6 +824,13 @@ pub fn generation_video_resume(app: AppHandle, job_id: String) -> Result<VideoJo
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn generation_video_cancel(app: AppHandle, job_id: String) -> Result<VideoJobView, String> {
+    if crate::studio_vdn_jobs::generation_vdn_jobs(app.clone())?
+        .iter().any(|record| record.id == job_id) {
+        crate::studio_vdn_jobs::generation_vdn_cancel_job(app.clone(), job_id.clone())?;
+        return generation_video_jobs(app)?.into_iter()
+            .find(|job| job.id == job_id)
+            .ok_or_else(|| "VDN job disappeared after cancellation".to_string());
+    }
     let mut was_rendering = false;
     let job = transition(&app, &job_id, |job| {
         if !matches!(job.status, VideoJobStatus::Queued | VideoJobStatus::Running | VideoJobStatus::Interrupted) {
