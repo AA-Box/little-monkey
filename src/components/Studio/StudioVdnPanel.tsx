@@ -77,7 +77,9 @@ export function StudioVdnPanel({
     let unlisten: (() => void) | undefined;
     void listen<PhaseEvent>("studio://vdn-progress", (event) => {
       if (active && job.current === event.payload.jobId) {
-        setPhase(event.payload.phase);
+        setPhase(event.payload.detail
+          ? `${event.payload.phase} · ${event.payload.detail}`
+          : event.payload.phase);
       }
     }).then((clean) => {
       if (active) unlisten = clean;
