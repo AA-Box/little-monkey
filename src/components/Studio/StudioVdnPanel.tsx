@@ -498,6 +498,26 @@ export function StudioVdnPanel({
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
+        {durableJobs.length > 0 && <div className="grid gap-1">
+          <strong>Persisted VDN jobs</strong>
+          {durableJobs.slice(-8).map((item) =>
+            <div key={item.id} className="flex items-center gap-2">
+              <span>{item.id.slice(0, 8)} · {item.status}</span>
+              {(item.status === "failed" || item.status === "interrupted") &&
+                <Button size="sm" variant="secondary"
+                  onClick={() => void studioClient.vdnResume(item.id)
+                    .then(() => studioClient.vdnJobs()).then(setDurableJobs)}>
+                  Retry
+                </Button>}
+              {(item.status === "running" || item.status === "queued") &&
+                <Button size="sm" variant="secondary"
+                  onClick={() => void studioClient.vdnCancelJob(item.id)
+                    .then(() => studioClient.vdnJobs()).then(setDurableJobs)}>
+                  Cancel
+                </Button>}
+            </div>
+          )}
+        </div>}
         {error && <p role="alert" className="text-danger">{error}</p>}
         {preview && <p className="text-foreground">
           Preview saved to Gallery: {preview.frameCount} frames. This uses a separate real inference pass, not reused motion latents.
