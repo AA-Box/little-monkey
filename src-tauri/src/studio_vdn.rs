@@ -94,7 +94,7 @@ fn worker_args(
 }
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VdnRunRequest {
     pub job_id: String,
@@ -105,6 +105,16 @@ pub struct VdnRunRequest {
     pub seed: i64,
     pub first_image_path: Option<String>,
     pub last_image_path: Option<String>,
+    #[serde(default)]
+    pub source_gallery_entry_id: Option<String>,
+    #[serde(default)]
+    pub reference_image_paths: Vec<String>,
+    #[serde(default)]
+    pub reference_video_path: Option<String>,
+    #[serde(default)]
+    pub lora_paths: Vec<String>,
+    #[serde(default)]
+    pub reference_audio_path: Option<String>,
     pub fp8: bool,
     pub offload_dit: bool,
     #[serde(default)]
@@ -200,8 +210,52 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if !python.is_file() {
         return Err("Python executable is not a file".into());
     }
+    if request.lora_paths.len() > 4 { return Err("VDN supports at most four LoRAs".into()); }
+    if !request.lora_paths.is_empty() &&
+        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses | VdnBackend::FreeVideoAdaptive) {
+        return Err("External LoRA requires native optimized OpenVDN".into());
+    }
+    for lora in &request.lora_paths {
+        let path = Path::new(lora).canonicalize().map_err(|_| "LoRA file missing")?;
+        let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() < 128 || metadata.len() > 8 * 1024 * 1024 * 1024 ||
+            path.extension().and_then(|x| x.to_str()) != Some("safetensors") {
+            return Err("VDN LoRA must be a local .safetensors file up to 8 GiB".into());
+        }
+    }
+    if let Some(audio) = &request.reference_audio_path {
+        if request.backend != VdnBackend::FreeVideoAdaptive {
+            return Err("Audio-conditioned references require the optional adaptive backend".into());
+        }
+        let path = Path::new(audio).canonicalize().map_err(|_| "Reference audio not found")?;
+        let info = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !info.is_file() || info.len() < 32 || info.len() > 64 * 1024 * 1024 {
+            return Err("Audio reference must be a local file of at most 64 MiB".into());
+        }
+    }
+    if request.reference_video_path.is_some() &&
+        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("Video reference frames require optimized OpenVDN".into());
+    }
+    if let Some(path) = &request.reference_video_path {
+        let video = Path::new(path).canonicalize().map_err(|_| "Reference video not found")?;
+        let metadata = std::fs::metadata(&video).map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() > MAX_VIDEO_BYTES || metadata.len() < 32 {
+            return Err("Reference video must be a local file of 32 bytes to 256 MB".into());
+        }
+    }
+    if request.reference_image_paths.len() > 8 {
+        return Err("VDN supports at most eight reference images".into());
+    }
+    if !request.reference_image_paths.is_empty() &&
+        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("Ref2VA is supported only by native optimized OpenVDN backends".into());
+    }
+    for reference in &request.reference_image_paths {
+        validate_image(&Some(reference.clone()))?;
+    }
     if request.source_gallery_entry_id.is_some() && request.first_image_path.is_some() {
-        return Err("Cannot combine video continuation with an explicit first image".into());
+        return Err("Cannot combine continuation with first image".into());
     }
     let first = validate_image(&request.first_image_path)?;
     let last = validate_image(&request.last_image_path)?;
@@ -261,16 +315,12 @@ pub async fn generation_vdn_run(
         request.checkpoint_root.as_deref(),
         request.gpu_class.as_deref(), request.server_port,
     )?;
-    // Coordinate with native Durable Video Jobs. VDN must never consume or
-    // replace GPU resources concurrently with an active managed video render.
-    // The guard is held until publication/cleanup, including cancellation.
     let _video_engine_guard = crate::studio_video_jobs::engine_gate().lock().await;
     if crate::studio_vdn_jobs::is_cancelled(&app, &request.job_id)? {
-        return Err("VDN job was cancelled before GPU allocation".into());
+        return Err("VDN job cancelled before GPU allocation".into());
     }
-    // Old direct callers cannot silently ignore a gallery continuation.
     if request.source_gallery_entry_id.is_some() {
-        return Err("Submit video continuation through the durable VDN queue".into());
+        return Err("Use durable VDN queue for Gallery continuation".into());
     }
     crate::generation_commands::ensure_vdn_usage(&app)?;
     let (cancel, _registration) = register(&request.job_id)?;
@@ -319,6 +369,17 @@ pub async fn generation_vdn_run(
     if request.fp8 { process.arg("--fp8"); }
     if let Some(ref image) = first { process.arg("--first").arg(image); }
     if let Some(ref image) = last { process.arg("--last").arg(image); }
+    for lora in &request.lora_paths { process.arg("--lora").arg(lora); }
+    if let Some(audio) = &request.reference_audio_path {
+        process.arg("--reference-audio").arg(audio);
+    }
+    if let Some(reference_video) = &request.reference_video_path {
+        process.arg("--reference-video").arg(reference_video);
+    }
+    if !request.reference_image_paths.is_empty() {
+        process.arg("--refs");
+        for reference in &request.reference_image_paths { process.arg(reference); }
+    }
     let mut child = process.spawn().map_err(|error|
         format!("Could not start the installed Python VDN environment: {error}"))?;
     let _ = app.emit("studio://vdn-progress", VdnProgress {
@@ -512,6 +573,10 @@ mod tests {
             first_image_path: None,
             last_image_path: None,
             source_gallery_entry_id: None,
+            reference_image_paths: vec![],
+            reference_video_path: None,
+            lora_paths: vec![],
+            reference_audio_path: None,
             fp8: false,
             offload_dit: true,
             backend: VdnBackend::Diffusers,

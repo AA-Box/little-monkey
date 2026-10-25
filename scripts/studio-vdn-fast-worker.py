@@ -13,6 +13,8 @@ No FreeVideo or ComfyUI process, no shell=True, no user-supplied network URL.
 import argparse
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 import signal
 import subprocess
@@ -78,6 +80,9 @@ def arguments(argv=None):
     p.add_argument("--prompt", default="")
     p.add_argument("--first", default="")
     p.add_argument("--last", default="")
+    p.add_argument("--refs", nargs="+", default=[])
+    p.add_argument("--reference-video", default="")
+    p.add_argument("--lora", action="append", default=[])
     p.add_argument("--output", default="")
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--frames", type=int, default=141)
@@ -100,7 +105,24 @@ def arguments(argv=None):
             p.error("Seed must be nonnegative")
         if args.device != "cuda":
             p.error("Optimized VDN-H3 requires CUDA")
-        for path in (args.first, args.last):
+        if args.reference_video:
+            pth = Path(args.reference_video)
+            if not pth.is_file() or pth.stat().st_size > MAX_OUTPUT:
+                p.error("Reference video must exist and be at most 256 MB")
+        if len(args.lora) > 4:
+            p.error("At most four external LoRA adapters are supported")
+        if args.backend == "sglang" and args.lora:
+            p.error("External LoRA loading is not implemented for SGLang backend")
+        for lora in args.lora:
+            asset = Path(lora)
+            if (not asset.is_file() or asset.suffix.lower() != ".safetensors"
+                    or not 128 <= asset.stat().st_size <= 8 * 1024 ** 3):
+                p.error("LoRA must be a local safetensors file of at most 8 GB")
+        if len(args.refs) > 8:
+            p.error("At most eight reference images are supported")
+        if args.backend == "sglang" and (args.refs or args.reference_video):
+            p.error("This SGLang VDN endpoint does not accept Ref2VA references")
+        for path in (args.first, args.last, *args.refs):
             if path and (not Path(path).is_file() or Path(path).stat().st_size > 32 * 1024 * 1024):
                 p.error("Keyframe must be an existing file smaller than 32MB")
     if args.backend == "optimized_ulysses" and args.gpus != 8:
@@ -128,19 +150,58 @@ def source_tree(args):
     return root, ckpts
 
 
+def frames_from_reference_video(source, temporary_dir, max_frames=4):
+    """Decode bounded real frames and pass them through native Ref2VA encoder.
+
+    Video-to-reference here is visual frame conditioning; OpenVDN does not
+    expose arbitrary video-motion latent conditioning.
+    """
+    import av
+    from PIL import Image
+    path = Path(source)
+    if path.stat().st_size > MAX_OUTPUT:
+        raise ValueError("Reference video exceeds 256 MB")
+    with av.open(str(path)) as container:
+        stream = next((v for v in container.streams if v.type == "video"), None)
+        if stream is None:
+            raise ValueError("Reference video contains no video stream")
+        duration = float(stream.duration * stream.time_base) if stream.duration else 0
+        if duration <= 0 or duration > 90:
+            raise ValueError("Reference video duration must be 0-90 seconds")
+        target_times = [duration * i / max_frames for i in range(max_frames)]
+        selected = []
+        target = 0
+        for n, frame in enumerate(container.decode(video=stream.index)):
+            if n > 3000:
+                raise ValueError("Reference video decoding exceeds 3000 frames")
+            seconds = float(frame.pts * frame.time_base) if frame.pts is not None else n / 24
+            if target < len(target_times) and seconds >= target_times[target]:
+                output = Path(temporary_dir) / f"ref-video-{target:02d}.png"
+                Image.fromarray(frame.to_ndarray(format="rgb24")).save(output)
+                selected.append(str(output))
+                target += 1
+                if target == len(target_times):
+                    break
+    if not selected:
+        raise ValueError("Reference video decoded no frames")
+    return selected
+
+
 def native_commands(args, python_executable=sys.executable):
     """Exact official encoder then optimized renderer command vectors. No shell."""
     root, ckpts = source_tree(args)
     out = Path(args.output)
     cache = out.with_suffix(".prompt.pt")
-    encoder = "src/inference/encode_keyframes.py" if args.first or args.last else "src/inference/encode_prompt.py"
+    encoder = "src/inference/encode_keyframes.py" if args.first or args.last or args.refs else "src/inference/encode_prompt.py"
     prepare = [python_executable, str(root / encoder),
                "--prompt", args.prompt, "--out", str(cache)]
     if args.first:
         prepare.extend(["--first", args.first])
     if args.last:
         prepare.extend(["--last", args.last])
-    if args.first or args.last:
+    if args.refs:
+        prepare.extend(["--refs", *args.refs])
+    if args.first or args.last or args.refs:
         prepare.extend(["--vae_root", str(ckpts / "h3-base")])
     if args.backend == "optimized_ulysses":
         config = f"8nfe_tuned_fp8_ulysses_{args.gpu_class}.yaml"
@@ -150,6 +211,13 @@ def native_commands(args, python_executable=sys.executable):
     else:
         config = "8nfe_tuned_fp8.yaml" if args.fp8 else "8nfe_tuned.yaml"
         render = [python_executable, str(root / "src/inference/infer.py")]
+    if args.lora:
+        # The official inference assembler merges external_loras *after*
+        # the VDN hybrid branch and checkpoint adapters.
+        render.append("external_loras=" + json.dumps(
+            [{"path": str(Path(path).resolve(strict=True))} for path in args.lora],
+            separators=(",", ":"),
+        ))
     render.extend([
         "--config", str(root / "configs/inference" / config),
         "checkpoint=" + str(ckpts / "stage-dmd-step-250"),
@@ -304,6 +372,17 @@ def main(args):
         caps = inspect_cuda(args)
         if args.fp8 and not caps["fp8Supported"]:
             raise RuntimeError("FP8 tuned runner requires Hopper or newer GPU")
+        reference_dir = None
+        if args.reference_video:
+            reference_dir = tempfile.mkdtemp(prefix="vdn-video-refs-", dir=Path(args.output).parent)
+            try:
+                args.refs.extend(frames_from_reference_video(args.reference_video, reference_dir))
+            except Exception:
+                shutil.rmtree(reference_dir, ignore_errors=True)
+                raise
+        if len(args.refs) > 8:
+            if reference_dir: shutil.rmtree(reference_dir, ignore_errors=True)
+            raise ValueError("Combined image/video references exceed eight frames")
         _, cache, encoder, renderer = native_commands(args)
         emit("encoding", backend=args.backend)
         try:
@@ -312,6 +391,8 @@ def main(args):
             run_command(renderer, root)
         finally:
             cache.unlink(missing_ok=True)
+            if reference_dir:
+                shutil.rmtree(reference_dir, ignore_errors=True)
     output = Path(args.output)
     if not output.is_file() or output.stat().st_size < 32:
         raise RuntimeError("VDN optimized backend did not produce a nonempty MP4")

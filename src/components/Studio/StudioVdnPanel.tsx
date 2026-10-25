@@ -29,6 +29,11 @@ export function StudioVdnPanel({
   const [last, setLast] = useState<string | null>(null);
   const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
   const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
+  const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
+  const [references, setReferences] = useState<string[]>([]);
+  const [referenceVideo, setReferenceVideo] = useState<string | null>(null);
+  const [referenceAudio, setReferenceAudio] = useState<string | null>(null);
+  const [loraPaths, setLoraPaths] = useState<string[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
   const [seed, setSeed] = useState("0");
@@ -44,7 +49,7 @@ export function StudioVdnPanel({
   const [gpuFp8, setGpuFp8] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<GenerationEntry | null>(null);
-  const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
+  const [preview, setPreview] = useState<GenerationEntry | null>(null);
   const job = useRef<string | null>(null);
 
   const refreshLicense = useCallback(async () => {
@@ -63,8 +68,7 @@ export function StudioVdnPanel({
   useEffect(() => {
     void refreshLicense();
     void studioClient.vdnJobs().then(setDurableJobs).catch(() => {});
-    void studioClient.gallery().then((entries) => setAvailableClips(entries.filter((entry) =>
-      entry.mediaType === "video/mp4" || entry.mediaType === "video/webm"))).catch(() => {});
+    void studioClient.gallery().then(items => setAvailableClips(items.filter(item => item.mediaType === "video/mp4" || item.mediaType === "video/webm"))).catch(() => {});
     let active = true;
     let unlisten: (() => void) | undefined;
     void listen<PhaseEvent>("studio://vdn-progress", (event) => {
@@ -94,7 +98,7 @@ export function StudioVdnPanel({
         gpuClass, serverPort,
       );
       if (backend === "free_video_adaptive") {
-        setProbeInfo("FreeVideo adaptive runtime detected; weights checked during rendering.");
+        setProbeInfo("Installed FreeVideo adaptive runtime detected; actual model readiness is checked at execution.");
         setGpuFp8(false);
       } else if (backend === "sglang") {
         setProbeInfo(`Serving ${report.model} through 127.0.0.1:${report.port ?? serverPort}`);
@@ -126,55 +130,66 @@ export function StudioVdnPanel({
     }
   }
 
-  async function run() {
+  async function queuedRun(request: Parameters<typeof studioClient.vdnSubmit>[0]): Promise<GenerationEntry> {
+    const record = await studioClient.vdnSubmit(request);
+    setDurableJobs((records) => [...records, record]);
+    for (;;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+      const records = await studioClient.vdnJobs();
+      setDurableJobs(records);
+      const current = records.find((item) => item.id === request.jobId);
+      if (!current) throw new Error("Persisted VDN job disappeared");
+      setPhase(current.status);
+      if (current.status === "completed") {
+        const gallery = await studioClient.gallery();
+        const result = gallery.find((entry) => entry.entryId === current.resultEntryId);
+        if (!result) throw new Error("VDN completed without a Gallery artifact");
+        return result;
+      }
+      if (["cancelled", "failed", "interrupted"].includes(current.status)) {
+        throw new Error(current.error || `VDN job ${current.status}`);
+      }
+    }
+  }
+
+  async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
         !trustRemoteCode || running) return;
     const id = crypto.randomUUID();
     job.current = id;
     setRunning(true);
-    setPhase("starting");
+    setPhase("queued");
     setError(null);
     setCreated(null);
+    setPreview(null);
     try {
-      await studioClient.vdnSubmit({
-        jobId: id,
-        pythonExecutable: python,
-        prompt: prompt.trim(),
-        firstImagePath: first,
-        lastImagePath: last,
+      const request = {
+        jobId: id, pythonExecutable: python, prompt: prompt.trim(),
+        firstImagePath: first, lastImagePath: last,
         sourceGalleryEntryId: sourceGalleryId,
-        steps,
-        frames,
-        seed: Number(seed) || 0,
-        fp8,
-        offloadDit: offload,
-        backend,
+        referenceImagePaths: references,
+        referenceVideoPath: referenceVideo,
+        referenceAudioPath: referenceAudio,
+        loraPaths, steps, frames, seed: Number(seed) || 0,
+        fp8, offloadDit: offload, backend,
         repoRoot: repoRoot || null,
         checkpointRoot: checkpointRoot || null,
         gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
         serverPort: backend === "sglang" ? serverPort : null,
         acknowledgeThirdPartyCode: trustRemoteCode,
-      });
-      // Persisted backend queue continues even if this React view unmounts.
-      for (;;) {
-        await new Promise<void>((resolve) => setTimeout(resolve, 1200));
-        const jobs = await studioClient.vdnJobs();
-        setDurableJobs(jobs);
-        const latest = jobs.find((record) => record.id === id);
-        if (!latest) throw new Error("Persisted VDN job disappeared");
-        setPhase(latest.status);
-        if (latest.status === "completed") {
-          const entry = (await studioClient.gallery()).find((item) =>
-            item.entryId === latest.resultEntryId);
-          if (entry) setCreated(entry);
-          await onCompleted();
-          break;
-        }
-        if (latest.status === "failed" || latest.status === "cancelled" ||
-            latest.status === "interrupted") {
-          throw new Error(latest.error ?? `VDN job ${latest.status}`);
-        }
+      };
+      if (twoPass && frames > 124) {
+        setPhase("preview");
+        const previewEntry = await queuedRun({ ...request, frames: 124 });
+        setPreview(previewEntry);
+        await onCompleted();
+        request.jobId = crypto.randomUUID();
+        job.current = request.jobId;
       }
+      const entry = await queuedRun(request);
+      setCreated(entry);
+      setPhase("completed");
+      await onCompleted();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setPhase("failed");
@@ -244,32 +259,28 @@ export function StudioVdnPanel({
               const next = event.target.value as VdnBackend;
               setBackend(next);
               setProbeInfo(null);
-              if (next !== "diffusers" && next !== "free_video_adaptive") setSteps(8);
+              if (next !== "diffusers") setSteps(8);
             }}>
             <option value="diffusers">Portable Diffusers — single CUDA GPU with offload</option>
             <option value="optimized_single">OpenVDN tuned kernels — Linux, one large CUDA GPU</option>
             <option value="optimized_ulysses">OpenVDN Ulysses — Linux, 8 H200/B200 GPUs</option>
             <option value="sglang">SGLang Diffusion — local accelerated server (1/2/4/8 GPUs)</option>
-            <option value="free_video_adaptive">Adaptive FreeVideo — installed low-memory model runtime</option>
+            <option value="free_video_adaptive">Adaptive FreeVideo — multimodal references and low-memory runtime</option>
           </select>
         </label>
 
-        {backend === "free_video_adaptive" && (
-          <label className="grid gap-1 text-muted">
-            Prepared FreeVideo model cache
-            <div className="flex flex-wrap gap-2">
-              <input className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-foreground"
-                value={checkpointRoot} disabled={running}
-                onChange={(event) => { setCheckpointRoot(event.target.value); setProbeInfo(null); }}
-                placeholder="/path/to/prepared-freevideo-cache" />
-              <Button size="sm" variant="secondary" disabled={running}
-                onClick={() => void chooseFile((path) => { setCheckpointRoot(path); setProbeInfo(null); }, true)}>
-                <FolderOpen size={13} /> Choose cache
-              </Button>
-            </div>
-            <span>This optional backend uses the installed FreeVideo engine and its own adaptive planner. It does not remove model license restrictions.</span>
-          </label>
-        )}
+        {backend === "free_video_adaptive" && <label className="grid gap-1 text-muted">
+          Prepared FreeVideo model cache
+          <div className="flex gap-2">
+            <input className="min-w-0 flex-1 rounded border border-border bg-background p-1 text-foreground"
+              value={checkpointRoot} disabled={running}
+              onChange={(event) => { setCheckpointRoot(event.target.value); setProbeInfo(null); }} />
+            <Button size="sm" variant="secondary" disabled={running}
+              onClick={() => void chooseFile((value) => { setCheckpointRoot(value); setProbeInfo(null); }, true)}>
+              Choose cache
+            </Button>
+          </div>
+        </label>}
         {(backend === "optimized_single" || backend === "optimized_ulysses") && (
           <div className="grid gap-2">
             <label className="grid gap-1 text-muted">
@@ -407,6 +418,48 @@ export function StudioVdnPanel({
           </label>}
         </div>
 
+        {(backend === "optimized_single" || backend === "optimized_ulysses" || backend === "free_video_adaptive") &&
+          <div className="grid gap-1 text-muted">
+            <span>Reference images/video (native OpenVDN Ref2VA, visual frame conditioning)</span>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="secondary" disabled={running || references.length >= 8}
+                onClick={() => void open({ multiple: true, filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] })
+                  .then((selected) => {
+                    const paths = typeof selected === "string" ? [selected] : (selected ?? []);
+                    setReferences((current) => [...new Set([...current, ...paths])].slice(0, 8));
+                  })}>
+                Add reference images
+              </Button>
+              <Button size="sm" variant="secondary" disabled={running || references.length === 0}
+                onClick={() => setReferences([])}>Clear</Button>
+              <span>{references.length}/8 images</span>
+              <Button size="sm" variant="secondary" disabled={running}
+                onClick={() => void chooseFile(setReferenceVideo)}>Choose video</Button>
+              {referenceVideo && <Button size="sm" variant="secondary" disabled={running}
+                onClick={() => setReferenceVideo(null)}>Remove video</Button>}
+              {backend === "free_video_adaptive" && <>
+                <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => void chooseFile(setReferenceAudio)}>Choose audio reference</Button>
+                {referenceAudio && <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => setReferenceAudio(null)}>Remove audio</Button>}
+              </>}
+            </div>
+          </div>}
+        {(backend === "optimized_single" || backend === "optimized_ulysses") &&
+          <div className="grid gap-1 text-muted">
+            <span>External LoRA adapters (up to 4 safetensors)</span>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="secondary" disabled={running || loraPaths.length >= 4}
+                onClick={() => void open({ multiple: true, filters: [{ name: "LoRA", extensions: ["safetensors"] }] })
+                  .then((selected) => {
+                    const paths = typeof selected === "string" ? [selected] : (selected ?? []);
+                    setLoraPaths((current) => [...new Set([...current, ...paths])].slice(0, 4));
+                  })}>Add LoRA</Button>
+              <Button size="sm" variant="secondary" disabled={running || loraPaths.length === 0}
+                onClick={() => setLoraPaths([])}>Clear</Button>
+              <span>{loraPaths.length}/4</span>
+            </div>
+          </div>}
         <label className="grid gap-1 text-muted">
           Continue from a previous Gallery clip (true final frame)
           <select className="rounded border border-border bg-background p-1 text-foreground"
@@ -434,30 +487,21 @@ export function StudioVdnPanel({
             onClick={() => void run()}>
             <Play size={13} /> Generate with VDN-H3
           </Button>
+          <Button size="sm" variant="secondary"
+            disabled={running || frames <= 124 || !python || !probeInfo || !prompt.trim() ||
+              licenseReason !== null || !trustRemoteCode}
+            onClick={() => void run(true)}>
+            <Play size={13} /> Preview then render (two passes)
+          </Button>
           {running && <Button size="sm" variant="secondary" onClick={() => void cancel()}>
             <Square size={13} /> Cancel VDN job
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
-        {durableJobs.length > 0 && <div className="grid gap-1" aria-label="VDN job history">
-          <span className="font-semibold">Persisted VDN jobs</span>
-          {durableJobs.slice(-8).reverse().map((record) =>
-            <div key={record.id} className="flex items-center gap-2 text-muted">
-              <span>{record.id.slice(0, 8)} · {record.status} · attempt {record.attempts}</span>
-              {(record.status === "failed" || record.status === "interrupted") &&
-                <Button size="sm" variant="secondary" onClick={() => void studioClient.vdnResume(record.id)
-                  .then(() => studioClient.vdnJobs()).then(setDurableJobs).catch((e) => setError(String(e)))}>
-                  Retry
-                </Button>}
-              {(record.status === "queued" || record.status === "running") &&
-                <Button size="sm" variant="secondary" onClick={() => void studioClient.vdnCancelJob(record.id)
-                  .then(() => studioClient.vdnJobs()).then(setDurableJobs).catch((e) => setError(String(e)))}>
-                  Cancel
-                </Button>}
-            </div>
-          )}
-        </div>}
         {error && <p role="alert" className="text-danger">{error}</p>}
+        {preview && <p className="text-foreground">
+          Preview saved to Gallery: {preview.frameCount} frames. This uses a separate real inference pass, not reused motion latents.
+        </p>}
         {created && <p className="text-foreground">
           Video saved to Studio Gallery: {created.frameCount} frames,
           {(created.durationMs / 1000).toFixed(1)} seconds, audio/video MP4.
