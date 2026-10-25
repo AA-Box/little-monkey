@@ -42,6 +42,7 @@ export function StudioVdnPanel({
   const [gpuFp8, setGpuFp8] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<GenerationEntry | null>(null);
+  const [preview, setPreview] = useState<GenerationEntry | null>(null);
   const job = useRef<string | null>(null);
 
   const refreshLicense = useCallback(async () => {
@@ -117,7 +118,7 @@ export function StudioVdnPanel({
     }
   }
 
-  async function run() {
+  async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
         !trustRemoteCode || running) return;
     const id = crypto.randomUUID();
@@ -126,8 +127,9 @@ export function StudioVdnPanel({
     setPhase("starting");
     setError(null);
     setCreated(null);
+    setPreview(null);
     try {
-      const entry = await studioClient.vdnRun({
+      const request = {
         jobId: id,
         pythonExecutable: python,
         prompt: prompt.trim(),
@@ -144,7 +146,19 @@ export function StudioVdnPanel({
         gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
         serverPort: backend === "sglang" ? serverPort : null,
         acknowledgeThirdPartyCode: trustRemoteCode,
-      });
+      };
+      if (twoPass && frames > 124) {
+        setPhase("preview");
+        const previewEntry = await studioClient.vdnRun({ ...request, frames: 124 });
+        setPreview(previewEntry);
+        await onCompleted();
+        // A preview is a genuine shorter inference, not a cached latent. A
+        // fresh job ID keeps cancellation targeted to the full pass.
+        request.jobId = crypto.randomUUID();
+        job.current = request.jobId;
+      }
+      setPhase("final render");
+      const entry = await studioClient.vdnRun(request);
       setCreated(entry);
       setPhase("completed");
       await onCompleted();
@@ -377,12 +391,21 @@ export function StudioVdnPanel({
             onClick={() => void run()}>
             <Play size={13} /> Generate with VDN-H3
           </Button>
+          <Button size="sm" variant="secondary"
+            disabled={running || frames <= 124 || !python || !probeInfo || !prompt.trim() ||
+              licenseReason !== null || !trustRemoteCode}
+            onClick={() => void run(true)}>
+            <Play size={13} /> Preview then render (two passes)
+          </Button>
           {running && <Button size="sm" variant="secondary" onClick={() => void cancel()}>
             <Square size={13} /> Cancel VDN job
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
         {error && <p role="alert" className="text-danger">{error}</p>}
+        {preview && <p className="text-foreground">
+          Preview saved to Gallery: {preview.frameCount} frames. This uses a separate real inference pass, not reused motion latents.
+        </p>}
         {created && <p className="text-foreground">
           Video saved to Studio Gallery: {created.frameCount} frames,
           {(created.durationMs / 1000).toFixed(1)} seconds, audio/video MP4.
