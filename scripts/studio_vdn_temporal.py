@@ -216,7 +216,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             stage = "temporal_%d" % part
             was_continuing = context is not None
             print(json.dumps({"phase": "temporal_sampling", "part": part + 1,
-                              "parts": args.segments, "overlapFrames": 0 if part == 0 else 22}),
+                              "parts": args.segments, "overlapFrames": 22 if was_continuing else 0}),
                   flush=True)
             # FL2VA still requires its explicit first-image input on every
             # call. For subsequent windows it must agree with the protected
@@ -232,14 +232,24 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                     low_prefix.digest if low_prefix else None)
                 source_path = preview_path(
                     args.refine_from or args.checkpoint, part)
+                resumed = False
                 if Path(source_path).is_file() or Path(source_path).is_symlink():
-                    preview_latents, preview_audio = load_preview(
-                        source_path, preview_fingerprint)
-                    print(json.dumps({"phase": "temporal_preview_reused",
-                                      "segment": part + 1}), flush=True)
-                elif args.refine_from:
+                    try:
+                        preview_latents, preview_audio = load_preview(
+                            source_path, preview_fingerprint)
+                        resumed = True
+                        print(json.dumps({"phase": "temporal_preview_reused",
+                                          "segment": part + 1}), flush=True)
+                    except (OSError, ValueError):
+                        if args.refine_from:
+                            raise
+                        # Completed earlier segments may be regenerated on restart.
+                        # Their new tensors invalidate a later local preview,
+                        # which must be sampled again instead of aborting the job.
+                        Path(source_path).unlink(missing_ok=True)
+                if args.refine_from and not resumed:
                     raise RuntimeError("Missing compatible saved temporal preview segment")
-                else:
+                if not resumed:
                     with native_sampler_recovery(
                             args, stage + "_preview", pipe, model_identity=checkpoint,
                             temporal_context=low_prefix,
