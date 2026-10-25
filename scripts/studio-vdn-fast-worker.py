@@ -82,6 +82,7 @@ def arguments(argv=None):
     p.add_argument("--last", default="")
     p.add_argument("--refs", nargs="+", default=[])
     p.add_argument("--reference-video", default="")
+    p.add_argument("--lora", action="append", default=[])
     p.add_argument("--output", default="")
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--frames", type=int, default=141)
@@ -108,6 +109,15 @@ def arguments(argv=None):
             pth = Path(args.reference_video)
             if not pth.is_file() or pth.stat().st_size > MAX_OUTPUT:
                 p.error("Reference video must exist and be at most 256 MB")
+        if len(args.lora) > 4:
+            p.error("At most four external LoRA adapters are supported")
+        if args.backend == "sglang" and args.lora:
+            p.error("External LoRA loading is not implemented for SGLang backend")
+        for lora in args.lora:
+            asset = Path(lora)
+            if (not asset.is_file() or asset.suffix.lower() != ".safetensors"
+                    or not 128 <= asset.stat().st_size <= 8 * 1024 ** 3):
+                p.error("LoRA must be a local safetensors file of at most 8 GB")
         if len(args.refs) > 8:
             p.error("At most eight reference images are supported")
         if args.backend == "sglang" and (args.refs or args.reference_video):
@@ -201,6 +211,13 @@ def native_commands(args, python_executable=sys.executable):
     else:
         config = "8nfe_tuned_fp8.yaml" if args.fp8 else "8nfe_tuned.yaml"
         render = [python_executable, str(root / "src/inference/infer.py")]
+    if args.lora:
+        # The official inference assembler merges external_loras *after*
+        # the VDN hybrid branch and checkpoint adapters.
+        render.append("external_loras=" + json.dumps(
+            [{"path": str(Path(path).resolve(strict=True))} for path in args.lora],
+            separators=(",", ":"),
+        ))
     render.extend([
         "--config", str(root / "configs/inference" / config),
         "checkpoint=" + str(ckpts / "stage-dmd-step-250"),
