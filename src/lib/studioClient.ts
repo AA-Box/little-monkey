@@ -249,6 +249,7 @@ export interface VdnGenerationRequest {
   referenceAudioPath: string | null;
   fp8: boolean;
   offloadDit: boolean;
+  memoryMode: "auto" | "resident" | "stream_cpu" | "stream_disk";
   backend: VdnBackend;
   repoRoot: string | null;
   checkpointRoot: string | null;
