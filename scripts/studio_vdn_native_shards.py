@@ -55,7 +55,17 @@ class OriginalShardStore:
                     folder.split("/")[-1] == "text_encoder" else
                     "diffusion_pytorch_model.safetensors.index.json")
         params = dict(subfolder=folder or None, revision=revision)
-        index_path = Path(fetch(repo, filename=filename, **params))
+        try:
+            index_path = Path(fetch(repo, filename=filename, **params))
+        except Exception:
+            # Small audio VAEs may be published as a single SafeTensors
+            # file rather than a weight-map index. Never fall back to pickle.
+            from safetensors import safe_open
+            single = filename.replace(".index.json", "")
+            file_path = Path(fetch(repo, filename=single, **params))
+            with safe_open(str(file_path), framework="pt", device="cpu") as reader:
+                index = {"weight_map": {key: single for key in reader.keys()}}
+            return cls(index, {single: file_path})
         if not index_path.is_file() or index_path.stat().st_size > 16 * 1024**2:
             raise ValueError("Invalid original SafeTensors index file size")
         index = json.loads(index_path.read_text(encoding="utf8"))
@@ -88,6 +98,12 @@ def instantiate_meta_component(cls, repo, subfolder, revision=None, *,
                                      revision=revision)
     if dtype is not None:
         module.to(dtype=dtype)
+    # Model constructors can register buffers on CPU despite meta context;
+    # no fallback to allocating the full model is permitted.
+    import torch
+    for name, parameter in module.named_parameters():
+        if not parameter.is_meta:
+            raise RuntimeError("Initial H3 weights were allocated instead of meta: " + name)
     module.eval().requires_grad_(False)
     return module
 
