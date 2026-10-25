@@ -36,10 +36,14 @@ def weight_stream_policy(free_cuda, free_ram, *, disk_spill=False):
     gib = 1024**3
     cpu_ok = free_ram is not None and free_ram >= 64 * gib
     cuda_ok = free_cuda >= 14 * gib
+    use_prefetch = bool(cuda_ok and cpu_ok and not disk_spill)
     return {
-        "denoiser_blocks_per_group": 1 if free_cuda < 32 * gib else 2,
-        "denoiser_async_prefetch": bool(cuda_ok and cpu_ok and not disk_spill),
-        "text_async_prefetch": bool(cuda_ok and cpu_ok and not disk_spill),
+        # Diffusers recommends 1 block per group whenever CUDA streams
+        # prefetch the NEXT group; larger groups are only safe for sequential
+        # transfers, when enough VRAM is actually free.
+        "denoiser_blocks_per_group": 1 if use_prefetch or free_cuda < 32 * gib else 2,
+        "denoiser_async_prefetch": use_prefetch,
+        "text_async_prefetch": use_prefetch,
         "disk_spill": bool(disk_spill),
     }
 
