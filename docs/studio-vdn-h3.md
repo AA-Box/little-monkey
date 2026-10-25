@@ -85,3 +85,36 @@ OpenVDN components, run at least:
 These tests require authentic model weights, a valid license and physical
 CUDA resources; they **have not** been run by GitHub Actions. CPU/CI success
 is not a claim that a particular GPU has produced the correct output.
+
+
+## Native long-video temporal continuity (Diffusers backend)
+
+Set **Native continuous segments** to 2–8 in Studio. Each bounded H3
+generation uses an ordinary 17n+5-frame window, and each later window
+reuses the preceding **seven video-latent frames (22 decoded frames)** and
+the corresponding 40-Hz stereo audio-latent tail. A transformer pre-hook
+marks these packed AV rows as *clean* (timestep 1), and a sampler callback
+restores their original values after every dual-scheduler update. The same
+protected context is restored on recovered denoising steps.
+
+The worker calculates absolute 24-fps / 40-Hz offsets rather than guessing
+audio trims from video frame count, and writes decoded frames to a bounded
+disk-backed array. It assembles sample-aligned stereo audio with sub-tick
+seam correction, then encodes a **single MP4 with audio**, avoiding the
+audio loss and timestamp gaps caused by naively concatenating MP4 files.
+The resulting number of frames is `frames + (segments - 1) * (frames - 22)`.
+
+Each segment's completed denoising step is checkpointed under an isolated
+stage name; the checkpoint fingerprint includes the *actual preceding
+audio/video latent bytes*. Changing the predecessor invalidates a saved
+step. An interrupted overall run recomputes earlier completed segments,
+but can restore the last interrupted segment's completed steps if context
+matches. Temporary frames are removed on success or failure.
+
+Boundaries: this is an independent Little Monkey native implementation,
+**not a FreeVideo runtime dependency**. A physical licensed CUDA/H3 model
+test is still needed to certify visual and voice quality, sample
+compatibility across released Diffusers versions, and performance. This
+initial native path uses clean audio context and does not combine multiple
+segments with the existing per-job two-pass refinement checkpoint. Model
+territory restrictions and upstream-code consent are unchanged.
