@@ -36,6 +36,9 @@ if "native_sampler_recovery" not in globals():
         native_sampler_recovery, clear_native_sampler_stage,
     )
 
+if "install_native_h3_tiles" not in globals():
+    from studio_vdn_lowmem import install_native_h3_tiles
+
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
 REF_MODEL_REPOSITORY = "MiniMaxAI/MiniMax-H3"
@@ -60,6 +63,10 @@ def parse_args(argv=None):
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--offload-dit", action="store_true")
     parser.add_argument("--memory-mode", choices=("auto", "resident", "stream_cpu", "stream_disk"), default="auto")
+    parser.add_argument("--lowmem", choices=("auto", "off", "force"), default="auto")
+    parser.add_argument("--query-chunk", type=int, default=0)
+    parser.add_argument("--head-chunk", type=int, default=0)
+    parser.add_argument("--ff-chunk", type=int, default=256)
     parser.add_argument("--two-pass", action="store_true")
     parser.add_argument("--refine-from", default="")
     parser.add_argument("--checkpoint", default="")
@@ -68,6 +75,8 @@ def parse_args(argv=None):
     parser.add_argument("--internal-attempt", choices=("resident", "resident_fp8", "stream_cpu", "stream_disk", "fp8_disk", "int8_cpu", "fp8_cpu"), default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
+    if not 0 <= args.query_chunk <= 8192 or not 0 <= args.head_chunk <= 128 or not 0 <= args.ff_chunk <= 4096:
+        parser.error("Native H3 tile sizes exceed bounded limits")
     if args.self_test:
         print(json.dumps({
             "status": "ready_for_dependency_probe",
@@ -288,7 +297,11 @@ def run(args):
     original = [str(Path(__file__).resolve()), "--prompt", args.prompt,
                 "--output", args.output, "--frames", str(args.frames),
                 "--steps", str(args.steps), "--seed", str(args.seed),
-                "--device", args.device]
+                "--device", args.device,
+                "--lowmem", args.lowmem,
+                "--query-chunk", str(args.query_chunk),
+                "--head-chunk", str(args.head_chunk),
+                "--ff-chunk", str(args.ff_chunk)]
     for flag, value in (("--first", args.first), ("--last", args.last),
                         ("--reference-video", args.reference_video),
                         ("--reference-audio", args.reference_audio),
@@ -585,6 +598,13 @@ def _run_once(args):
         if not hasattr(pipe, "load_lora_weights"):
             raise RuntimeError("Installed Diffusers lacks native H3 LoRA loading")
         pipe.load_lora_weights(lora)
+    # Tile the actual H3 transformer after LoRA loading but before placing
+    # layers/offload hooks. The processor retains full cross-modal context;
+    # unlike spatial windows it changes no attention connectivity.
+    if args.lowmem == "force" or (args.lowmem == "auto" and args.offload_dit):
+        install_native_h3_tiles(
+            denoiser, query_chunk=args.query_chunk,
+            head_chunk=args.head_chunk, ff_chunk=args.ff_chunk)
     if args.int8:
         denoiser.requires_grad_(False)
         pipe.text_encoder.requires_grad_(False)
