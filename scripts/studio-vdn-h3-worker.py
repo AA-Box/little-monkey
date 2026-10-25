@@ -20,6 +20,9 @@ from pathlib import Path
 import sys
 import shutil
 import tempfile
+import subprocess
+import signal
+import importlib.util
 
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 FPS = 24
@@ -38,6 +41,8 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--offload-dit", action="store_true")
+    parser.add_argument("--memory-mode", choices=("auto", "resident", "stream_cpu", "stream_disk"), default="auto")
+    parser.add_argument("--internal-attempt", choices=("resident", "stream_cpu", "stream_disk", "int8_cpu", "fp8_cpu"), default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
     if args.self_test:
@@ -90,101 +95,161 @@ def parse_args(argv=None):
     return args
 
 
-def choose_memory_policy(free_bytes, *, fp8, offload, fp8_supported):
-    """Choose an actual fallback without requiring a GPU in unit tests.
-
-    Offloading is preferable to an optimistic resident load below 40 GiB.
-    FP8 is only considered on devices whose capability was checked at runtime.
-    """
-    if free_bytes < 0:
-        raise ValueError("CUDA free memory must be nonnegative")
-    return {
-        "offload": bool(offload or free_bytes < 40 * 1024 ** 3),
-        "fp8": bool(fp8 and fp8_supported),
-    }
+GiB = 1024 ** 3
 
 
 def available_host_ram():
-    """Estimate available RAM without importing heavyweight optional packages."""
+    """Linux MemAvailable or cross-platform psutil if installed; unknown is None."""
     try:
-        with open("/proc/meminfo", encoding="ascii") as mem:
-            for line in mem:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except ImportError:
+        pass
+    try:
+        with open("/proc/meminfo", encoding="ascii") as handle:
+            for line in handle:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
+    except (OSError, IndexError, ValueError):
         pass
     return None
 
 
-def should_disk_offload(available_ram, free_disk):
-    """Bound disk spill to hosts with enough actual working storage."""
-    return (available_ram is not None and available_ram < 64 * 1024 ** 3
-            and free_disk >= 128 * 1024 ** 3)
-
-
 def is_cuda_oom(error):
-    """Restrict retry to CUDA allocation failures, not arbitrary model errors."""
-    return "out of memory" in str(error).lower() and (
-        "cuda" in str(error).lower() or "cublas" in str(error).lower()
-    )
+    """Only retry allocation failures, not bad weights, bad prompts or permissions."""
+    reason = str(error).lower()
+    return any(marker in reason for marker in (
+        "cuda out of memory", "cublas_status_alloc_failed", "cuda error: out of memory",
+        "torch.outofmemoryerror", "cuda error: memory allocation",
+    ))
+
+
+def choose_memory_plans(free_vram, host_ram, disk_free, *,
+                        capability, offload=False, fp8=False, mode="auto",
+                        torchao_available=True):
+    """Ordered real execution tiers, with conservative memory safety margins.
+
+    A tier is not advertised as supported unless prerequisites exist.
+    Failed tiers are retried by a *new Python process*, not on a poisoned GPU.
+    """
+    if free_vram < 0 or disk_free < 0 or (host_ram is not None and host_ram < 0):
+        raise ValueError("Negative memory capacity")
+    if mode not in ("auto", "resident", "stream_cpu", "stream_disk"):
+        raise ValueError("Unsupported memory policy")
+    if fp8 and capability < 9:
+        raise ValueError("FP8 requires compute capability 9.0+")
+    disk_ok = disk_free >= 96 * GiB
+    cpu_ok = host_ram is None or host_ram >= 16 * GiB
+    plans = []
+    def add(tier):
+        if tier not in plans:
+            plans.append(tier)
+    if mode == "resident":
+        add("resident")
+    elif mode == "stream_cpu":
+        add("stream_cpu")
+    elif mode == "stream_disk":
+        if not disk_ok:
+            raise ValueError("Disk streaming needs at least 96 GiB of available space")
+        add("stream_disk")
+    else:
+        if not offload and free_vram >= 44 * GiB:
+            add("resident")
+        if cpu_ok:
+            add("stream_cpu")
+        if torchao_available and host_ram is not None and host_ram >= 48 * GiB:
+            add("int8_cpu")
+        if capability >= 9:
+            add("fp8_cpu")
+        if disk_ok:
+            add("stream_disk")
+    if not plans:
+        raise ValueError("Insufficient host RAM/disk for selected VDN memory modes")
+    if fp8 and mode == "auto":
+        plans = ["fp8_cpu"] + [tier for tier in plans if tier != "fp8_cpu"]
+    return plans
+
+
+def _forward_signal(signum, _frame):
+    child = getattr(_forward_signal, "child", None)
+    if child is not None and child.poll() is None:
+        try:
+            if os.name == "posix":
+                os.killpg(child.pid, signal.SIGTERM)
+            else:
+                child.terminate()
+        except ProcessLookupError:
+            pass
+    raise SystemExit(128 + signum)
 
 
 def run(args):
-    import gc
     import torch
-
     if not torch.cuda.is_available():
-        raise RuntimeError("VDN-H3 requires a CUDA GPU")
-    free_bytes, _ = torch.cuda.mem_get_info()
+        raise RuntimeError("VDN-H3 requires CUDA; no CPU-only inference claim")
     major, _ = torch.cuda.get_device_capability()
-    if args.fp8 and major < 9:
-        raise RuntimeError("VDN FP8 requires a CUDA device with compute capability 9.0+")
-    policy = choose_memory_policy(
-        free_bytes, fp8=args.fp8, offload=args.offload_dit,
-        fp8_supported=major >= 9,
-    )
-    args.offload_dit = policy["offload"]
-    # FreeVideo's INT8 runtime is distinct; use TorchAO's supported
-    # weight-only INT8 path on consumer CUDA, never label it FP8.
-    args.int8 = major < 9 and not args.fp8
-    available_ram = available_host_ram()
-    free_disk = shutil.disk_usage(Path(args.output).parent).free
-    args.disk_offload = args.offload_dit and should_disk_offload(available_ram, free_disk)
-    print(json.dumps({"phase": "memory_plan", "freeVramBytes": free_bytes,
-                      "hostRamAvailableBytes": available_ram,
-                      "diskFreeBytes": free_disk,
-                      "diskOffload": args.disk_offload,
-                      "offloadDit": args.offload_dit, "fp8": args.fp8,
-                      "int8WeightOnly": args.int8}),
-          flush=True)
-    # Isolate each attempt's spilled weights in an automatically cleaned folder.
-    with tempfile.TemporaryDirectory(prefix="vdn-layer-spill-",
-                                     dir=Path(args.output).parent) as cache:
-        args.disk_offload_path = cache if args.disk_offload else None
-        try:
-            return _run_once(args)
-        except RuntimeError as error:
-            if not is_cuda_oom(error):
-                raise
-            if not args.offload_dit:
-                args.offload_dit = True
-                strategy = "cpu_block_offload"
-            elif not args.fp8 and major >= 9:
-                args.fp8 = True
-                strategy = "fp8_with_cpu_block_offload"
-            elif not args.disk_offload and free_disk >= 128 * 1024 ** 3:
-                args.disk_offload = True
-                strategy = "disk_layer_spill"
-            else:
-                raise RuntimeError(
-                    "VDN exceeded available CUDA memory after bounded retries; "
-                    "use fewer frames or a larger GPU"
-                ) from error
+    if args.internal_attempt:
+        args.offload_dit = args.internal_attempt != "resident"
+        args.disk_offload = args.internal_attempt == "stream_disk"
+        args.int8 = args.internal_attempt == "int8_cpu"
+        args.fp8 = args.internal_attempt == "fp8_cpu"
+        with tempfile.TemporaryDirectory(prefix="vdn-spill-", dir=Path(args.output).parent) as cache:
             args.disk_offload_path = cache if args.disk_offload else None
-            gc.collect()
-            torch.cuda.empty_cache()
-            print(json.dumps({"phase": "oom_retry", "strategy": strategy}), flush=True)
             return _run_once(args)
+
+    free, total = torch.cuda.mem_get_info()
+    host = available_host_ram()
+    disk = shutil.disk_usage(Path(args.output).parent).free
+    plans = choose_memory_plans(
+        free, host, disk, capability=major, offload=args.offload_dit,
+        fp8=args.fp8, mode=args.memory_mode,
+        torchao_available=importlib.util.find_spec("torchao") is not None,
+    )
+    print(json.dumps({"phase": "memory_plan", "engine": "little_monkey_native",
+                      "tiers": plans, "freeVramBytes": free,
+                      "totalVramBytes": total, "freeHostRamBytes": host,
+                      "freeDiskBytes": disk, "prefetch": "diffusers_stream_hooks"}),
+          flush=True)
+    original = [str(Path(__file__).resolve()), "--prompt", args.prompt,
+                "--output", args.output, "--frames", str(args.frames),
+                "--steps", str(args.steps), "--seed", str(args.seed),
+                "--device", args.device]
+    for flag, value in (("--first", args.first), ("--last", args.last)):
+        if value:
+            original.extend([flag, value])
+    for tier in plans:
+        argv = [sys.executable, "-u", *original, "--internal-attempt", tier]
+        if tier == "fp8_cpu":
+            argv.append("--fp8")
+        print(json.dumps({"phase": "attempt", "tier": tier}), flush=True)
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, bufsize=1,
+                                 start_new_session=(os.name == "posix"))
+        _forward_signal.child = child
+        errors = []
+        try:
+            for line in child.stdout:
+                print(line, end="", flush=True)
+                errors.append(line)
+                if len(errors) > 100:
+                    errors.pop(0)
+            code = child.wait()
+        finally:
+            _forward_signal.child = None
+        if code == 0:
+            return
+        reason = "".join(errors)[-8000:]
+        if not is_cuda_oom(reason):
+            raise RuntimeError("VDN native inference failed outside memory recovery: " + reason[-1400:])
+        print(json.dumps({"phase": "oom_recovery", "tier": tier,
+                          "next": "fresh_process", "exitCode": code}), flush=True)
+    raise RuntimeError("All native CUDA placement tiers exhausted their memory budget")
+
+
+for _sig in (signal.SIGTERM, signal.SIGINT):
+    signal.signal(_sig, _forward_signal)
+
 
 def _run_once(args):
     # Import only AFTER the host has decided the license permits execution.
@@ -239,10 +304,14 @@ def _run_once(args):
         vae.offload()
     pipe.transformer.register_forward_pre_hook(decoder_back)
     if args.offload_dit:
-        apply_group_offloading(pipe.transformer, onload_device=device,
-                               offload_device="cpu", offload_type="block_level",
-                               num_blocks_per_group=1, use_stream=True,
-                               offload_to_disk_path=args.disk_offload_path)
+        stream_kwargs = {
+            "onload_device": device, "offload_device": "cpu",
+            "offload_type": "block_level",
+            "num_blocks_per_group": 1, "use_stream": True,
+        }
+        if args.disk_offload_path:
+            stream_kwargs["offload_to_disk_path"] = args.disk_offload_path
+        apply_group_offloading(pipe.transformer, **stream_kwargs)
     else:
         pipe.transformer.to(device)
 
