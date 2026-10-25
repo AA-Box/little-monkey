@@ -144,6 +144,15 @@ class NativeOriginalShardHooks:
             self.fp8_quantize = quantize_
         registered = []
         for prefix, module in model.named_modules():
+            # Non-persistent RoPE/sinusoidal buffers come from constructor,
+            # not the weight map. Keep their tiny deterministic values on the
+            # execution device so they can multiply CUDA position tensors.
+            for buffer_name in module._non_persistent_buffers_set:
+                buffer = module._buffers.get(buffer_name)
+                if buffer is not None and not buffer.is_meta:
+                    if buffer.numel() * buffer.element_size() > 64 * 1024**2:
+                        raise ValueError("Oversized nonpersistent model buffer")
+                    module._buffers[buffer_name] = buffer.to(self.device)
             names = []
             for name, param in module.named_parameters(recurse=False):
                 if param is not None:
