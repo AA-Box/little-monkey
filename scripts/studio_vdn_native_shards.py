@@ -164,6 +164,10 @@ class NativeOriginalShardHooks:
         if not registered:
             raise ValueError("No native sharded modules matched the model")
         for module, entries, paths in registered:
+            # The native tiled attention processor must call this module's
+            # forward so that its weight hydration hooks can run, rather
+            # than directly slicing a meta-resident .weight.
+            module._little_monkey_original_shards = True
             module.register_forward_pre_hook(
                 self._make_before(module, entries, paths), prepend=True)
             module.register_forward_hook(
