@@ -177,7 +177,8 @@ class NativeTemporalPrefix:
 
 
 def render_temporal_video(pipe, args, torch, device, keyframes, references,
-                          checkpoint, encode_video):
+                          checkpoint, encode_video, native_sampler_recovery,
+                          clear_native_sampler_stage):
     """Sample bounded rolling windows with fixed AV context and one final mux."""
     import numpy as np
     frames_total = temporal_frame_plan(args.frames, args.segments)
