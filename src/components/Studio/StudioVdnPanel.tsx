@@ -40,6 +40,7 @@ export function StudioVdnPanel({
   const [fp8, setFp8] = useState(false);
   const [offload, setOffload] = useState(true);
   const [memoryMode, setMemoryMode] = useState<"auto" | "resident" | "stream_cpu" | "stream_disk">("auto");
+  const [refineSteps, setRefineSteps] = useState(3);
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [licenseReason, setLicenseReason] = useState<string | null | undefined>(undefined);
   const [region, setRegion] = useState<Region>(null);
@@ -173,20 +174,13 @@ export function StudioVdnPanel({
         referenceAudioPath: referenceAudio,
         loraPaths, steps, frames, seed: Number(seed) || 0,
         fp8, offloadDit: offload, memoryMode, backend,
+        nativeTwoPass: twoPass, refineSteps, refineFromJobId: null,
         repoRoot: repoRoot || null,
         checkpointRoot: checkpointRoot || null,
         gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
         serverPort: backend === "sglang" ? serverPort : null,
         acknowledgeThirdPartyCode: trustRemoteCode,
       };
-      if (twoPass && frames > 124) {
-        setPhase("preview");
-        const previewEntry = await queuedRun({ ...request, frames: 124 });
-        setPreview(previewEntry);
-        await onCompleted();
-        request.jobId = crypto.randomUUID();
-        job.current = request.jobId;
-      }
       const entry = await queuedRun(request);
       setCreated(entry);
       setPhase("completed");
@@ -198,6 +192,32 @@ export function StudioVdnPanel({
       setRunning(false);
       job.current = null;
       void refreshLicense();
+    }
+  }
+
+  async function refineSaved(record: DurableVdnJob) {
+    if (running || !record.request.nativeTwoPass || record.status !== "completed") return;
+    setRunning(true);
+    setError(null);
+    const jobId = crypto.randomUUID();
+    job.current = jobId;
+    try {
+      const result = await queuedRun({
+        ...record.request,
+        jobId,
+        refineFromJobId: record.id,
+        nativeTwoPass: true,
+        refineSteps,
+        memoryMode,
+      });
+      setCreated(result);
+      setPhase("completed");
+      await onCompleted();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRunning(false);
+      job.current = null;
     }
   }
 
@@ -449,7 +469,7 @@ export function StudioVdnPanel({
                 onClick={() => void chooseFile(setReferenceVideo)}>Choose video</Button>
               {referenceVideo && <Button size="sm" variant="secondary" disabled={running}
                 onClick={() => setReferenceVideo(null)}>Remove video</Button>}
-              {backend === "free_video_adaptive" && <>
+              {(backend === "free_video_adaptive" || backend === "diffusers") && <>
                 <Button size="sm" variant="secondary" disabled={running}
                   onClick={() => void chooseFile(setReferenceAudio)}>Choose audio reference</Button>
                 {referenceAudio && <Button size="sm" variant="secondary" disabled={running}
@@ -457,7 +477,7 @@ export function StudioVdnPanel({
               </>}
             </div>
           </div>}
-        {(backend === "optimized_single" || backend === "optimized_ulysses") &&
+        {(backend === "optimized_single" || backend === "optimized_ulysses" || backend === "diffusers") &&
           <div className="grid gap-1 text-muted">
             <span>External LoRA adapters (up to 4 safetensors)</span>
             <div className="flex items-center gap-2">
@@ -500,21 +520,32 @@ export function StudioVdnPanel({
             <Play size={13} /> Generate with VDN-H3
           </Button>
           <Button size="sm" variant="secondary"
-            disabled={running || frames <= 124 || !python || !probeInfo || !prompt.trim() ||
+            disabled={running || backend !== "diffusers" || !python || !probeInfo || !prompt.trim() ||
               licenseReason !== null || !trustRemoteCode}
             onClick={() => void run(true)}>
-            <Play size={13} /> Preview then render (two passes)
+            <Play size={13} /> Native latent two-pass (reuses pass one)
           </Button>
           {running && <Button size="sm" variant="secondary" onClick={() => void cancel()}>
             <Square size={13} /> Cancel VDN job
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
+        {backend === "diffusers" && <label className="grid gap-1 text-muted">
+          Native latent refinement evaluations
+          <input type="number" min={1} max={12} disabled={running} value={refineSteps}
+            className="rounded border border-border bg-background p-1 text-foreground"
+            onChange={(event) => setRefineSteps(Math.max(1, Math.min(12, Number(event.target.value) || 3)))} />
+        </label>}
         {durableJobs.length > 0 && <div className="grid gap-1">
           <strong>Persisted VDN jobs</strong>
           {durableJobs.slice(-8).map((item) =>
             <div key={item.id} className="flex items-center gap-2">
               <span>{item.id.slice(0, 8)} · {item.status}</span>
+              {item.status === "completed" && item.request.nativeTwoPass &&
+                <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => void refineSaved(item)}>
+                  Refine saved native latents
+                </Button>}
               {(item.status === "failed" || item.status === "interrupted") &&
                 <Button size="sm" variant="secondary"
                   onClick={() => void studioClient.vdnResume(item.id)
