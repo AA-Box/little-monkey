@@ -21,6 +21,7 @@ const MAX_VIDEO_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOG_BYTES: u64 = 256 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
+const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -42,6 +43,16 @@ fn worker_source(backend: VdnBackend) -> &'static str {
         VdnBackend::Diffusers => WORKER,
         VdnBackend::FreeVideoAdaptive => ADAPTIVE_WORKER,
         _ => FAST_WORKER,
+    }
+}
+
+fn staged_worker_source(backend: VdnBackend) -> String {
+    if backend == VdnBackend::Diffusers {
+        // A self-contained, uniquely named worker script makes the sampler
+        // callback part of the same Python process and works after a restart.
+        format!("{SAMPLER_SOURCE}\n{WORKER}")
+    } else {
+        worker_source(backend).to_owned()
     }
 }
 
@@ -406,7 +417,7 @@ pub async fn generation_vdn_run(
     // errors and cross-job mutation of a script already executing.
     let source = directory.join(format!("studio-vdn-h3-worker-{}.py", request.job_id));
     let staging = directory.join(format!(".worker-{}.tmp", request.job_id));
-    std::fs::write(&staging, worker_source(request.backend))
+    std::fs::write(&staging, staged_worker_source(request.backend))
         .map_err(|error| error.to_string())?;
     #[cfg(unix)]
     {
@@ -439,6 +450,21 @@ pub async fn generation_vdn_run(
         .kill_on_drop(true);
     if request.backend == VdnBackend::Diffusers {
         process.arg("--memory-mode").arg(&request.memory_mode);
+        let checkpoint_home = directory.join("step-checkpoints");
+        std::fs::create_dir_all(&checkpoint_home).map_err(|e| e.to_string())?;
+        let root_metadata = std::fs::symlink_metadata(&checkpoint_home)
+            .map_err(|e| e.to_string())?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err("Unsafe native sampler checkpoint root".into());
+        }
+        let job_checkpoints = checkpoint_home.join(&request.job_id);
+        std::fs::create_dir_all(&job_checkpoints).map_err(|e| e.to_string())?;
+        let job_metadata = std::fs::symlink_metadata(&job_checkpoints)
+            .map_err(|e| e.to_string())?;
+        if job_metadata.file_type().is_symlink() || !job_metadata.is_dir() {
+            return Err("Unsafe job-specific sampler checkpoint directory".into());
+        }
+        process.arg("--step-checkpoint-root").arg(job_checkpoints);
         if request.native_two_pass {
             let checkpoints = directory.join("latent-checkpoints");
             std::fs::create_dir_all(&checkpoints).map_err(|e| e.to_string())?;
@@ -590,7 +616,7 @@ pub async fn generation_vdn_probe(
         .join("studio-vdn-h3");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let script = dir.join(format!(".vdn-probe-{}.py", uuid::Uuid::new_v4()));
-    std::fs::write(&script, worker_source(backend)).map_err(|error| error.to_string())?;
+    std::fs::write(&script, staged_worker_source(backend)).map_err(|error| error.to_string())?;
     let outcome = async {
         let mut cmd = tokio::process::Command::new(python);
         cmd.arg("-u").arg(&script).arg("--probe").args(&extra)
@@ -662,6 +688,8 @@ mod tests {
         assert!(WORKER.contains("OpenVDN/vdn-minimax-h3"));
         assert!(WORKER.contains("num_inference_steps=args.steps + 1"));
         assert!(WORKER.contains("apply_group_offloading"));
+        assert!(SAMPLER_SOURCE.contains("native_sampler_recovery"));
+        assert!(staged_worker_source(VdnBackend::Diffusers).contains("NativeStepStore"));
         assert!(!WORKER.contains("import comfyui"));
     }
 
