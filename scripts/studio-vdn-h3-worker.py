@@ -37,7 +37,7 @@ if "native_sampler_recovery" not in globals():
     )
 
 if "install_native_h3_tiles" not in globals():
-    from studio_vdn_lowmem import install_native_h3_tiles
+    from studio_vdn_lowmem import install_native_h3_tiles, weight_stream_policy
 
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
@@ -637,9 +637,14 @@ def _run_once(args):
         raise RuntimeError("An OpenVDN component did not load successfully.")
 
     device = torch.device(args.device)
+    stream_policy = weight_stream_policy(
+        torch.cuda.mem_get_info(device)[0], available_host_ram(),
+        disk_spill=args.disk_offload)
+    print(json.dumps({"phase": "native_stream_plan", **stream_policy}), flush=True)
     text_stream_kwargs = {
         "onload_device": device, "offload_device": "cpu",
-        "offload_type": "leaf_level", "use_stream": True,
+        "offload_type": "leaf_level",
+        "use_stream": stream_policy["text_async_prefetch"],
     }
     if args.disk_offload:
         text_path = Path(args.disk_offload_path) / "text_encoder"
@@ -659,7 +664,8 @@ def _run_once(args):
         stream_kwargs = {
             "onload_device": device, "offload_device": "cpu",
             "offload_type": "block_level",
-            "num_blocks_per_group": 1, "use_stream": True,
+            "num_blocks_per_group": stream_policy["denoiser_blocks_per_group"],
+            "use_stream": stream_policy["denoiser_async_prefetch"],
         }
         if args.disk_offload_path:
             dit_path = Path(args.disk_offload_path) / "denoiser"
