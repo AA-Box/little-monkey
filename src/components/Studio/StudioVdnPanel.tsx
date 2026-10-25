@@ -353,7 +353,7 @@ export function StudioVdnPanel({
             </label>
           </div>
           <p>Zero means adaptive for attention. Every query still attends to all video, audio and text keys. These controls reduce activation peaks but do not bypass the model's weight-loading RAM requirements.</p>
-        </div>
+        </div>}
         <label className="grid gap-1 text-muted">
           VDN execution backend
           <select aria-label="VDN execution backend" disabled={running}
