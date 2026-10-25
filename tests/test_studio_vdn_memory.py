@@ -34,6 +34,17 @@ class NativePlacementTests(unittest.TestCase):
         self.assertNotIn("int8_cpu", self.choose(torchao_available=False))
         self.assertNotIn("int8_cpu", self.choose(ram=64, disk=240, mode="auto"))
 
+    def test_fp8_disk_requires_capability_and_quantizer(self):
+        g = 1024**3
+        tiers = worker.choose_memory_plans(
+            16*g, 16*g, 220*g, capability=9,
+            fp8=True, mode="stream_disk", torchao_available=True)
+        self.assertEqual(tiers, ["fp8_disk"])
+        with self.assertRaisesRegex(ValueError, "torchao"):
+            worker.choose_memory_plans(
+                16*g, 16*g, 220*g, capability=9,
+                fp8=True, mode="stream_disk", torchao_available=False)
+
     def test_fp8_is_rejected_on_non_hopper(self):
         with self.assertRaisesRegex(ValueError, "9.0"):
             self.choose(fp8=True)
