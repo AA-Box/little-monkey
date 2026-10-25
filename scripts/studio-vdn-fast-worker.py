@@ -78,6 +78,7 @@ def arguments(argv=None):
     p.add_argument("--prompt", default="")
     p.add_argument("--first", default="")
     p.add_argument("--last", default="")
+    p.add_argument("--refs", nargs="+", default=[])
     p.add_argument("--output", default="")
     p.add_argument("--steps", type=int, default=8)
     p.add_argument("--frames", type=int, default=141)
@@ -100,7 +101,11 @@ def arguments(argv=None):
             p.error("Seed must be nonnegative")
         if args.device != "cuda":
             p.error("Optimized VDN-H3 requires CUDA")
-        for path in (args.first, args.last):
+        if len(args.refs) > 8:
+            p.error("At most eight reference images are supported")
+        if args.backend == "sglang" and args.refs:
+            p.error("This SGLang VDN endpoint does not accept Ref2VA references")
+        for path in (args.first, args.last, *args.refs):
             if path and (not Path(path).is_file() or Path(path).stat().st_size > 32 * 1024 * 1024):
                 p.error("Keyframe must be an existing file smaller than 32MB")
     if args.backend == "optimized_ulysses" and args.gpus != 8:
@@ -133,14 +138,16 @@ def native_commands(args, python_executable=sys.executable):
     root, ckpts = source_tree(args)
     out = Path(args.output)
     cache = out.with_suffix(".prompt.pt")
-    encoder = "src/inference/encode_keyframes.py" if args.first or args.last else "src/inference/encode_prompt.py"
+    encoder = "src/inference/encode_keyframes.py" if args.first or args.last or args.refs else "src/inference/encode_prompt.py"
     prepare = [python_executable, str(root / encoder),
                "--prompt", args.prompt, "--out", str(cache)]
     if args.first:
         prepare.extend(["--first", args.first])
     if args.last:
         prepare.extend(["--last", args.last])
-    if args.first or args.last:
+    if args.refs:
+        prepare.extend(["--refs", *args.refs])
+    if args.first or args.last or args.refs:
         prepare.extend(["--vae_root", str(ckpts / "h3-base")])
     if args.backend == "optimized_ulysses":
         config = f"8nfe_tuned_fp8_ulysses_{args.gpu_class}.yaml"
