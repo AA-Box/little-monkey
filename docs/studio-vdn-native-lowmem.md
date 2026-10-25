@@ -56,6 +56,58 @@ weight-license check in Rust.
    tokens / head count are bounded adaptive ceilings; 0 means auto. FFN
    tokens default to 256 (0 disables FFN tiling).
 
+## New native original-shard runtime (stream_disk default)
+
+The primary native `stream_disk` tier now **does not create Accelerate
+offload .dat copies**. The first-party `studio_vdn_native_shards.py` loader:
+
+- Reads the exact component source and subfolder from the live Diffusers
+  component spec, including the Ref2VA `transformer_ref` partition.
+- Downloads the original indexed SafeTensors shards into the regular HF cache
+  and preserves their original bytes. A single SafeTensors file is also
+  supported for smaller components. This must complete before inference.
+- Instantiates **H3, Qwen3-VL, Video VAE and Audio VAE** as real model objects
+  with meta parameters, then installs per-module pre/post-forward hydration
+  and eviction hooks. Parameters are only materialized on the CUDA device
+  during their own forward; an exception triggers the post-hook and releases
+  them. Small nonpersistent RoPE buffers remain device-resident.
+- Preserves mixed precision: H3's official FP32 patch/time/output/RoPE
+  modules remain FP32 and the released VAE/audio weights retain FP32.
+- Retains the official video VAE's temporal overlap/crossfade and enables
+  smaller spatial tiles at constrained VRAM. Audio is encoded and decoded
+  one mono channel at a time, without truncation or time-domain splitting.
+- Supports direct original-shard inference-time LoRA A/B linear overlays
+  (including optional per-pair alpha/rank) without merging or permanently
+  modifying base weights. Invalid/unknown adapter formats fail closed.
+- Provides **experimental** TorchAO FP8 weight-only conversion for supported
+  CUDA capability 9.0+ Linear modules on hydration. It is never applied
+  to Video/Audio VAE; absent kernels fail explicitly without BF16 fallback.
+- The existing `--weight-loader accelerate` remains available for diagnostic
+  comparison. It may materialize a second offload copy and does not promise
+  the same peak-RAM behavior.
+
+The model's original weights may still occupy significant storage in the
+Hugging Face cache, and CUDA execution of a large operator can exceed VRAM
+even if its weights are streamed individually. Actual supported hardware
+requirements must be measured on the complete model.
+
+### Tested behavior versus unverified behavior
+
+- CI uses **actual CPU PyTorch** with original SafeTensors test shards to
+  exercise true load/forward/meta-evict/repeat, exception cleanup, legacy
+  audio `weight_norm` hook ordering, native LoRA numerical parity and
+  stereo-audio operations. No synthetic `from_pretrained` eager-load
+  shortcut is involved in the streaming fixture.
+- End-to-end licensed 60+ GB Qwen/H3 inference and multi-frame GPU encoding
+  have **not** been performed here. In particular FP8 TorchAO kernel support,
+  VRAM peaks and LoRA on the original giant H3 layers remain to be proven
+  on an eligible NVIDIA device; the existence of a functional CPU toy test
+  does not establish 8 GiB VRAM / 16 GiB total system RAM production support.
+- Direct hook coverage is intentionally strict. Missing, renamed or tied
+  checkpoint weights, model-code paths that access a leaf parameter outside
+  that leaf's `forward`, and unsupported LoRA formats fail rather than
+  silently running a different model.
+
 ## How this is validated
 
 - Native VDN contract suite: compiles the exact concatenated Rust worker,
