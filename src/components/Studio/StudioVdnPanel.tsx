@@ -29,7 +29,8 @@ export function StudioVdnPanel({
   const [last, setLast] = useState<string | null>(null);
   const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
   const [sourceVdnJobId, setSourceVdnJobId] = useState<string | null>(null);
-  const [continuationMode, setContinuationMode] = useState<"last_frame" | "video_reference">("last_frame");
+  const [continuationMode, setContinuationMode] = useState<"last_frame" | "video_reference" | "latent_context">("last_frame");
+  const [queueNativeTwoPass, setQueueNativeTwoPass] = useState(true);
   const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
   const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
   const [references, setReferences] = useState<string[]>([]);
@@ -173,10 +174,10 @@ export function StudioVdnPanel({
         ...request,
         firstImagePath: null, lastImagePath: null,
         sourceGalleryEntryId: null, sourceVdnJobId: parent.id,
-        continuationMode: "video_reference",
+        continuationMode: "latent_context",
         referenceVideoPath: null,
         referenceAudioPath: null,
-        nativeTwoPass: false,
+        nativeTwoPass: queueNativeTwoPass,
         refineFromJobId: null,
       });
       setDurableJobs((items) => [...items, record]);
@@ -210,7 +211,7 @@ export function StudioVdnPanel({
 
   async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
-        !trustRemoteCode || running || (twoPass && segments > 1)) return;
+        !trustRemoteCode || running || (segments > 1 && Boolean(last)) return;
     const id = crypto.randomUUID();
     job.current = id;
     setRunning(true);
@@ -582,7 +583,13 @@ export function StudioVdnPanel({
             onChange={(event) => setContinuationMode(event.target.value as typeof continuationMode)}>
             <option value="last_frame">Last video frame (FL2VA)</option>
             <option value="video_reference">Reference original video motion and audio (Ref2VA)</option>
+            <option value="latent_context">Continue using saved native video + audio latents</option>
           </select>
+        </label>}
+        {backend === "diffusers" && <label className="flex items-center gap-2 text-muted">
+          <input type="checkbox" checked={queueNativeTwoPass} disabled={running}
+            onChange={(event) => setQueueNativeTwoPass(event.target.checked)} />
+          Use native two-pass for queued latent continuations
         </label>}
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
@@ -599,7 +606,7 @@ export function StudioVdnPanel({
             <Play size={13} /> Generate with VDN-H3
           </Button>
           <Button size="sm" variant="secondary"
-            disabled={running || backend !== "diffusers" || segments > 1 || !python || !probeInfo || !prompt.trim() ||
+            disabled={running || backend !== "diffusers" || (segments > 1 && Boolean(last)) || !python || !probeInfo || !prompt.trim() ||
               licenseReason !== null || !trustRemoteCode}
             onClick={() => void run(true)}>
             <Play size={13} /> Native latent two-pass (reuses pass one)
