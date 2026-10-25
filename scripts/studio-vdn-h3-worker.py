@@ -25,6 +25,14 @@ import signal
 import importlib.util
 import hashlib
 
+# The Rust host embeds this module into its self-contained, job-specific
+# staged worker. Running the checked-in Python script directly imports the
+# same Little Monkey-owned implementation from the adjacent source file.
+if "native_sampler_recovery" not in globals():
+    from studio_vdn_sampler import (
+        native_sampler_recovery, clear_native_sampler_stage,
+    )
+
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
 REF_MODEL_REPOSITORY = "MiniMaxAI/MiniMax-H3"
