@@ -656,6 +656,51 @@ mod tests {
     }
 
     #[test]
+    fn diffusers_native_ref2va_images_and_audio_validate_before_launch() {
+        let dir = std::env::temp_dir().join(format!("vdn-ref2va-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let image = dir.join("portrait.png");
+        let audio = dir.join("voice.wav");
+        std::fs::write(&image, [137, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+        std::fs::write(&audio, vec![1u8; 64]).unwrap();
+        let python = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let request: VdnRunRequest = serde_json::from_value(serde_json::json!({
+            "jobId": uuid::Uuid::new_v4().to_string(),
+            "pythonExecutable": python, "prompt": "A subject moves gently",
+            "steps": 8, "frames": 141, "seed": 31,
+            "firstImagePath": null, "lastImagePath": null,
+            "referenceImagePaths": [image.to_string_lossy().into_owned()],
+            "referenceAudioPath": audio.to_string_lossy().into_owned(),
+            "fp8": false, "offloadDit": true, "backend": "diffusers",
+            "acknowledgeThirdPartyCode": true
+        })).unwrap();
+        assert!(validate_request(&request).is_ok(), "Native Ref2VA should reach the worker");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolved_native_motion_reference_does_not_need_gone_gallery_pointer() {
+        let dir = std::env::temp_dir().join(format!("vdn-motion-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let clip = dir.join("prior.mp4");
+        std::fs::write(&clip, vec![1u8; 128]).unwrap();
+        let mut request: VdnRunRequest = serde_json::from_value(serde_json::json!({
+            "jobId": uuid::Uuid::new_v4().to_string(),
+            "pythonExecutable": std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            "prompt": "Continue the motion", "steps": 8, "frames": 141, "seed": 31,
+            "firstImagePath": null, "lastImagePath": null,
+            "continuationMode": "video_reference",
+            "referenceVideoPath": clip.to_string_lossy().into_owned(),
+            "fp8": false, "offloadDit": true, "backend": "diffusers",
+            "acknowledgeThirdPartyCode": true
+        })).unwrap();
+        assert!(validate_request(&request).is_ok(), "Resolved artifact must reach Ref2VA worker");
+        request.reference_video_path = None;
+        assert!(validate_request(&request).is_err(), "Unresolved source must fail closed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn malformed_requests_are_rejected_before_launch() {
         let invalid = VdnRunRequest {
             job_id: uuid::Uuid::new_v4().to_string(),
