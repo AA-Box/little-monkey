@@ -44,3 +44,19 @@ jobs:
           python3 -m unittest discover -s tests -p "test_studio_vdn_sampler.py"
           python3 -m unittest discover -s tests -p "test_studio_vdn_temporal.py"
           python3 -m unittest discover -s tests -p "test_studio_vdn_temporal_store.py"
+
+  native-av-tensor-cpu:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install bounded CPU tensor dependencies (no GPU / model weights)
+        run: |
+          python -m pip install "numpy>=1.24,<3" "safetensors>=0.5,<1"
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.5.1+cpu"
+      - name: Run real CPU AV snapshot and mocked full two-pass/continuation contracts
+        run: |
+          python -m unittest -v tests.test_studio_vdn_temporal_store
