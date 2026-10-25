@@ -1,0 +1,28 @@
+name: Native VDN contracts
+
+on:
+  pull_request:
+    paths:
+      - "scripts/studio-vdn-h3-worker.py"
+      - "scripts/studio-vdn-fast-worker.py"
+      - "src-tauri/src/studio_vdn.rs"
+      - "src-tauri/src/studio_vdn_jobs.rs"
+      - "src/components/Studio/StudioVdnPanel.tsx"
+      - "src/lib/studioClient.ts"
+      - "tests/test_studio_vdn_*.py"
+      - ".github/workflows/vdn-native-check.yml"
+
+jobs:
+  native-worker-contracts:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax-check owned Python workers
+        run: python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py
+      - name: Run actual worker subprocess input contracts
+        run: python3 scripts/test-studio-vdn-h3-worker.py
+      - name: Native policy, media pinning and latent checkpoint contracts
+        run: |
+          python3 -m unittest discover -s tests -p "test_studio_vdn_memory.py"
+          python3 -m unittest discover -s tests -p "test_studio_vdn_native_contract.py"
