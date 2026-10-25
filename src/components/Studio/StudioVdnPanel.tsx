@@ -29,6 +29,7 @@ export function StudioVdnPanel({
   const [last, setLast] = useState<string | null>(null);
   const [references, setReferences] = useState<string[]>([]);
   const [referenceVideo, setReferenceVideo] = useState<string | null>(null);
+  const [loraPaths, setLoraPaths] = useState<string[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
   const [seed, setSeed] = useState("0");
@@ -139,6 +140,7 @@ export function StudioVdnPanel({
         lastImagePath: last,
         referenceImagePaths: references,
         referenceVideoPath: referenceVideo,
+        loraPaths,
         steps,
         frames,
         seed: Number(seed) || 0,
@@ -400,6 +402,21 @@ export function StudioVdnPanel({
                 onClick={() => void chooseFile(setReferenceVideo)}>Choose video</Button>
               {referenceVideo && <Button size="sm" variant="secondary" disabled={running}
                 onClick={() => setReferenceVideo(null)}>Remove video</Button>}
+            </div>
+          </div>}
+        {(backend === "optimized_single" || backend === "optimized_ulysses") &&
+          <div className="grid gap-1 text-muted">
+            <span>External LoRA adapters (up to 4 safetensors)</span>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="secondary" disabled={running || loraPaths.length >= 4}
+                onClick={() => void open({ multiple: true, filters: [{ name: "LoRA", extensions: ["safetensors"] }] })
+                  .then((selected) => {
+                    const paths = typeof selected === "string" ? [selected] : (selected ?? []);
+                    setLoraPaths((current) => [...new Set([...current, ...paths])].slice(0, 4));
+                  })}>Add LoRA</Button>
+              <Button size="sm" variant="secondary" disabled={running || loraPaths.length === 0}
+                onClick={() => setLoraPaths([])}>Clear</Button>
+              <span>{loraPaths.length}/4</span>
             </div>
           </div>}
         <label className="flex items-start gap-2 text-muted">
