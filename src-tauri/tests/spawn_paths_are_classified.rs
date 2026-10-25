@@ -212,6 +212,12 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "lifecycle commands for that same server",
     ),
     (
+        "studio_vdn.rs",
+        Class::ManagedService,
+        "licensed user-triggered OpenVDN CUDA model worker with one guarded job, \
+         owned output, cancellation, and four-hour limit; never arbitrary agent code",
+    ),
+    (
         "studio_video_timeline.rs",
         Class::HostUtility,
         "fixed-argv FFmpeg with bounded app-owned scratch paths to compose user-selected

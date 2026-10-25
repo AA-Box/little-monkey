@@ -230,6 +230,28 @@ export interface GenerationModel {
   fitsInMemory: boolean;
 }
 
+/** Standalone, authorized CUDA VDN-H3 inference (no FreeVideo/ComfyUI). */
+export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang";
+
+export interface VdnGenerationRequest {
+  jobId: string;
+  pythonExecutable: string;
+  prompt: string;
+  steps: number;
+  frames: number;
+  seed: number;
+  firstImagePath: string | null;
+  lastImagePath: string | null;
+  fp8: boolean;
+  offloadDit: boolean;
+  backend: VdnBackend;
+  repoRoot: string | null;
+  checkpointRoot: string | null;
+  gpuClass: "h200" | "b200" | null;
+  serverPort: number | null;
+  acknowledgeThirdPartyCode: boolean;
+}
+
 export type VideoJobStatus = "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled";
 export type VideoJobStage = "waiting_for_dependencies" | "preparing_input" | "rendering" | "published";
 
@@ -635,6 +657,21 @@ export const studioClient = {
     invoke<void>("generation_import_minimax_entitlement", { grantJson }),
   clearMinimaxEntitlement: () =>
     invoke<void>("generation_clear_minimax_entitlement"),
+  vdnLicenseStatus: () => invoke<string | null>("generation_vdn_license_status"),
+  vdnAcceptTerms: () => invoke<void>("generation_vdn_accept_terms"),
+  vdnRun: (request: VdnGenerationRequest) =>
+    invoke<GenerationEntry>("generation_vdn_run", { request }),
+  vdnProbe: (
+    pythonExecutable: string, backend: VdnBackend, repoRoot: string | null,
+    checkpointRoot: string | null, gpuClass: "h200" | "b200" | null,
+    serverPort: number | null,
+  ) => invoke<{status?: string; phase?: string; backend: string; model: string;
+    device?: string; computeCapability?: string; vramBytes?: number;
+    torch?: string; fp8Supported?: boolean; visibleGpuCount?: number; port?: number}>(
+      "generation_vdn_probe",
+      { pythonExecutable, backend, repoRoot, checkpointRoot, gpuClass, serverPort }
+    ),
+  vdnCancel: (jobId: string) => invoke<boolean>("generation_vdn_cancel", { jobId }),
   setHuggingFaceToken: (modelId: string, token: string) =>
     invoke<void>("generation_set_hugging_face_token", { modelId, token }),
   downloadModel: (modelId: string) =>

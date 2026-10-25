@@ -49,6 +49,12 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      - name: Exercise standalone VDN worker executable without restricted model downloads
+        run: python3 scripts/test-studio-vdn-h3-worker.py
+
+      - name: Verify optimized VDN, Ulysses and real SGLang video API contracts
+        run: python3 scripts/test-studio-vdn-fast-worker.py
+
       - name: Syntax-check live real-model benchmark harness (no model mocks)
         run: pnpm test:swarm-models:syntax
 
