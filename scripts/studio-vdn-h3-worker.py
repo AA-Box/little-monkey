@@ -52,6 +52,7 @@ def parse_args(argv=None):
     parser.add_argument("--two-pass", action="store_true")
     parser.add_argument("--refine-from", default="")
     parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--step-checkpoint-root", default="")
     parser.add_argument("--refine-steps", type=int, default=3)
     parser.add_argument("--internal-attempt", choices=("resident", "resident_fp8", "stream_cpu", "stream_disk", "fp8_disk", "int8_cpu", "fp8_cpu"), default="")
     parser.add_argument("--device", default="cuda")
@@ -114,6 +115,8 @@ def parse_args(argv=None):
         parser.error("Step count must be from 1 to 50")
     if not 120 <= args.frames <= 360 or (args.frames - 5) % 17:
         parser.error("Frame count must be a supported 17n+5 value (120..360)")
+    if args.step_checkpoint_root and not Path(args.step_checkpoint_root).is_absolute():
+        parser.error("Native step checkpoint location must be absolute and app-owned")
     if args.refine_from and not args.two_pass:
         parser.error("Refine-from needs native two-pass mode")
     if args.two_pass and (not args.checkpoint or not Path(args.checkpoint).is_absolute()):
@@ -279,6 +282,7 @@ def run(args):
                         ("--reference-video", args.reference_video),
                         ("--reference-audio", args.reference_audio),
                         ("--checkpoint", args.checkpoint),
+                        ("--step-checkpoint-root", args.step_checkpoint_root),
                         ("--refine-from", args.refine_from)):
         if value:
             original.extend([flag, value])
@@ -419,7 +423,9 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
     else:
         print(json.dumps({"phase": "native_preview_sampling",
                           "canvas": [384, 672]}), flush=True)
-        preview = pipe(
+        with native_sampler_recovery(args, "preview", pipe, model_identity=(
+                REF_MODEL_REPOSITORY if references else MODEL_REPOSITORY)):
+            preview = pipe(
             prompt=args.prompt,
             num_frames=args.frames,
             num_inference_steps=args.steps + 1,
@@ -427,7 +433,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
             generator=torch.Generator(device).manual_seed(args.seed),
             output=["latents", "audio_latents"],
             **({"references": references} if references else keyframes),
-        )
+            )
         latents, audio_latents = preview["latents"], preview["audio_latents"]
         validate_preview_layout(tuple(latents.shape), tuple(audio_latents.shape))
         from pathlib import Path
@@ -441,6 +447,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
         with open(temp, "rb") as written:
             os.fsync(written.fileno())
         os.replace(temp, destination)
+        clear_native_sampler_stage(args, "preview")
         if os.name == "posix":
             folder = os.open(str(destination.parent), os.O_RDONLY)
             try:
@@ -465,14 +472,16 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
         upscaled.shape, generator=generator, device=device, dtype=upscaled.dtype)
     print(json.dumps({"phase": "native_latent_refinement",
                       "steps": args.refine_steps, "latentReuse": True}), flush=True)
-    return pipe(
+    with native_sampler_recovery(args, "refine", pipe, model_identity=(
+            REF_MODEL_REPOSITORY if references else MODEL_REPOSITORY)):
+        return pipe(
         prompt=args.prompt, num_frames=args.frames, height=768, width=1344,
         num_inference_steps=args.refine_steps + 1,
         generator=torch.Generator(device).manual_seed(args.seed + 2),
         latents=upscaled, audio_latents=audio_latents,
         output=["videos", "audio", "sampling_rate"],
         **({"references": references} if references else keyframes),
-    )
+        )
 
 
 def _run_once(args):
@@ -613,13 +622,14 @@ def _run_once(args):
     if args.two_pass:
         sample = native_two_pass(pipe, args, torch, device, keyframes, references)
     else:
-        sample = pipe(
+        with native_sampler_recovery(args, "single", pipe, model_identity=checkpoint):
+            sample = pipe(
             prompt=args.prompt, num_frames=args.frames,
             num_inference_steps=args.steps + 1,
             generator=torch.Generator(device).manual_seed(args.seed),
             output=["videos", "audio", "sampling_rate"],
             **({"references": references} if references else keyframes),
-        )
+            )
     videos, audio, sample_rate = (sample["videos"], sample["audio"],
                                  sample["sampling_rate"])
 
@@ -635,6 +645,7 @@ def _run_once(args):
     if not temporary.is_file() or temporary.stat().st_size < 32:
         raise RuntimeError("OpenVDN produced no video bytes")
     os.replace(temporary, output)
+    clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
     print(json.dumps({"phase": "completed", "path": str(output),
                       "frames": len(videos[0]), "fps": FPS}), flush=True)
 
