@@ -61,7 +61,7 @@ class OriginalShardNativeTests(unittest.TestCase):
                 streamed, store, device="cpu", component="test")
             self.assertGreater(hooks.layers, 0)
             self.assertTrue(all(p.is_meta for p in streamed.parameters()))
-            self.assertEqual(list(Path(root).glob("*")), list(store.files.values()))
+            self.assertEqual(set(Path(root).glob("*")), set(store.files.values()))
             torch.testing.assert_close(streamed(x), expected)
             torch.testing.assert_close(streamed(x), expected)
             self.assertTrue(all(p.is_meta for p in streamed.parameters()))
@@ -110,7 +110,7 @@ class OriginalShardNativeTests(unittest.TestCase):
             self.assertEqual(native.attach_native_lora(streamed, [adapter]), 1)
             torch.testing.assert_close(streamed(x), manual, atol=1e-6, rtol=1e-6)
             self.assertTrue(all(p.is_meta for p in streamed.parameters()))
-            with self.assertRaisesRegex(ValueError, "No LoRA"):
+            with self.assertRaisesRegex(ValueError, "Unsupported LoRA state key"):
                 empty = Path(root) / "empty.safetensors"
                 save_file({"other": torch.zeros(1)}, str(empty))
                 native.attach_native_lora(streamed, [empty])
