@@ -239,6 +239,7 @@ export interface VdnGenerationRequest {
   prompt: string;
   steps: number;
   frames: number;
+  segments: number;
   seed: number;
   firstImagePath: string | null;
   lastImagePath: string | null;
