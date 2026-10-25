@@ -37,6 +37,27 @@ def install_lowmem_decoders(vae, audio_vae, *, free_vram, verbose=True):
     vae.enable_slicing()
     if getattr(audio_vae, "_little_monkey_audio_sliced", False):
         return plan
+    original_encode = audio_vae.encode
+    @functools.wraps(original_encode)
+    def sliced_encode(self, samples, return_dict=True):
+        if samples.ndim != 3 or samples.shape[0] <= 1:
+            return original_encode(samples, return_dict=return_dict)
+        import torch
+        from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (
+            MiniMaxH3AudioDiagonalGaussianDistribution, MiniMaxH3AudioEncoderOutput,
+        )
+        means, logs = [], []
+        for mono in samples.split(1, dim=0):
+            posterior = original_encode(mono, return_dict=False)[0]
+            means.append(posterior.mean)
+            logs.append(posterior.logs)
+        distribution = MiniMaxH3AudioDiagonalGaussianDistribution(
+            torch.cat(means, dim=0), torch.cat(logs, dim=0))
+        if not return_dict:
+            return (distribution,)
+        return MiniMaxH3AudioEncoderOutput(latent_dist=distribution)
+
+    audio_vae.encode = types.MethodType(sliced_encode, audio_vae)
     original_decode = audio_vae.decode
 
     @functools.wraps(original_decode)
@@ -66,5 +87,6 @@ def install_lowmem_decoders(vae, audio_vae, *, free_vram, verbose=True):
                           "videoSpatialOverlap": plan["spatial_overlap"],
                           "officialTemporalChunking": True,
                           "audioChannelsSequential": True,
+                          "audioReferenceEncoderSequential": True,
                           "audioWaveformFp32": True}), flush=True)
     return plan
