@@ -178,6 +178,12 @@ export type GenerationEngineKind =
   | "mlx_video"
   | "mflux_image";
 
+export type VideoMemoryProfile =
+  | "default"
+  | "maximum_speed"
+  | "adaptive_vram"
+  | "minimum_ram";
+
 /** A model exactly as stored in the user's library. */
 export interface GenerationModelSpec {
   id: string;
@@ -195,6 +201,7 @@ export interface GenerationModelSpec {
   /** The diffusion model itself reads per-run reference images (FLUX Kontext,
    *  Qwen-Image-Edit, FLUX.2). Mirrors `reads_ref_images` in generation.rs. */
   readsRefImages: boolean;
+  videoMemoryProfile?: VideoMemoryProfile;
 }
 
 export interface GenerationModel {
@@ -211,6 +218,7 @@ export interface GenerationModel {
   engine: GenerationEngineKind;
   quantizationBits: number | null;
   readsRefImages: boolean;
+  videoMemoryProfile?: VideoMemoryProfile;
   installed: boolean;
   /** Measured on this machine, not declared in the entry. */
   totalBytes: number;
@@ -613,6 +621,8 @@ export const studioClient = {
   models: () => invoke<GenerationModel[]>("generation_models"),
   addModel: (spec: GenerationModelSpec) =>
     invoke<GenerationModelSpec[]>("generation_add_model", { spec }),
+  registerWan22: () =>
+    invoke<GenerationModelSpec[]>("generation_register_wan22"),
   removeModel: (modelId: string) =>
     invoke<void>("generation_remove_model", { modelId }),
   acceptLicense: (licenseId: string) =>
@@ -902,5 +912,6 @@ export function emptyModelSpec(): GenerationModelSpec {
     engine: "stable_diffusion_cpp",
     quantizationBits: null,
     readsRefImages: false,
+    videoMemoryProfile: "default",
   };
 }
