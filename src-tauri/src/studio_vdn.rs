@@ -111,6 +111,8 @@ pub struct VdnRunRequest {
     pub last_image_path: Option<String>,
     #[serde(default)]
     pub source_gallery_entry_id: Option<String>,
+    #[serde(default)]
+    pub source_vdn_job_id: Option<String>,
     #[serde(default = "default_continuation_mode")]
     pub continuation_mode: String,
     #[serde(default)]
@@ -222,9 +224,19 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if !matches!(request.continuation_mode.as_str(), "last_frame" | "video_reference") {
         return Err("Unsupported native continuation mode".into());
     }
+    if let Some(source_id) = &request.source_vdn_job_id {
+        uuid::Uuid::parse_str(source_id).map_err(|_| "Invalid VDN predecessor job ID")?;
+        if source_id == &request.job_id { return Err("VDN job cannot depend on itself".into()); }
+        if request.source_gallery_entry_id.is_some() {
+            return Err("Choose a Gallery source or predecessor job, not both".into());
+        }
+        if request.first_image_path.is_some() {
+            return Err("VDN predecessor supplies its own first frame".into());
+        }
+    }
     if request.continuation_mode == "video_reference" {
-        if request.source_gallery_entry_id.is_none() {
-            return Err("Video reference continuation needs an earlier Gallery clip".into());
+        if request.source_gallery_entry_id.is_none() && request.source_vdn_job_id.is_none() {
+            return Err("Video reference continuation needs a Gallery clip or predecessor VDN job".into());
         }
         if request.backend != VdnBackend::Diffusers {
             return Err("Motion/audio reference continuation requires native Diffusers Ref2VA".into());
@@ -645,6 +657,7 @@ mod tests {
             first_image_path: None,
             last_image_path: None,
             source_gallery_entry_id: None,
+            source_vdn_job_id: None,
             continuation_mode: "last_frame".into(),
             reference_image_paths: vec![],
             reference_video_path: None,
