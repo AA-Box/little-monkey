@@ -24,6 +24,26 @@ def tile_policy(tokens, heads, dim, free_bytes, *, query_override=0, heads_overr
     return q, h
 
 
+def weight_stream_policy(free_cuda, free_ram, *, disk_spill=False):
+    """Budget genuine Diffusers block streaming and async weight prefetch.
+
+    Prefetch is beneficial only when the model can keep two transfer slots in
+    VRAM plus host-pinned pages. Low-VRAM/low-RAM machines use sequential
+    transfers instead of causing a secondary OOM inside the offload hooks.
+    """
+    if free_cuda < 0 or free_ram is not None and free_ram < 0:
+        raise ValueError("Negative native streaming budget")
+    gib = 1024**3
+    cpu_ok = free_ram is not None and free_ram >= 64 * gib
+    cuda_ok = free_cuda >= 14 * gib
+    return {
+        "denoiser_blocks_per_group": 1 if free_cuda < 32 * gib else 2,
+        "denoiser_async_prefetch": bool(cuda_ok and cpu_ok and not disk_spill),
+        "text_async_prefetch": bool(cuda_ok and cpu_ok and not disk_spill),
+        "disk_spill": bool(disk_spill),
+    }
+
+
 def _plain_linear_rows(layer, x, start, stop):
     import torch
     import torch.nn.functional as functional
