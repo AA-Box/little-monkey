@@ -133,12 +133,13 @@ class RealTensorAndWindowContracts(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temp:
                 base = Path(temp)
-                def run(job_id, source_path="", source_sha="", source_id="", segments=2):
+                def run(job_id, source_path="", source_sha="", source_id="", segments=2,
+                        refine_from=""):
                     args = SimpleNamespace(
                         prompt="moving characters", output=str(base / (job_id + ".mp4")),
                         seed=42, frames=124, segments=segments, steps=8, refine_steps=3,
                         two_pass=True, checkpoint=str(base / (job_id + ".preview")),
-                        refine_from="", step_checkpoint_root=str(base / "step"),
+                        refine_from=refine_from, step_checkpoint_root=str(base / "step"),
                         temporal_context_in=source_path,
                         temporal_context_out=str(base / (job_id + ".safetensors")),
                         temporal_source_video_sha256=source_sha,
@@ -155,7 +156,7 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                         encoder, lambda *a, **kw: contextlib.nullcontext(),
                         lambda *a: None, "request-identity",
                     )
-                    self.assertEqual(len(pipe.calls), 2 * segments)
+                    self.assertEqual(len(pipe.calls), segments if refine_from else 2 * segments)
                     self.assertTrue(all("latents" in call["output"] for call in pipe.calls))
                     return args, report
                 parent = str(uuid.uuid4())
@@ -164,6 +165,10 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 self.assertEqual(report["audioSamples"], temporal.emitted_audio_samples(226))
                 self.assertTrue(Path(store.preview_path(args.checkpoint, 0)).is_file())
                 self.assertTrue(Path(store.preview_path(args.checkpoint, 1)).is_file())
+                refined_job = str(uuid.uuid4())
+                copied, again = run(refined_job, segments=2, refine_from=args.checkpoint)
+                self.assertEqual(again["videos"], 226)
+                self.assertTrue(Path(copied.output).is_file())
                 digest = hashlib.sha256(Path(args.output).read_bytes()).hexdigest()
                 previous = store.load_context(args.temporal_context_out, digest, "vdn-h3", parent)
                 self.assertEqual(previous["total_frames"], 226)
