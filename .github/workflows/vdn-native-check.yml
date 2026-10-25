@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - "scripts/studio-vdn-h3-worker.py"
+      - "scripts/studio_vdn_sampler.py"
       - "scripts/studio-vdn-fast-worker.py"
       - "src-tauri/src/studio_vdn.rs"
       - "src-tauri/src/studio_vdn_jobs.rs"
@@ -23,10 +24,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Syntax-check owned Python workers
-        run: python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py
+        run: |
+          python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py scripts/studio_vdn_sampler.py
+          python3 - <<'PY'
+          from pathlib import Path
+          native = Path("scripts/studio_vdn_sampler.py").read_text()
+          worker = Path("scripts/studio-vdn-h3-worker.py").read_text()
+          compile(native + "\\n" + worker, "staged-vdn-worker.py", "exec")
+          PY
       - name: Run actual worker subprocess input contracts
         run: python3 scripts/test-studio-vdn-h3-worker.py
       - name: Native policy, media pinning and latent checkpoint contracts
         run: |
           python3 -m unittest discover -s tests -p "test_studio_vdn_memory.py"
           python3 -m unittest discover -s tests -p "test_studio_vdn_native_contract.py"
+          python3 -m unittest discover -s tests -p "test_studio_vdn_sampler.py"
