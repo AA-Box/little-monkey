@@ -10,6 +10,7 @@ on:
       - "scripts/studio-vdn-h3-worker.py"
       - "scripts/studio_vdn_sampler.py"
       - "scripts/studio_vdn_temporal.py"
+      - "scripts/studio_vdn_temporal_store.py"
       - "scripts/studio-vdn-fast-worker.py"
       - "src-tauri/src/studio_vdn.rs"
       - "src-tauri/src/studio_vdn_jobs.rs"
@@ -26,12 +27,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax-check owned Python workers
         run: |
-          python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py scripts/studio_vdn_sampler.py scripts/studio_vdn_temporal.py
+          python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py scripts/studio_vdn_sampler.py scripts/studio_vdn_temporal.py scripts/studio_vdn_temporal_store.py
           python3 - <<'PY'
           from pathlib import Path
-          native = Path("scripts/studio_vdn_sampler.py").read_text()
-          worker = Path("scripts/studio-vdn-h3-worker.py").read_text()
-          compile(native + "\n" + worker, "staged-vdn-worker.py", "exec")
+          scripts = ("studio_vdn_sampler.py", "studio_vdn_temporal_store.py",
+                     "studio_vdn_temporal.py", "studio-vdn-h3-worker.py")
+          sources = [Path("scripts", p).read_text() for p in scripts]
+          compile("\n".join(sources), "staged-vdn-worker.py", "exec")
           PY
       - name: Run actual worker subprocess input contracts
         run: python3 scripts/test-studio-vdn-h3-worker.py
@@ -41,3 +43,4 @@ jobs:
           python3 -m unittest discover -s tests -p "test_studio_vdn_native_contract.py"
           python3 -m unittest discover -s tests -p "test_studio_vdn_sampler.py"
           python3 -m unittest discover -s tests -p "test_studio_vdn_temporal.py"
+          python3 -m unittest discover -s tests -p "test_studio_vdn_temporal_store.py"
