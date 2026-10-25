@@ -211,7 +211,7 @@ export function StudioVdnPanel({
 
   async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
-        !trustRemoteCode || running || (segments > 1 && Boolean(last)) return;
+        !trustRemoteCode || running || (segments > 1 && Boolean(last))) return;
     const id = crypto.randomUUID();
     job.current = id;
     setRunning(true);
