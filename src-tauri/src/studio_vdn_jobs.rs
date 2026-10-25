@@ -140,6 +140,25 @@ pub(crate) fn is_cancelled(app: &AppHandle, id: &str) -> Result<bool, String> {
     Ok(matches!(load(&dir, id)?.status, VdnJobStatus::Cancelled))
 }
 
+/// A native preview is usable only if the prior job is complete in this
+/// profile, has a published Gallery artifact, and its own request generated
+/// a real checkpoint using the native Diffusers backend.
+pub(crate) fn completed_with_preview(app: &AppHandle, id: &str) -> Result<bool, String> {
+    let _guard = lock().lock().map_err(|error| error.to_string())?;
+    let dir = directory(app)?;
+    let job = load(&dir, id)?;
+    if !matches!(job.status, VdnJobStatus::Completed)
+        || !job.request.native_two_pass
+        || job.result_entry_id.is_none()
+    { return Ok(false); }
+    let preview = app.profile_data_dir().map_err(|error| error.to_string())?
+        .join("studio-vdn-h3").join("latent-checkpoints")
+        .join(format!("{id}.safetensors"));
+    let metadata = fs::symlink_metadata(&preview).map_err(|error| error.to_string())?;
+    Ok(metadata.is_file() && !metadata.file_type().is_symlink()
+       && metadata.len() > 128 && metadata.len() < 2 * 1024 * 1024 * 1024)
+}
+
 fn published_entry(app: &AppHandle, id: &str) -> Result<Option<String>, String> {
     Ok(crate::generation_commands::generation_gallery(app.clone())?
         .into_iter()
