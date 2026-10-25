@@ -22,28 +22,19 @@ weight-license check in Rust.
 3. **Token-chunked FFN.** Each MiniMax-H3 `FeedForward` layer performs its
    own forward pass in bounded token groups, reducing intermediate SwiGLU/FF
    activations while preserving token-independent math.
-4. **Initial disk-mapped SafeTensors loading for both H3 and Qwen.**
-   For the native `stream_disk` tier, `studio_vdn_disk_loader.py` reads each
-   component's small shard index from the *actual* Diffusers component spec
-   (OpenVDN H3 is under `h3-base/transformer`; Qwen may resolve to the
-   separate `MiniMaxAI/MiniMax-H3/text_encoder` source). It verifies that
-   indexed weights are SafeTensors rather than pickle and passes
-   `device_map="auto"`, separate bounded `max_memory`, per-component
-   `offload_folder`, `low_cpu_mem_usage=True`, and
-   `offload_state_dict=True` to the models' original
-   `from_pretrained` loaders. **These options act during shard loading,**
-   before the full model is resident. Accelerate can offload most modules to
-   disk and materialize them as their forward hooks run. The app **checks
-   both H3 and Qwen have real disk-dispatched modules** before sampling.
-   Accelerate's disk format may create extra cache files; this is not yet a
-   zero-copy original-SafeTensors mmap engine.
-5. **Other placements.** Existing Diffusers group-offload hooks still
-   stream CPU-resident weights for non-disk tiers. Disk-dispatched modules
-   retain Accelerate's hooks; applying group hooks a second time is
-   prohibited. Available VRAM/RAM governs prefetch and block grouping.
-   Streaming with 12 GiB *available* host RAM and 180 GiB scratch space is
-   admitted for a trial with at least 8 GiB *free* CUDA VRAM; this is not a
-   guarantee that a whole video will finish or fit.
+4. **Primary disk tier: first-party original-shard streaming.** The
+   `studio_vdn_native_shards.py` loader resolves original model indexes and
+   constructs H3, Qwen, Video VAE and Audio VAE as meta modules. Each module
+   reads just its required original SafeTensors weights during forward and
+   returns to meta afterward. This **does not create Accelerate disk-copy
+   files**. See the dedicated section below.
+5. **Alternative disk/CPU placements.** The existing
+   `--weight-loader accelerate` diagnostic mode still uses Accelerate
+   shard dispatch for H3/Qwen; its disk copies and resource behavior differ.
+   The ordinary CPU-resident tier uses Diffusers group-offload hooks.
+   The 12 GiB available host RAM + 180 GiB scratch + 8 GiB free VRAM
+   admission for direct disk streaming is only an experimental lower-bound
+   check, **not** a verified end-to-end hardware requirement.
 6. **Recovery and observability.** The Rust-owned worker passes low-memory
    settings to subprocesses. CUDA OOM triggers one stricter, smaller-tile
    attempt in a *fresh process* before moving to the next tier. Per-step
@@ -129,18 +120,16 @@ requirements must be measured on the complete model.
 - Full model inference on a consumer NVIDIA GPU, target video quality or
   reproducibility against a real licensed checkpoint.
 - **8 GiB VRAM / 16 GiB RAM production support is not established.**
-  The loader no longer requires full BF16 H3 and Qwen residency at initial
-  load in the disk tier, but Accelerate may materialize individual shards,
-  temporary weights and execution buffers. Full model CUDA acceptance is
-  still required to measure process RSS, true peak allocation and output.
-  The 12 GiB minimum refers to *currently available* host RAM, not installed.
-- The new loader dispatches standard Hugging Face shards into Accelerate's
-  disk offload storage. A fully first-party zero-copy loader that reads
-  exact per-block tensor slices directly from the *original* SafeTensors
-  files during each forward remains future work. No training/quantization
-  changes are implied by this PR.
-- FP8 and LoRA injection into disk-mapped layers are not yet validated and
-  fail explicitly rather than silently reverting to eager loading.
+  Direct original SafeTensors loading avoids building all four components
+  in RAM first, but large individual operators and temporary activations may
+  still cause OOM. Full-model CUDA acceptance is required for actual peak
+  memory and output validation. The 12 GiB check means *available* RAM.
+- CUDA FP8 TorchAO with the complete giant H3/Qwen model, and LoRA adapter
+  parity on the real checkpoint, remain to be validated on a licensed GPU.
+  Unsupported LoRA schemas and configurations fail closed.
+- Direct module hooks assume weights are accessed through the hooked
+  module's forward, not through unhooked direct parameter access; such
+  model-code paths need real-model integration tests.
 - Guaranteed speedups: smaller chunks trade memory for more kernel launches
   and may be slower, especially with quantized module projections.
 
