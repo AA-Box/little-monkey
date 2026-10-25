@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { Play, Square, FolderOpen, RefreshCw } from "lucide-react";
 import { Button } from "../ui";
-import { studioClient, type GenerationEntry } from "../../lib/studioClient";
+import { studioClient, type GenerationEntry, type VdnBackend } from "../../lib/studioClient";
 
 type PhaseEvent = { jobId: string; phase: string; detail: string };
 type Region = "eu" | "uk" | "us" | "kr" | "other" | null;
@@ -19,6 +19,11 @@ export function StudioVdnPanel({
   onOpenModels?: () => void;
 }) {
   const [python, setPython] = useState("");
+  const [backend, setBackend] = useState<VdnBackend>("diffusers");
+  const [repoRoot, setRepoRoot] = useState("");
+  const [checkpointRoot, setCheckpointRoot] = useState("");
+  const [gpuClass, setGpuClass] = useState<"h200" | "b200">("h200");
+  const [serverPort, setServerPort] = useState(30010);
   const [prompt, setPrompt] = useState("");
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
@@ -67,8 +72,8 @@ export function StudioVdnPanel({
     return () => { active = false; unlisten?.(); };
   }, [refreshLicense]);
 
-  async function chooseFile(set: (value: string) => void) {
-    const value = await open({ multiple: false, directory: false });
+  async function chooseFile(set: (value: string) => void, directory = false) {
+    const value = await open({ multiple: false, directory });
     if (typeof value === "string") set(value);
   }
 
@@ -78,10 +83,19 @@ export function StudioVdnPanel({
     setProbInfoPlaceholder();
     setProbing(true);
     try {
-      const report = await studioClient.vdnProbe(python);
-      setProbeInfo(`${report.device} · compute capability ${report.computeCapability} · ${(report.vramBytes / (1024 ** 3)).toFixed(1)} GiB VRAM · PyTorch ${report.torch}`);
-      setGpuFp8(report.fp8Supported);
-      if (!report.fp8Supported) setFp8(false);
+      const report = await studioClient.vdnProbe(
+        python, backend, repoRoot || null, checkpointRoot || null,
+        gpuClass, serverPort,
+      );
+      if (backend === "sglang") {
+        setProbeInfo(`Serving ${report.model} through 127.0.0.1:${report.port ?? serverPort}`);
+        setGpuFp8(false);
+        setFp8(false);
+      } else {
+        setProbeInfo(`${report.device} · ${report.computeCapability} · ${((report.vramBytes ?? 0) / (1024 ** 3)).toFixed(1)} GiB VRAM · ${report.visibleGpuCount ?? 1} CUDA GPUs · PyTorch ${report.torch}`);
+        setGpuFp8(report.fp8Supported === true);
+        if (!report.fp8Supported) setFp8(false);
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setProbeInfo(null);
@@ -124,6 +138,11 @@ export function StudioVdnPanel({
         seed: Number(seed) || 0,
         fp8,
         offloadDit: offload,
+        backend,
+        repoRoot: repoRoot || null,
+        checkpointRoot: checkpointRoot || null,
+        gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
+        serverPort: backend === "sglang" ? serverPort : null,
         acknowledgeThirdPartyCode: trustRemoteCode,
       });
       setCreated(entry);
@@ -191,6 +210,76 @@ export function StudioVdnPanel({
         </div>
 
         <label className="grid gap-1 text-muted">
+          VDN execution backend
+          <select aria-label="VDN execution backend" disabled={running}
+            className="rounded border border-border bg-background px-2 py-1 text-foreground"
+            value={backend} onChange={(event) => {
+              const next = event.target.value as VdnBackend;
+              setBackend(next);
+              setProbeInfo(null);
+              if (next !== "diffusers") setSteps(8);
+            }}>
+            <option value="diffusers">Portable Diffusers — single CUDA GPU with offload</option>
+            <option value="optimized_single">OpenVDN tuned kernels — Linux, one large CUDA GPU</option>
+            <option value="optimized_ulysses">OpenVDN Ulysses — Linux, 8 H200/B200 GPUs</option>
+            <option value="sglang">SGLang Diffusion — local accelerated server (1/2/4/8 GPUs)</option>
+          </select>
+        </label>
+
+        {(backend === "optimized_single" || backend === "optimized_ulysses") && (
+          <div className="grid gap-2">
+            <label className="grid gap-1 text-muted">
+              Official OpenVDN Git checkout
+              <div className="flex flex-wrap gap-2">
+                <input className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-foreground"
+                  value={repoRoot} disabled={running} onChange={(event) => {
+                    setRepoRoot(event.target.value); setProbeInfo(null);
+                  }} placeholder="/home/user/vdn-minimax-h3" />
+                <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => void chooseFile((v) => {
+                    setRepoRoot(v); setProbeInfo(null);
+                  }, true)}>Choose folder</Button>
+              </div>
+            </label>
+            <label className="grid gap-1 text-muted">
+              Existing authorized OpenVDN 8-step checkpoint directory (h3-base + stage-dmd-step-250)
+              <div className="flex flex-wrap gap-2">
+                <input className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-foreground"
+                  value={checkpointRoot} disabled={running} onChange={(event) => {
+                    setCheckpointRoot(event.target.value); setProbeInfo(null);
+                  }} placeholder="/data/ckpts" />
+                <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => void chooseFile((v) => {
+                    setCheckpointRoot(v); setProbeInfo(null);
+                  }, true)}>Choose folder</Button>
+              </div>
+            </label>
+            {backend === "optimized_ulysses" && (
+              <label className="grid gap-1 text-muted">
+                GPU configuration (8 matching GPU devices required)
+                <select value={gpuClass} disabled={running}
+                  className="rounded border border-border bg-background px-2 py-1 text-foreground"
+                  onChange={(event) => { setGpuClass(event.target.value as "h200" | "b200"); setProbeInfo(null); }}>
+                  <option value="h200">8 × H200</option>
+                  <option value="b200">8 × B200</option>
+                </select>
+              </label>
+            )}
+          </div>
+        )}
+        {backend === "sglang" && (
+          <label className="grid gap-1 text-muted">
+            Existing OpenVDN SGLang server port (loopback only)
+            <input type="number" min={1} max={65535}
+              className="rounded border border-border bg-background px-2 py-1 text-foreground"
+              value={serverPort} disabled={running}
+              onChange={(event) => { setServerPort(Number(event.target.value)); setProbeInfo(null); }}/>
+            <span>Server must serve OpenVDN/vdn-minimax-h3.
+              Stopping a client job may not stop GPU work inside existing SGLang releases.</span>
+          </label>
+        )}
+
+        <label className="grid gap-1 text-muted">
           Python interpreter from the installed OpenVDN-compatible environment
           <div className="flex items-center gap-2">
             <input className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-foreground"
@@ -240,7 +329,8 @@ export function StudioVdnPanel({
 
         <div className="grid gap-2 sm:grid-cols-3">
           <label className="grid gap-1 text-muted">Model evaluations
-            <input type="number" min={1} max={50} value={steps} disabled={running}
+            <input type="number" min={1} max={50} value={steps}
+              disabled={running || backend !== "diffusers"}
               className="rounded border border-border bg-background p-1 text-foreground"
               onChange={(event) => setSteps(Math.max(1, Math.min(50, Number(event.target.value) || 8)))} />
           </label>
@@ -261,23 +351,23 @@ export function StudioVdnPanel({
         </div>
 
         <div className="flex flex-wrap gap-4">
-          <label className="flex items-center gap-2 text-muted">
+          {backend === "diffusers" && <label className="flex items-center gap-2 text-muted">
             <input type="checkbox" checked={offload} disabled={running}
               onChange={(event) => setOffload(event.target.checked)} />
             Stream transformer blocks to GPU (24 GB VRAM)
-          </label>
-          <label className="flex items-center gap-2 text-muted">
+          </label>}
+          {(backend === "diffusers" || backend === "optimized_single") && <label className="flex items-center gap-2 text-muted">
             <input type="checkbox" checked={fp8} disabled={running || !gpuFp8}
               onChange={(event) => setFp8(event.target.checked)} />
-            TorchAO FP8 (supported GPU only)
-          </label>
+            FP8 (supported GPUs only)
+          </label>}
         </div>
 
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />
-          I agree to run upstream OpenVDN Python model components
-          (Hugging Face trust_remote_code=True), and have verified the source.
+          I have verified and authorize running the selected official OpenVDN
+          source/runtime and the upstream model components, which may execute Python code.
         </label>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -300,7 +390,7 @@ export function StudioVdnPanel({
         <p className="text-muted">
           Output is verified and published into the same Studio Gallery as Wan.
           Missing CUDA dependencies, unauthorized territory, unsupported GPU, or
-          incompatible OpenVDN Diffusers components are reported as errors,
+          incompatible upstream OpenVDN or SGLang components are reported as errors,
           never represented as a successful render.
         </p>
       </div>
