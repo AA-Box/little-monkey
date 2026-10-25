@@ -114,7 +114,62 @@ matches. Temporary frames are removed on success or failure.
 Boundaries: this is an independent Little Monkey native implementation,
 **not a FreeVideo runtime dependency**. A physical licensed CUDA/H3 model
 test is still needed to certify visual and voice quality, sample
-compatibility across released Diffusers versions, and performance. This
-initial native path uses clean audio context and does not combine multiple
-segments with the existing per-job two-pass refinement checkpoint. Model
-territory restrictions and upstream-code consent are unchanged.
+compatibility across released Diffusers versions, and performance. native implementation requires the installed H3 transformer interfaces;
+model territory restrictions and upstream-code consent remain unchanged.
+
+### Two-pass rolling windows
+
+For a 2–8-segment generation, choose **Native latent two-pass**. Each segment
+now executes *two model sampling passes*, not a preview job followed by
+independent outputs: the half-resolution pass receives the exact prior
+half-resolution video/audio latent tail; the full-resolution refinement pass
+receives the matching full-resolution tail. The preview's video latents
+are interpolated and re-noised for the second pass, while its generated
+audio latents are passed to refinement. Each pass has a distinct
+completed-denoising-step checkpoint and a content-bound Safetensors
+preview checkpoint. A restart can reuse a matching preview; an outdated or
+corrupt local preview is regenerated. Different refinement step counts do
+not invalidate a compatible first pass.
+
+This reuses the existing native interpolation+refinement implementation; it
+does **not** claim the independently trained upscaler from FreeVideo.
+
+### Continue from a prior native video
+
+After the MP4 is encoded, the worker writes a small, atomic
+`temporal-contexts/<job-id>.safetensors` snapshot containing the *actual
+final seven visual latents* and the matching stereo audio latent tail.
+For two-pass videos it persists both preview and final-resolution tails;
+for regular single-pass videos the low-resolution tail is derived from
+the final-resolution latents. The snapshot includes the original
+job ID, model identity, total-frame timeline and SHA-256 of the exact MP4.
+
+In Studio choose an existing native Diffusers Gallery clip or a queued
+predecessor and select **Continue using saved native video + audio latents**.
+The durable job resolver accepts only a completed native Gallery job,
+verifies the artifact ID, bounds the saved snapshot and provides the worker
+the exact source job and pinned MP4 digest. The worker verifies the
+Safetensors tensor digest, geometry, model, job identity, video SHA-256 and
+global 24-fps/40-Hz AV time origins before GPU sampling. Invalid or legacy
+sources fail explicitly instead of silently degrading to frame-only
+conditioning.
+
+The first continued window consumes 22 old frames as protected context,
+so only `frames - 22` new frames/audio are exported for that window.
+Later windows reuse the preceding window's actual AV latent tails.
+The original MP4 remains a separate Gallery artifact, and the new MP4
+contains **only newly generated material**. Studio Timeline can order
+these clips; this path does not secretly reencode or duplicate the parent
+video. Each new MP4 has a 32-kHz stereo soundtrack with bounded
+audio-latent rounding at the seam.
+
+### Acceptance boundary
+
+The CPU contracts validate deterministic frame/audio planning, source
+ownership/size rules, preview fingerprints, staging and Python syntax.
+Optional real-tensor tests exercise Safetensors roundtrips and a mocked
+two-pass parent-to-child path when CPU PyTorch and Safetensors are installed.
+These do not substitute for the licensed CUDA H3 models: physical
+multi-segment visual continuity, voice identity, audiovisual synchrony,
+exact Diffusers version compatibility, checkpoint resume and resource
+usage still require real-hardware acceptance before parity is claimed.
