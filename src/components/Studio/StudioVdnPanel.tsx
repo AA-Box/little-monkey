@@ -245,7 +245,7 @@ export function StudioVdnPanel({
       <div className="mt-3 grid gap-3">
         <p className="text-muted">
           Run the genuine OpenVDN Diffusers hybrid-attention pipeline with its
-          trained 8-step VDN-H3 weights, directly from Little Monkey.
+          trained VDN-H3 weights for text/keyframe runs. Reference-video/audio requests use the separately trained MiniMax H3 Ref2VA partition.
           It requires an installed compatible CUDA Python environment and
           substantial disk/RAM. No FreeVideo or ComfyUI dependency.
           On macOS, use the native Wan engine above/below instead.
@@ -458,6 +458,11 @@ export function StudioVdnPanel({
         {(backend === "optimized_single" || backend === "optimized_ulysses" || backend === "free_video_adaptive" || backend === "diffusers") &&
           <div className="grid gap-1 text-muted">
             <span>Image, motion-video and audio references (native Diffusers Ref2VA)</span>
+            {backend === "diffusers" && <p className="text-muted">
+              This loads the original MiniMax H3 transformer_ref checkpoint,
+              not the OpenVDN hybrid transformer. Inputs remain local to the
+              selected Python runtime; model licensing still applies.
+            </p>}
             <div className="flex items-center gap-2">
               <Button size="sm" variant="secondary" disabled={running || references.length >= 8}
                 onClick={() => void open({ multiple: true, filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] })
