@@ -22,6 +22,7 @@ const MAX_LOG_BYTES: u64 = 256 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
 const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py");
+const TEMPORAL_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -50,7 +51,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
@@ -107,6 +108,7 @@ fn worker_args(
 
 fn default_native_memory_mode() -> String { "auto".into() }
 fn default_native_refine_steps() -> u32 { 3 }
+fn default_native_segments() -> u32 { 1 }
 fn default_continuation_mode() -> String { "last_frame".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +119,8 @@ pub struct VdnRunRequest {
     pub prompt: String,
     pub steps: u32,
     pub frames: u32,
+    #[serde(default = "default_native_segments")]
+    pub segments: u32,
     pub seed: i64,
     pub first_image_path: Option<String>,
     pub last_image_path: Option<String>,
@@ -225,6 +229,15 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         || !(120..=360).contains(&request.frames)
         || (request.frames - 5) % 17 != 0 {
         return Err("VDN requires 1-50 inference steps and 17n+5 frames in 120..360".into());
+    }
+    if !(1..=8).contains(&request.segments) {
+        return Err("Native VDN supports 1..8 temporal segments".into());
+    }
+    if request.segments != 1 && request.backend != VdnBackend::Diffusers {
+        return Err("Native temporal continuity requires the Little Monkey Diffusers backend".into());
+    }
+    if request.segments > 1 && request.native_two_pass {
+        return Err("Multi-segment native continuation cannot reuse a single two-pass checkpoint".into());
     }
     if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) && request.steps != 8 {
         return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
@@ -452,6 +465,7 @@ pub async fn generation_vdn_run(
         .arg("--output").arg(&output)
         .arg("--steps").arg(request.steps.to_string())
         .arg("--frames").arg(request.frames.to_string())
+        .arg("--segments").arg(request.segments.to_string())
         .arg("--seed").arg(request.seed.to_string())
         .arg("--device").arg("cuda")
         .current_dir(&directory)
@@ -701,6 +715,7 @@ mod tests {
         assert!(WORKER.contains("apply_group_offloading"));
         assert!(SAMPLER_SOURCE.contains("native_sampler_recovery"));
         assert!(staged_worker_source(VdnBackend::Diffusers).contains("NativeStepStore"));
+        assert!(staged_worker_source(VdnBackend::Diffusers).contains("NativeTemporalPrefix"));
         assert!(!WORKER.contains("import comfyui"));
     }
 
@@ -757,6 +772,7 @@ mod tests {
             prompt: "sample".into(),
             steps: 8,
             frames: 345,
+            segments: 1,
             seed: 0,
             first_image_path: None,
             last_image_path: None,
