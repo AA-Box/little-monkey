@@ -219,7 +219,7 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if request.lora_paths.len() > 4 { return Err("VDN supports at most four LoRAs".into()); }
     if !request.lora_paths.is_empty() &&
-        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses | VdnBackend::FreeVideoAdaptive) {
+        !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses | VdnBackend::FreeVideoAdaptive) {
         return Err("External LoRA requires native optimized OpenVDN".into());
     }
     for lora in &request.lora_paths {
@@ -231,8 +231,8 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         }
     }
     if let Some(audio) = &request.reference_audio_path {
-        if request.backend != VdnBackend::FreeVideoAdaptive {
-            return Err("Audio-conditioned references require the optional adaptive backend".into());
+        if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) {
+            return Err("Audio-conditioned references require the native Diffusers Ref2VA backend".into());
         }
         let path = Path::new(audio).canonicalize().map_err(|_| "Reference audio not found")?;
         let info = std::fs::metadata(&path).map_err(|e| e.to_string())?;
@@ -241,8 +241,8 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         }
     }
     if request.reference_video_path.is_some() &&
-        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
-        return Err("Video reference frames require optimized OpenVDN".into());
+        !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("Video references require native OpenVDN or Diffusers".into());
     }
     if let Some(path) = &request.reference_video_path {
         let video = Path::new(path).canonicalize().map_err(|_| "Reference video not found")?;
@@ -256,10 +256,22 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if !request.reference_image_paths.is_empty() &&
         !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
-        return Err("Ref2VA is supported only by native optimized OpenVDN backends".into());
+        return Err("Ref2VA requires native OpenVDN or Diffusers".into());
     }
     for reference in &request.reference_image_paths {
         validate_image(&Some(reference.clone()))?;
+    }
+    if request.backend == VdnBackend::Diffusers
+        && (request.reference_audio_path.is_some()
+            || request.reference_video_path.is_some()
+            || !request.reference_image_paths.is_empty())
+        && (request.first_image_path.is_some() || request.last_image_path.is_some()) {
+        return Err("Ref2VA reference conditioning cannot be combined with keyframes".into());
+    }
+    if request.backend == VdnBackend::Diffusers
+        && request.reference_audio_path.is_some()
+        && request.reference_video_path.is_none() && request.reference_image_paths.is_empty() {
+        return Err("Native Ref2VA audio reference requires image or video".into());
     }
     if request.source_gallery_entry_id.is_some() && request.first_image_path.is_some() {
         return Err("Cannot combine continuation with first image".into());
