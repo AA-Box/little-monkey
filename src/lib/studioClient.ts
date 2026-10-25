@@ -242,6 +242,7 @@ export interface VdnGenerationRequest {
   seed: number;
   firstImagePath: string | null;
   lastImagePath: string | null;
+  referenceImagePaths: string[];
   fp8: boolean;
   offloadDit: boolean;
   backend: VdnBackend;
