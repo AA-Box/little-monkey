@@ -109,7 +109,12 @@ export function StudioVdnPanel({
         setGpuFp8(false);
         setFp8(false);
       } else {
-        setProbeInfo(`${report.device} · ${report.computeCapability} · ${((report.vramBytes ?? 0) / (1024 ** 3)).toFixed(1)} GiB VRAM · ${report.visibleGpuCount ?? 1} CUDA GPUs · PyTorch ${report.torch}`);
+        setProbeInfo(`${report.device} · ${report.computeCapability} · ${((report.vramBytes ?? 0) / (1024 ** 3)).toFixed(1)} GiB VRAM · ${report.visibleGpuCount ?? 1} CUDA GPUs · PyTorch ${report.torch}` +
+          (backend === "diffusers"
+            ? report.resourcesReady
+              ? ` · Native plans: ${(report.nativeMemoryPlans ?? []).join(" → ")}`
+              : ` · Insufficient resources: ${report.resourceWarning ?? "No safe tier"}`
+            : ""));
         setGpuFp8(report.fp8Supported === true);
         if (!report.fp8Supported) setFp8(false);
       }
@@ -309,8 +314,8 @@ export function StudioVdnPanel({
             onChange={(event) => setMemoryMode(event.target.value as typeof memoryMode)}>
             <option value="auto">Adaptive GPU / streamed CPU / quantization / disk</option>
             <option value="resident">GPU resident only</option>
-            <option value="stream_cpu">Stream blocks from CPU with prefetch</option>
-            <option value="stream_disk">Disk-backed block streaming (96 GiB available required)</option>
+            <option value="stream_cpu">Stream blocks from CPU (136 GiB available RAM)</option>
+            <option value="stream_disk">Disk-backed block streaming (160 GiB storage + 40 GiB RAM)</option>
           </select>
         </label>
         <label className="grid gap-1 text-muted">
