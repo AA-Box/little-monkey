@@ -22,6 +22,8 @@ VISUAL_CONTEXT_LATENTS = 7
 MAX_SEGMENTS = 8
 
 if "save_context" not in globals():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from studio_vdn_temporal_store import (
         load_context, save_context, preview_fallback, preview_identity,
         preview_path, load_preview, save_preview,
