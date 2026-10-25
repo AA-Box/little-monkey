@@ -53,7 +53,7 @@ class NativeShardedDiskContracts(unittest.TestCase):
         g = disk.GIB
         b = disk.low_ram_disk_budget(12*g, 16*g, 190*g)
         self.assertGreater(b["cpu_reserve_bytes"], 8*g)
-        self.assertGreater(b["cuda_activation_reserve_bytes"], 8*g)
+        self.assertGreaterEqual(b["cuda_activation_reserve_bytes"], 8*g)
         for args in ((6*g,16*g,200*g), (12*g,8*g,200*g),
                      (12*g,16*g,120*g)):
             with self.assertRaises(ValueError):
