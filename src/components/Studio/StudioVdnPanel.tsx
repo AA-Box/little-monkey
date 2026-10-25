@@ -27,6 +27,7 @@ export function StudioVdnPanel({
   const [prompt, setPrompt] = useState("");
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
+  const [references, setReferences] = useState<string[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
   const [seed, setSeed] = useState("0");
@@ -135,6 +136,7 @@ export function StudioVdnPanel({
         prompt: prompt.trim(),
         firstImagePath: first,
         lastImagePath: last,
+        referenceImagePaths: references,
         steps,
         frames,
         seed: Number(seed) || 0,
@@ -377,6 +379,23 @@ export function StudioVdnPanel({
           </label>}
         </div>
 
+        {(backend === "optimized_single" || backend === "optimized_ulysses") &&
+          <div className="grid gap-1 text-muted">
+            <span>Reference images (native OpenVDN Ref2VA, up to 8)</span>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="secondary" disabled={running || references.length >= 8}
+                onClick={() => void open({ multiple: true, filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] })
+                  .then((selected) => {
+                    const paths = typeof selected === "string" ? [selected] : (selected ?? []);
+                    setReferences((current) => [...new Set([...current, ...paths])].slice(0, 8));
+                  })}>
+                Add reference images
+              </Button>
+              <Button size="sm" variant="secondary" disabled={running || references.length === 0}
+                onClick={() => setReferences([])}>Clear</Button>
+              <span>{references.length}/8</span>
+            </div>
+          </div>}
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />
