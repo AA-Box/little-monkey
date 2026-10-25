@@ -28,6 +28,7 @@ export function StudioVdnPanel({
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
   const [references, setReferences] = useState<string[]>([]);
+  const [referenceVideo, setReferenceVideo] = useState<string | null>(null);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
   const [seed, setSeed] = useState("0");
@@ -137,6 +138,7 @@ export function StudioVdnPanel({
         firstImagePath: first,
         lastImagePath: last,
         referenceImagePaths: references,
+        referenceVideoPath: referenceVideo,
         steps,
         frames,
         seed: Number(seed) || 0,
@@ -381,7 +383,7 @@ export function StudioVdnPanel({
 
         {(backend === "optimized_single" || backend === "optimized_ulysses") &&
           <div className="grid gap-1 text-muted">
-            <span>Reference images (native OpenVDN Ref2VA, up to 8)</span>
+            <span>Reference images/video (native OpenVDN Ref2VA, visual frame conditioning)</span>
             <div className="flex items-center gap-2">
               <Button size="sm" variant="secondary" disabled={running || references.length >= 8}
                 onClick={() => void open({ multiple: true, filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] })
@@ -393,7 +395,11 @@ export function StudioVdnPanel({
               </Button>
               <Button size="sm" variant="secondary" disabled={running || references.length === 0}
                 onClick={() => setReferences([])}>Clear</Button>
-              <span>{references.length}/8</span>
+              <span>{references.length}/8 images</span>
+              <Button size="sm" variant="secondary" disabled={running}
+                onClick={() => void chooseFile(setReferenceVideo)}>Choose video</Button>
+              {referenceVideo && <Button size="sm" variant="secondary" disabled={running}
+                onClick={() => setReferenceVideo(null)}>Remove video</Button>}
             </div>
           </div>}
         <label className="flex items-start gap-2 text-muted">
