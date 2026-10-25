@@ -96,6 +96,7 @@ fn worker_args(
 
 fn default_native_memory_mode() -> String { "auto".into() }
 fn default_native_refine_steps() -> u32 { 3 }
+fn default_continuation_mode() -> String { "last_frame".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +111,8 @@ pub struct VdnRunRequest {
     pub last_image_path: Option<String>,
     #[serde(default)]
     pub source_gallery_entry_id: Option<String>,
+    #[serde(default = "default_continuation_mode")]
+    pub continuation_mode: String,
     #[serde(default)]
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
@@ -215,6 +218,21 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if !matches!(request.memory_mode.as_str(), "auto" | "resident" | "stream_cpu" | "stream_disk") {
         return Err("Invalid Little Monkey native memory policy".into());
+    }
+    if !matches!(request.continuation_mode.as_str(), "last_frame" | "video_reference") {
+        return Err("Unsupported native continuation mode".into());
+    }
+    if request.continuation_mode == "video_reference" {
+        if request.source_gallery_entry_id.is_none() {
+            return Err("Video reference continuation needs an earlier Gallery clip".into());
+        }
+        if request.backend != VdnBackend::Diffusers {
+            return Err("Motion/audio reference continuation requires native Diffusers Ref2VA".into());
+        }
+        if request.reference_video_path.is_some() || request.first_image_path.is_some()
+            || request.last_image_path.is_some() {
+            return Err("Cannot mix video continuation with another video/keyframe".into());
+        }
     }
     if request.native_two_pass && request.backend != VdnBackend::Diffusers {
         return Err("Little Monkey native latent refinement currently requires Diffusers".into());
@@ -627,6 +645,7 @@ mod tests {
             first_image_path: None,
             last_image_path: None,
             source_gallery_entry_id: None,
+            continuation_mode: "last_frame".into(),
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],
