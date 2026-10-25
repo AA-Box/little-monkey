@@ -230,12 +230,16 @@ pub(crate) fn completed_with_preview(app: &AppHandle, id: &str) -> Result<bool, 
         || !job.request.native_two_pass
         || job.result_entry_id.is_none()
     { return Ok(false); }
-    let preview = app.profile_data_dir().map_err(|error| error.to_string())?
-        .join("studio-vdn-h3").join("latent-checkpoints")
-        .join(format!("{id}.safetensors"));
+    let checkpoint_root = app.profile_data_dir().map_err(|error| error.to_string())?
+        .join("studio-vdn-h3").join("latent-checkpoints");
+    let dir = fs::symlink_metadata(&checkpoint_root).map_err(|error| error.to_string())?;
+    if dir.file_type().is_symlink() || !dir.is_dir() {
+        return Err("Native VDN checkpoint directory is unsafe".into());
+    }
+    let preview = checkpoint_root.join(format!("{id}.safetensors"));
     let metadata = fs::symlink_metadata(&preview).map_err(|error| error.to_string())?;
     Ok(metadata.is_file() && !metadata.file_type().is_symlink()
-       && metadata.len() > 128 && metadata.len() < 2 * 1024 * 1024 * 1024)
+       && metadata.len() > 128 && metadata.len() <= 64 * 1024 * 1024)
 }
 
 fn published_entry(app: &AppHandle, id: &str) -> Result<Option<String>, String> {
