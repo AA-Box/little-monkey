@@ -120,6 +120,15 @@ async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
         root.join("content-v1"), 256 * 1024 * 1024
     ).map_err(|e| e.to_string())?;
     let bytes = store.read(&entry.artifact_id).map_err(|e| e.to_string())?;
+    if request.continuation_mode == "video_reference" {
+        // Retain temporal motion *and* the original soundtrack by supplying the
+        // pinned clip directly to native MiniMax-H3 Ref2VA reference decoding.
+        let suffix = if entry.media_type == "video/webm" { "webm" } else { "mp4" };
+        let temp = directory(app)?.join(format!("{}.source.{suffix}", job.id));
+        fs::write(&temp, &bytes).map_err(|e| e.to_string())?;
+        request.reference_video_path = Some(temp.to_string_lossy().into_owned());
+        return Ok((request, Some(temp)));
+    }
     let png_base64 = crate::studio_video_jobs::extract_final_frame(
         app, &bytes, &entry.media_type
     ).await?;
