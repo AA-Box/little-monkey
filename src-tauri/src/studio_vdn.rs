@@ -99,6 +99,8 @@ pub struct VdnRunRequest {
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
     pub reference_video_path: Option<String>,
+    #[serde(default)]
+    pub lora_paths: Vec<String>,
     pub fp8: bool,
     pub offload_dit: bool,
     #[serde(default)]
@@ -193,6 +195,19 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         .map_err(|_| "Choose the Python executable from the OpenVDN-compatible environment")?;
     if !python.is_file() {
         return Err("Python executable is not a file".into());
+    }
+    if request.lora_paths.len() > 4 { return Err("VDN supports at most four LoRAs".into()); }
+    if !request.lora_paths.is_empty() &&
+        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("External LoRA requires native optimized OpenVDN".into());
+    }
+    for lora in &request.lora_paths {
+        let path = Path::new(lora).canonicalize().map_err(|_| "LoRA file missing")?;
+        let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() < 128 || metadata.len() > 8 * 1024 * 1024 * 1024 ||
+            path.extension().and_then(|x| x.to_str()) != Some("safetensors") {
+            return Err("VDN LoRA must be a local .safetensors file up to 8 GiB".into());
+        }
     }
     if request.reference_video_path.is_some() &&
         !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
@@ -315,6 +330,7 @@ pub async fn generation_vdn_run(
     if request.fp8 { process.arg("--fp8"); }
     if let Some(ref image) = first { process.arg("--first").arg(image); }
     if let Some(ref image) = last { process.arg("--last").arg(image); }
+    for lora in &request.lora_paths { process.arg("--lora").arg(lora); }
     if let Some(reference_video) = &request.reference_video_path {
         process.arg("--reference-video").arg(reference_video);
     }
@@ -515,6 +531,7 @@ mod tests {
             last_image_path: None,
             reference_image_paths: vec![],
             reference_video_path: None,
+            lora_paths: vec![],
             fp8: false,
             offload_dit: true,
             backend: VdnBackend::Diffusers,
