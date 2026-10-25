@@ -86,6 +86,22 @@ def parse_args(argv=None):
             "torch": torch.__version__,
             "fp8Supported": cap[0] >= 9,
         }
+        free_vram, _ = torch.cuda.mem_get_info()
+        host_ram = available_host_ram()
+        disk_free = shutil.disk_usage(Path.cwd()).free
+        try:
+            report["nativeMemoryPlans"] = choose_memory_plans(
+                free_vram, host_ram, disk_free, capability=cap[0],
+                torchao_available=importlib.util.find_spec("torchao") is not None,
+            )
+            report["resourcesReady"] = True
+        except ValueError as exc:
+            report["nativeMemoryPlans"] = []
+            report["resourcesReady"] = False
+            report["resourceWarning"] = str(exc)
+        report["freeVramBytes"] = free_vram
+        report["hostRamAvailableBytes"] = host_ram
+        report["diskFreeBytes"] = disk_free
         if not hasattr(ModularPipeline, "load_components"):
             raise RuntimeError("Installed Diffusers is missing ModularPipeline.load_components")
         print(json.dumps(report), flush=True)
