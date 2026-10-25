@@ -95,6 +95,8 @@ pub struct VdnRunRequest {
     pub seed: i64,
     pub first_image_path: Option<String>,
     pub last_image_path: Option<String>,
+    #[serde(default)]
+    pub source_gallery_entry_id: Option<String>,
     pub fp8: bool,
     pub offload_dit: bool,
     #[serde(default)]
@@ -189,6 +191,9 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         .map_err(|_| "Choose the Python executable from the OpenVDN-compatible environment")?;
     if !python.is_file() {
         return Err("Python executable is not a file".into());
+    }
+    if request.source_gallery_entry_id.is_some() && request.first_image_path.is_some() {
+        return Err("Cannot combine video continuation with an explicit first image".into());
     }
     let first = validate_image(&request.first_image_path)?;
     let last = validate_image(&request.last_image_path)?;
@@ -489,6 +494,7 @@ mod tests {
             seed: 0,
             first_image_path: None,
             last_image_path: None,
+            source_gallery_entry_id: None,
             fp8: false,
             offload_dit: true,
             backend: VdnBackend::Diffusers,
