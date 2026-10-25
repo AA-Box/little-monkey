@@ -22,6 +22,7 @@ const MAX_LOG_BYTES: u64 = 256 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
+const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
 /// An independent real rendering runtime. Each shares licensing, cancellation
 /// and gallery storage; none is implemented by relabeling the Diffusers mode.
@@ -33,11 +34,13 @@ pub enum VdnBackend {
     OptimizedSingle,
     OptimizedUlysses,
     Sglang,
+    FreeVideoAdaptive,
 }
 
 fn worker_source(backend: VdnBackend) -> &'static str {
     match backend {
         VdnBackend::Diffusers => WORKER,
+        VdnBackend::FreeVideoAdaptive => ADAPTIVE_WORKER,
         _ => FAST_WORKER,
     }
 }
@@ -47,11 +50,18 @@ fn worker_args(
     gpu_class: Option<&str>, server_port: Option<u16>,
 ) -> Result<Vec<String>, String> {
     if backend == VdnBackend::Diffusers { return Ok(Vec::new()); }
+    if backend == VdnBackend::FreeVideoAdaptive {
+        let cache = checkpoint_root.ok_or(
+            "Select the already prepared FreeVideo model cache")?;
+        let cache = Path::new(cache).canonicalize().map_err(|_|
+            "Prepared FreeVideo model cache cannot be found")?;
+        return Ok(vec!["--cache".into(), cache.to_string_lossy().into_owned()]);
+    }
     let mut args = vec!["--backend".into(), match backend {
         VdnBackend::OptimizedSingle => "optimized_single",
         VdnBackend::OptimizedUlysses => "optimized_ulysses",
         VdnBackend::Sglang => "sglang",
-        VdnBackend::Diffusers => unreachable!(),
+        VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive => unreachable!(),
     }.into()];
     if backend == VdnBackend::Sglang {
         let port = server_port.unwrap_or(30010);
@@ -179,7 +189,7 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         || (request.frames - 5) % 17 != 0 {
         return Err("VDN requires 1-50 inference steps and 17n+5 frames in 120..360".into());
     }
-    if request.backend != VdnBackend::Diffusers && request.steps != 8 {
+    if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) && request.steps != 8 {
         return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
     }
     if request.seed < 0 {
@@ -436,6 +446,7 @@ mod tests {
         assert_eq!(worker_source(VdnBackend::OptimizedSingle), FAST_WORKER);
         assert_eq!(worker_source(VdnBackend::OptimizedUlysses), FAST_WORKER);
         assert_eq!(worker_source(VdnBackend::Sglang), FAST_WORKER);
+        assert_eq!(worker_source(VdnBackend::FreeVideoAdaptive), ADAPTIVE_WORKER);
         let sglang = worker_args(VdnBackend::Sglang, None, None, None, Some(30010)).unwrap();
         assert!(sglang.windows(2).any(|pair| pair == ["--backend", "sglang"]));
         assert!(sglang.windows(2).any(|pair| pair == ["--port", "30010"]));

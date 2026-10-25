@@ -9,7 +9,8 @@ type PhaseEvent = { jobId: string; phase: string; detail: string };
 type Region = "eu" | "uk" | "us" | "kr" | "other" | null;
 
 /** Executes OpenVDN's actual hybrid-attention model through an app-owned
- * standalone Python worker. No FreeVideo process or ComfyUI server.
+ * standalone Python worker. The optional adaptive backend uses a separately
+ * installed FreeVideo package; the default OpenVDN modes remain independent.
  * The Rust backend, never UI state, controls local model licensing. */
 export function StudioVdnPanel({
   onCompleted,
@@ -87,7 +88,11 @@ export function StudioVdnPanel({
         python, backend, repoRoot || null, checkpointRoot || null,
         gpuClass, serverPort,
       );
-      if (backend === "sglang") {
+      if (backend === "free_video_adaptive") {
+        setProbeInfo("Optional FreeVideo adaptive runtime detected; prepared weights and hardware must still be validated when rendering.");
+        setGpuFp8(false);
+        setFp8(false);
+      } else if (backend === "sglang") {
         setProbeInfo(`Serving ${report.model} through 127.0.0.1:${report.port ?? serverPort}`);
         setGpuFp8(false);
         setFp8(false);
@@ -223,9 +228,26 @@ export function StudioVdnPanel({
             <option value="optimized_single">OpenVDN tuned kernels — Linux, one large CUDA GPU</option>
             <option value="optimized_ulysses">OpenVDN Ulysses — Linux, 8 H200/B200 GPUs</option>
             <option value="sglang">SGLang Diffusion — local accelerated server (1/2/4/8 GPUs)</option>
+            <option value="free_video_adaptive">Adaptive low-memory — installed FreeVideo engine (CPU/disk/INT8/FP8)</option>
           </select>
         </label>
 
+        {backend === "free_video_adaptive" && (
+          <label className="grid gap-1 text-muted">
+            Prepared FreeVideo model cache
+            <div className="flex flex-wrap gap-2">
+              <input className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 font-mono text-foreground"
+                value={checkpointRoot} disabled={running}
+                onChange={(event) => { setCheckpointRoot(event.target.value); setProbeInfo(null); }}
+                placeholder="/path/to/prepared-freevideo-cache" />
+              <Button size="sm" variant="secondary" disabled={running}
+                onClick={() => void chooseFile((path) => { setCheckpointRoot(path); setProbeInfo(null); }, true)}>
+                <FolderOpen size={13} /> Choose cache
+              </Button>
+            </div>
+            <span>This optional backend uses the installed FreeVideo engine and its own adaptive planner. It does not remove model license restrictions.</span>
+          </label>
+        )}
         {(backend === "optimized_single" || backend === "optimized_ulysses") && (
           <div className="grid gap-2">
             <label className="grid gap-1 text-muted">
@@ -366,8 +388,8 @@ export function StudioVdnPanel({
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />
-          I have verified and authorize running the selected official OpenVDN
-          source/runtime and the upstream model components, which may execute Python code.
+          I have verified and authorize running the selected third-party VDN
+          runtime and model components, which may execute Python code.
         </label>
 
         <div className="flex flex-wrap items-center gap-2">

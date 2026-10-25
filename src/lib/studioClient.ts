@@ -230,8 +230,8 @@ export interface GenerationModel {
   fitsInMemory: boolean;
 }
 
-/** Standalone, authorized CUDA VDN-H3 inference (no FreeVideo/ComfyUI). */
-export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang";
+/** VDN backend selection; FreeVideo is an optional separately installed runtime. */
+export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang" | "free_video_adaptive";
 
 export interface VdnGenerationRequest {
   jobId: string;
