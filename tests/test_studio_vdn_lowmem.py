@@ -23,6 +23,19 @@ class NativeAttentionBudgetTests(unittest.TestCase):
                                  query_override=10000, heads_override=56)
         self.assertEqual(auto, forced)
 
+    def test_streaming_prefetch_respects_real_resource_budget(self):
+        gib = 1024**3
+        constrained = low.weight_stream_policy(8*gib, 16*gib, disk_spill=True)
+        self.assertFalse(constrained["denoiser_async_prefetch"])
+        self.assertFalse(constrained["text_async_prefetch"])
+        self.assertEqual(constrained["denoiser_blocks_per_group"], 1)
+        roomy = low.weight_stream_policy(40*gib, 128*gib, disk_spill=False)
+        self.assertTrue(roomy["denoiser_async_prefetch"])
+        self.assertTrue(roomy["text_async_prefetch"])
+        self.assertEqual(roomy["denoiser_blocks_per_group"], 2)
+        with self.assertRaises(ValueError):
+            low.weight_stream_policy(-1, 128*gib)
+
     def test_limits_and_invalid_geometry(self):
         self.assertEqual(low.tile_policy(100, 6, 8, 1024**3,
                                           query_override=17, heads_override=2), (17, 2))
