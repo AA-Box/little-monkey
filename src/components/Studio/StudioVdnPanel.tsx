@@ -603,7 +603,7 @@ export function StudioVdnPanel({
           24-channel H3 model weights, then 3 calibrated refinement steps.
           The first use downloads approximately 659 MiB of verified weights
           from the original publisher. No interpolation fallback.
-        </p>
+        </p>}
         {durableJobs.length > 0 && <div className="grid gap-1">
           <strong>Persisted VDN jobs</strong>
           {durableJobs.slice(-8).map((item) =>
