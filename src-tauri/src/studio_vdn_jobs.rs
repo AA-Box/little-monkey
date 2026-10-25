@@ -296,6 +296,42 @@ pub fn start_background_recovery(app: AppHandle) {
 mod tests {
     use super::*;
     #[test]
+    fn journal_reloads_exact_seed_and_source_identity() {
+        let root = std::env::temp_dir().join(format!("vdn-durable-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let request: crate::studio_vdn::VdnRunRequest = serde_json::from_value(
+            serde_json::json!({
+                "jobId": id, "pythonExecutable": "/not/executed/python",
+                "prompt": "fixed seed", "steps": 8, "frames": 141,
+                "seed": 712, "firstImagePath": null, "lastImagePath": null,
+                "sourceGalleryEntryId": "published-parent",
+                "fp8": false, "offloadDit": true,
+                "backend": "diffusers", "acknowledgeThirdPartyCode": true
+            })
+        ).unwrap();
+        let record = VdnJob {
+            id: id.clone(),
+            request,
+            status: VdnJobStatus::Interrupted,
+            attempts: 1,
+            result_entry_id: None,
+            source_artifact_id: Some("deadbeef".repeat(8)),
+            error: Some("app crashed".into()),
+            created_at_ms: 10,
+            updated_at_ms: 11,
+        };
+        store(&root, &record).unwrap();
+        let loaded = load(&root, &id).unwrap();
+        assert_eq!(loaded.request.seed, 712);
+        assert_eq!(loaded.request.source_gallery_entry_id.as_deref(), Some("published-parent"));
+        assert_eq!(loaded.source_artifact_id, record.source_artifact_id);
+        assert_eq!(loaded.attempts, 1);
+        assert_eq!(loaded.created_at_ms, 10);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn journal_rejects_traversal() {
         assert!(path(Path::new("/tmp"), "../secret").is_err());
         assert!(path(Path::new("/tmp"), "not-a-uuid").is_err());
