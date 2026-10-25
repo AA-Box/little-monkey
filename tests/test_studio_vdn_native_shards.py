@@ -96,11 +96,11 @@ class OriginalShardNativeTests(unittest.TestCase):
         a = torch.randn(rank, 8)
         b = torch.randn(12, rank)
         manual = model.k(F.relu(model.q(x) +
-                                   F.linear(F.linear(x, a), b) / rank))
+                                   F.linear(F.linear(x, a), b)))
         with tempfile.TemporaryDirectory() as root:
             store = make_original_shards(model, root)
             adapter = Path(root) / "adapter.safetensors"
-            save_file({"q.lora_A.weight": a, "q.lora_B.weight": b},
+            save_file({"q.lora_A.weight": a, "q.lora_B.weight": b, "q.alpha": torch.tensor(float(rank))},
                       str(adapter))
             with torch.device("meta"):
                 streamed = Projection()
