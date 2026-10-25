@@ -174,35 +174,44 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
         raise ValueError("Unsupported memory policy")
     if fp8 and capability < 9:
         raise ValueError("FP8 requires compute capability 9.0+")
-    disk_ok = disk_free >= 96 * GiB
-    cpu_ok = host_ram is None or host_ram >= 16 * GiB
+    # Official H3 BF16 weights are ~61.7 GB (denoiser) and ~62.1 GB
+    # (Qwen3-VL). An offload switch does not make those host requirements
+    # disappear. The INT8 documented recipe needs about 75 GB host memory.
+    cpu_ok = host_ram is not None and host_ram >= 136 * GiB
+    quant_cpu_ok = host_ram is not None and host_ram >= 80 * GiB
+    disk_ok = (host_ram is not None and host_ram >= 40 * GiB
+               and disk_free >= 160 * GiB)
+    resident_ok = (host_ram is not None and host_ram >= 68 * GiB
+                   and free_vram >= (48 if fp8 else 78) * GiB)
     plans = []
     def add(tier):
         if tier not in plans:
             plans.append(tier)
     if mode == "resident":
+        if not resident_ok:
+            raise ValueError("Resident H3 requires approximately 78 GiB VRAM (48 GiB FP8) and 68 GiB host RAM")
         add("resident_fp8" if fp8 else "resident")
     elif mode == "stream_cpu":
+        if not (quant_cpu_ok if fp8 else cpu_ok):
+            raise ValueError("CPU streaming needs 136 GiB available host RAM (80 GiB FP8)")
         add("fp8_cpu" if fp8 else "stream_cpu")
     elif mode == "stream_disk":
         if not disk_ok:
-            raise ValueError("Disk streaming needs at least 96 GiB of available space")
+            raise ValueError("Disk streaming needs 160 GiB free storage and 40 GiB available host RAM")
         add("fp8_disk" if fp8 else "stream_disk")
     else:
-        if not offload and free_vram >= 44 * GiB:
-            add("resident")
-        if cpu_ok:
-            add("stream_cpu")
-        if torchao_available and host_ram is not None and host_ram >= 48 * GiB:
-            add("int8_cpu")
-        if capability >= 9:
+        if not offload and resident_ok:
+            add("resident_fp8" if fp8 else "resident")
+        if fp8 and quant_cpu_ok and capability >= 9:
             add("fp8_cpu")
+        if not fp8 and cpu_ok:
+            add("stream_cpu")
+        if not fp8 and torchao_available and quant_cpu_ok:
+            add("int8_cpu")
         if disk_ok:
-            add("stream_disk")
+            add("fp8_disk" if fp8 else "stream_disk")
     if not plans:
-        raise ValueError("Insufficient host RAM/disk for selected VDN memory modes")
-    if fp8 and mode == "auto":
-        plans = ["fp8_cpu"] + [tier for tier in plans if tier != "fp8_cpu"]
+        raise ValueError("Native H3 requires substantial host RAM or disk-backed model streaming; available resources are insufficient")
     return plans
 
 
