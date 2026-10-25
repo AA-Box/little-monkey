@@ -4,6 +4,7 @@
 //! It shares the native video GPU gate and publishes into the same Gallery.
 use crate::profiles::ProfileScopedPaths;
 use serde::{Deserialize, Serialize};
+use base64::Engine as _;
 use std::{fs, path::{Path, PathBuf}, sync::{Mutex, OnceLock}, collections::HashSet};
 use tauri::AppHandle;
 
@@ -20,6 +21,8 @@ pub struct VdnJob {
     pub status: VdnJobStatus,
     pub attempts: u32,
     pub result_entry_id: Option<String>,
+    #[serde(default)]
+    pub source_artifact_id: Option<String>,
     pub error: Option<String>,
 }
 fn lock() -> &'static Mutex<()> {
@@ -87,6 +90,37 @@ fn list(app: &AppHandle) -> Result<Vec<VdnJob>, String> {
     found.sort_by(|a,b| a.id.cmp(&b.id));
     Ok(found)
 }
+async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
+    -> Result<(crate::studio_vdn::VdnRunRequest, Option<PathBuf>), String> {
+    let mut request = job.request.clone();
+    let Some(source_id) = request.source_gallery_entry_id.take() else {
+        return Ok((request, None));
+    };
+    let entry = crate::generation_commands::generation_gallery(app.clone())?
+        .into_iter().find(|entry| entry.entry_id == source_id)
+        .ok_or("VDN continuation source no longer exists in this profile")?;
+    if !matches!(entry.media_type.as_str(), "video/mp4" | "video/webm") {
+        return Err("VDN continuation requires a video gallery entry".into());
+    }
+    if job.source_artifact_id.as_deref() != Some(entry.artifact_id.as_str()) {
+        return Err("VDN continuation artifact changed since submission".into());
+    }
+    let root = app.profile_data_dir().map_err(|e| e.to_string())?;
+    let store = crate::artifact_store::ArtifactStore::with_max_blob_size(
+        root.join("content-v1"), 256 * 1024 * 1024
+    ).map_err(|e| e.to_string())?;
+    let bytes = store.read(&entry.artifact_id).map_err(|e| e.to_string())?;
+    let png_base64 = crate::studio_video_jobs::extract_final_frame(
+        app, &bytes, &entry.media_type
+    ).await?;
+    let png = base64::engine::general_purpose::STANDARD.decode(png_base64)
+        .map_err(|e| e.to_string())?;
+    let dest = directory(app)?.join(format!("{}.first.png", job.id));
+    fs::write(&dest, png).map_err(|e| e.to_string())?;
+    request.first_image_path = Some(dest.to_string_lossy().into_owned());
+    Ok((request, Some(dest)))
+}
+
 fn dispatch(app: AppHandle, id: String) {
     let already = active().lock().map(|mut running| !running.insert(id.clone())).unwrap_or(true);
     if already { return; }
@@ -98,7 +132,14 @@ fn dispatch(app: AppHandle, id: String) {
             Ok(())
         });
         if let Ok(j) = job {
-            let result = crate::studio_vdn::generation_vdn_run(app.clone(), j.request).await;
+            let result = match prepare_continuation(&app, &j).await {
+                Ok((request, scratch)) => {
+                    let result = crate::studio_vdn::generation_vdn_run(app.clone(), request).await;
+                    if let Some(path) = scratch { let _ = fs::remove_file(path); }
+                    result
+                }
+                Err(error) => Err(error),
+            };
             let _ = modify(&app, &id, |j| {
                 if matches!(j.status, VdnJobStatus::Cancelled) { return Ok(()); }
                 match &result {
@@ -127,8 +168,17 @@ pub fn generation_vdn_submit(app: AppHandle, request: crate::studio_vdn::VdnRunR
     crate::generation_commands::ensure_vdn_usage(&app)?;
     crate::studio_vdn::validate_for_durable_submit(&request)?;
     let id = request.job_id.clone();
+    let source_artifact_id = if let Some(source_id) = request.source_gallery_entry_id.as_deref() {
+        let entry = crate::generation_commands::generation_gallery(app.clone())?
+            .into_iter().find(|entry| entry.entry_id == source_id)
+            .ok_or("Video continuation source does not exist")?;
+        if !matches!(entry.media_type.as_str(), "video/mp4" | "video/webm") {
+            return Err("VDN source must be an MP4 or WebM gallery clip".into());
+        }
+        Some(entry.artifact_id)
+    } else { None };
     let job = VdnJob { id: id.clone(), request, status: VdnJobStatus::Queued,
-        attempts: 0, result_entry_id: None, error: None };
+        attempts: 0, result_entry_id: None, source_artifact_id, error: None };
     {
         let _guard = lock().lock().map_err(|e| e.to_string())?;
         let dir = directory(&app)?;
