@@ -360,6 +360,7 @@ pub fn generation_vdn_cancel_job(app: AppHandle, job_id: String) -> Result<VdnJo
         Ok(())
     })?;
     let _ = crate::studio_vdn::generation_vdn_cancel(job_id);
+    dispatch_waiting(&app);
     Ok(j)
 }
 /// Called at app startup; an interrupted CUDA sampler restarts from the
