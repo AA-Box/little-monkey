@@ -1,5 +1,9 @@
 name: Native VDN contracts
 
+# Read-only checkout and no token writes are required.
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths:
