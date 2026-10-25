@@ -243,12 +243,18 @@ export interface VdnGenerationRequest {
   firstImagePath: string | null;
   lastImagePath: string | null;
   sourceGalleryEntryId: string | null;
+  sourceVdnJobId: string | null;
+  continuationMode: "last_frame" | "video_reference";
   referenceImagePaths: string[];
   referenceVideoPath: string | null;
   loraPaths: string[];
   referenceAudioPath: string | null;
   fp8: boolean;
   offloadDit: boolean;
+  memoryMode: "auto" | "resident" | "stream_cpu" | "stream_disk";
+  nativeTwoPass: boolean;
+  refineSteps: number;
+  refineFromJobId: string | null;
   backend: VdnBackend;
   repoRoot: string | null;
   checkpointRoot: string | null;
@@ -687,7 +693,9 @@ export const studioClient = {
     serverPort: number | null,
   ) => invoke<{status?: string; phase?: string; backend: string; model: string;
     device?: string; computeCapability?: string; vramBytes?: number;
-    torch?: string; fp8Supported?: boolean; visibleGpuCount?: number; port?: number}>(
+    torch?: string; fp8Supported?: boolean; visibleGpuCount?: number; port?: number;
+    freeVramBytes?: number; hostRamAvailableBytes?: number | null; diskFreeBytes?: number;
+    nativeMemoryPlans?: string[]; resourcesReady?: boolean; resourceWarning?: string}>(
       "generation_vdn_probe",
       { pythonExecutable, backend, repoRoot, checkpointRoot, gpuClass, serverPort }
     ),

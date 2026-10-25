@@ -21,6 +21,7 @@ const MAX_VIDEO_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LOG_BYTES: u64 = 256 * 1024;
 const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
+const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -42,6 +43,16 @@ fn worker_source(backend: VdnBackend) -> &'static str {
         VdnBackend::Diffusers => WORKER,
         VdnBackend::FreeVideoAdaptive => ADAPTIVE_WORKER,
         _ => FAST_WORKER,
+    }
+}
+
+fn staged_worker_source(backend: VdnBackend) -> String {
+    if backend == VdnBackend::Diffusers {
+        // A self-contained, uniquely named worker script makes the sampler
+        // callback part of the same Python process and works after a restart.
+        format!("{SAMPLER_SOURCE}\n{WORKER}")
+    } else {
+        worker_source(backend).to_owned()
     }
 }
 
@@ -94,6 +105,10 @@ fn worker_args(
 }
 
 
+fn default_native_memory_mode() -> String { "auto".into() }
+fn default_native_refine_steps() -> u32 { 3 }
+fn default_continuation_mode() -> String { "last_frame".into() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VdnRunRequest {
@@ -108,6 +123,10 @@ pub struct VdnRunRequest {
     #[serde(default)]
     pub source_gallery_entry_id: Option<String>,
     #[serde(default)]
+    pub source_vdn_job_id: Option<String>,
+    #[serde(default = "default_continuation_mode")]
+    pub continuation_mode: String,
+    #[serde(default)]
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
     pub reference_video_path: Option<String>,
@@ -117,6 +136,14 @@ pub struct VdnRunRequest {
     pub reference_audio_path: Option<String>,
     pub fp8: bool,
     pub offload_dit: bool,
+    #[serde(default = "default_native_memory_mode")]
+    pub memory_mode: String,
+    #[serde(default)]
+    pub native_two_pass: bool,
+    #[serde(default = "default_native_refine_steps")]
+    pub refine_steps: u32,
+    #[serde(default)]
+    pub refine_from_job_id: Option<String>,
     #[serde(default)]
     pub backend: VdnBackend,
     #[serde(default)]
@@ -202,6 +229,49 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) && request.steps != 8 {
         return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
     }
+    if !matches!(request.memory_mode.as_str(), "auto" | "resident" | "stream_cpu" | "stream_disk") {
+        return Err("Invalid Little Monkey native memory policy".into());
+    }
+    if !matches!(request.continuation_mode.as_str(), "last_frame" | "video_reference") {
+        return Err("Unsupported native continuation mode".into());
+    }
+    if let Some(source_id) = &request.source_vdn_job_id {
+        uuid::Uuid::parse_str(source_id).map_err(|_| "Invalid VDN predecessor job ID")?;
+        if source_id == &request.job_id { return Err("VDN job cannot depend on itself".into()); }
+        if request.source_gallery_entry_id.is_some() {
+            return Err("Choose a Gallery source or predecessor job, not both".into());
+        }
+        if request.first_image_path.is_some() {
+            return Err("VDN predecessor supplies its own first frame".into());
+        }
+    }
+    if request.continuation_mode == "video_reference" {
+        let linked = request.source_gallery_entry_id.is_some()
+            || request.source_vdn_job_id.is_some();
+        if !linked && request.reference_video_path.is_none() {
+            return Err("Video reference continuation needs a Gallery clip, predecessor job or resolved local video".into());
+        }
+        if request.backend != VdnBackend::Diffusers {
+            return Err("Motion/audio reference continuation requires native Diffusers Ref2VA".into());
+        }
+        if (linked && request.reference_video_path.is_some())
+            || request.first_image_path.is_some() || request.last_image_path.is_some() {
+            return Err("Cannot mix pending video continuation with another video/keyframe".into());
+        }
+    }
+    if request.native_two_pass && request.backend != VdnBackend::Diffusers {
+        return Err("Little Monkey native latent refinement currently requires Diffusers".into());
+    }
+    if request.refine_from_job_id.is_some() && !request.native_two_pass {
+        return Err("Refine-from requires native two-pass".into());
+    }
+    if !(1..=12).contains(&request.refine_steps) {
+        return Err("Native refinement requires 1..12 steps".into());
+    }
+    if let Some(prior) = &request.refine_from_job_id {
+        uuid::Uuid::parse_str(prior).map_err(|_| "Invalid native preview job ID")?;
+        if prior == &request.job_id { return Err("Cannot refine from own job ID".into()); }
+    }
     if request.seed < 0 {
         return Err("VDN seed must be nonnegative".into());
     }
@@ -212,7 +282,7 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if request.lora_paths.len() > 4 { return Err("VDN supports at most four LoRAs".into()); }
     if !request.lora_paths.is_empty() &&
-        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses | VdnBackend::FreeVideoAdaptive) {
+        !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses | VdnBackend::FreeVideoAdaptive) {
         return Err("External LoRA requires native optimized OpenVDN".into());
     }
     for lora in &request.lora_paths {
@@ -224,8 +294,8 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         }
     }
     if let Some(audio) = &request.reference_audio_path {
-        if request.backend != VdnBackend::FreeVideoAdaptive {
-            return Err("Audio-conditioned references require the optional adaptive backend".into());
+        if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) {
+            return Err("Audio-conditioned references require the native Diffusers Ref2VA backend".into());
         }
         let path = Path::new(audio).canonicalize().map_err(|_| "Reference audio not found")?;
         let info = std::fs::metadata(&path).map_err(|e| e.to_string())?;
@@ -234,8 +304,8 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         }
     }
     if request.reference_video_path.is_some() &&
-        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
-        return Err("Video reference frames require optimized OpenVDN".into());
+        !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("Video references require native OpenVDN or Diffusers".into());
     }
     if let Some(path) = &request.reference_video_path {
         let video = Path::new(path).canonicalize().map_err(|_| "Reference video not found")?;
@@ -248,11 +318,26 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         return Err("VDN supports at most eight reference images".into());
     }
     if !request.reference_image_paths.is_empty() &&
-        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
-        return Err("Ref2VA is supported only by native optimized OpenVDN backends".into());
+        !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("Ref2VA requires native OpenVDN or Diffusers".into());
     }
     for reference in &request.reference_image_paths {
         validate_image(&Some(reference.clone()))?;
+    }
+    if request.backend == VdnBackend::Diffusers
+        && (request.reference_audio_path.is_some()
+            || request.reference_video_path.is_some()
+            || !request.reference_image_paths.is_empty())
+        && (request.first_image_path.is_some() || request.last_image_path.is_some()) {
+        return Err("Ref2VA reference conditioning cannot be combined with keyframes".into());
+    }
+    if request.backend == VdnBackend::Diffusers
+        && request.reference_audio_path.is_some()
+        && request.reference_video_path.is_none() && request.reference_image_paths.is_empty()
+        && !(request.continuation_mode == "video_reference"
+            && (request.source_gallery_entry_id.is_some()
+                || request.source_vdn_job_id.is_some())) {
+        return Err("Native Ref2VA audio reference requires image, video or a pinned video continuation".into());
     }
     if request.source_gallery_entry_id.is_some() && request.first_image_path.is_some() {
         return Err("Cannot combine continuation with first image".into());
@@ -270,16 +355,27 @@ fn valid_mp4(bytes: &[u8]) -> bool {
     bytes.len() >= 32 && bytes.get(4..8) == Some(b"ftyp".as_slice())
 }
 
-fn read_last_phase(log: &Path) -> Option<String> {
+fn read_last_phase(log: &Path) -> Option<(String, String)> {
     let bytes = std::fs::read(log).ok()?;
     if bytes.len() as u64 > MAX_LOG_BYTES {
         return None;
     }
     let s = String::from_utf8(bytes).ok()?;
-    s.lines().filter_map(|line| {
+    s.lines().rev().find_map(|line| {
         let row: serde_json::Value = serde_json::from_str(line).ok()?;
-        row.get("phase")?.as_str().map(str::to_owned)
-    }).last()
+        let phase = row.get("phase")?.as_str()?.to_owned();
+        let detail = match (
+            row.get("stage").and_then(|v| v.as_str()),
+            row.get("completedSteps").and_then(|v| v.as_u64()),
+            row.get("totalSteps").and_then(|v| v.as_u64()),
+        ) {
+            (Some(stage), Some(done), Some(total)) if done <= total && total <= 100 => {
+                format!("{stage}: completed {done}/{total} sampler steps")
+            }
+            _ => String::new(),
+        };
+        Some((phase, detail))
+    })
 }
 
 fn brief_error(path: &Path) -> String {
@@ -319,8 +415,9 @@ pub async fn generation_vdn_run(
     if crate::studio_vdn_jobs::is_cancelled(&app, &request.job_id)? {
         return Err("VDN job cancelled before GPU allocation".into());
     }
-    if request.source_gallery_entry_id.is_some() {
-        return Err("Use durable VDN queue for Gallery continuation".into());
+    if request.source_gallery_entry_id.is_some()
+        || request.source_vdn_job_id.is_some() {
+        return Err("Native VDN continuation requires a resolved durable job; direct rendering cannot bypass source handoff".into());
     }
     crate::generation_commands::ensure_vdn_usage(&app)?;
     let (cancel, _registration) = register(&request.job_id)?;
@@ -331,7 +428,7 @@ pub async fn generation_vdn_run(
     // errors and cross-job mutation of a script already executing.
     let source = directory.join(format!("studio-vdn-h3-worker-{}.py", request.job_id));
     let staging = directory.join(format!(".worker-{}.tmp", request.job_id));
-    std::fs::write(&staging, worker_source(request.backend))
+    std::fs::write(&staging, staged_worker_source(request.backend))
         .map_err(|error| error.to_string())?;
     #[cfg(unix)]
     {
@@ -362,6 +459,36 @@ pub async fn generation_vdn_run(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true);
+    if request.backend == VdnBackend::Diffusers {
+        process.arg("--memory-mode").arg(&request.memory_mode);
+        let checkpoint_home = directory.join("step-checkpoints");
+        std::fs::create_dir_all(&checkpoint_home).map_err(|e| e.to_string())?;
+        let root_metadata = std::fs::symlink_metadata(&checkpoint_home)
+            .map_err(|e| e.to_string())?;
+        if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+            return Err("Unsafe native sampler checkpoint root".into());
+        }
+        let job_checkpoints = checkpoint_home.join(&request.job_id);
+        std::fs::create_dir_all(&job_checkpoints).map_err(|e| e.to_string())?;
+        let job_metadata = std::fs::symlink_metadata(&job_checkpoints)
+            .map_err(|e| e.to_string())?;
+        if job_metadata.file_type().is_symlink() || !job_metadata.is_dir() {
+            return Err("Unsafe job-specific sampler checkpoint directory".into());
+        }
+        process.arg("--step-checkpoint-root").arg(job_checkpoints);
+        if request.native_two_pass {
+            let checkpoints = directory.join("latent-checkpoints");
+            std::fs::create_dir_all(&checkpoints).map_err(|e| e.to_string())?;
+            process.arg("--two-pass").arg("--refine-steps").arg(request.refine_steps.to_string());
+            process.arg("--checkpoint").arg(checkpoints.join(format!("{}.safetensors", request.job_id)));
+            if let Some(prior) = &request.refine_from_job_id {
+                if !crate::studio_vdn_jobs::completed_with_preview(&app, prior)? {
+                    return Err("Refine-from requires a completed native two-pass source job".into());
+                }
+                process.arg("--refine-from").arg(checkpoints.join(format!("{prior}.safetensors")));
+            }
+        }
+    }
     if request.backend == VdnBackend::Diffusers && request.offload_dit {
         process.arg("--offload-dit");
     }
@@ -400,9 +527,9 @@ pub async fn generation_vdn_run(
             _ = health.tick() => {
                 match crate::generation_commands::ensure_vdn_usage(&app) {
                     Ok(()) => {
-                        if let Some(phase) = read_last_phase(&stdout_path) {
+                        if let Some((phase, detail)) = read_last_phase(&stdout_path) {
                             let _ = app.emit("studio://vdn-progress", VdnProgress {
-                                job_id: &request.job_id, phase: &phase, detail: "",
+                                job_id: &request.job_id, phase: &phase, detail: &detail,
                             });
                         }
                         continue;
@@ -430,8 +557,22 @@ pub async fn generation_vdn_run(
                     Err("VDN worker output is not a valid MP4 header".into())
                 } else {
                     crate::generation_commands::publish_vdn_video(
-                        &app, &request.job_id, &request.prompt, request.steps, request.seed,
-                        request.frames, first.is_some(), &bytes
+                        &app, &request.job_id,
+                        match request.backend {
+                            VdnBackend::Diffusers
+                                if !request.reference_image_paths.is_empty()
+                                   || request.reference_video_path.is_some()
+                                   || request.reference_audio_path.is_some() =>
+                                "minimax-h3-ref2va-diffusers",
+                            VdnBackend::Diffusers => "vdn-h3-diffusers",
+                            VdnBackend::OptimizedSingle => "vdn-h3-optimized",
+                            VdnBackend::OptimizedUlysses => "vdn-h3-ulysses",
+                            VdnBackend::Sglang => "vdn-h3-sglang",
+                            VdnBackend::FreeVideoAdaptive => "vdn-h3-freevideo-adaptive",
+                        },
+                        &request.prompt, request.steps, request.seed,
+                        request.frames, first.is_some() || !request.reference_image_paths.is_empty()
+                            || request.reference_video_path.is_some(), &bytes
                     )
                 }
             }
@@ -486,7 +627,7 @@ pub async fn generation_vdn_probe(
         .join("studio-vdn-h3");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let script = dir.join(format!(".vdn-probe-{}.py", uuid::Uuid::new_v4()));
-    std::fs::write(&script, worker_source(backend)).map_err(|error| error.to_string())?;
+    std::fs::write(&script, staged_worker_source(backend)).map_err(|error| error.to_string())?;
     let outcome = async {
         let mut cmd = tokio::process::Command::new(python);
         cmd.arg("-u").arg(&script).arg("--probe").args(&extra)
@@ -558,7 +699,54 @@ mod tests {
         assert!(WORKER.contains("OpenVDN/vdn-minimax-h3"));
         assert!(WORKER.contains("num_inference_steps=args.steps + 1"));
         assert!(WORKER.contains("apply_group_offloading"));
+        assert!(SAMPLER_SOURCE.contains("native_sampler_recovery"));
+        assert!(staged_worker_source(VdnBackend::Diffusers).contains("NativeStepStore"));
         assert!(!WORKER.contains("import comfyui"));
+    }
+
+    #[test]
+    fn diffusers_native_ref2va_images_and_audio_validate_before_launch() {
+        let dir = std::env::temp_dir().join(format!("vdn-ref2va-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let image = dir.join("portrait.png");
+        let audio = dir.join("voice.wav");
+        std::fs::write(&image, [137, 80, 78, 71, 13, 10, 26, 10]).unwrap();
+        std::fs::write(&audio, vec![1u8; 64]).unwrap();
+        let python = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let request: VdnRunRequest = serde_json::from_value(serde_json::json!({
+            "jobId": uuid::Uuid::new_v4().to_string(),
+            "pythonExecutable": python, "prompt": "A subject moves gently",
+            "steps": 8, "frames": 141, "seed": 31,
+            "firstImagePath": null, "lastImagePath": null,
+            "referenceImagePaths": [image.to_string_lossy().into_owned()],
+            "referenceAudioPath": audio.to_string_lossy().into_owned(),
+            "fp8": false, "offloadDit": true, "backend": "diffusers",
+            "acknowledgeThirdPartyCode": true
+        })).unwrap();
+        assert!(validate_request(&request).is_ok(), "Native Ref2VA should reach the worker");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolved_native_motion_reference_does_not_need_gone_gallery_pointer() {
+        let dir = std::env::temp_dir().join(format!("vdn-motion-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let clip = dir.join("prior.mp4");
+        std::fs::write(&clip, vec![1u8; 128]).unwrap();
+        let mut request: VdnRunRequest = serde_json::from_value(serde_json::json!({
+            "jobId": uuid::Uuid::new_v4().to_string(),
+            "pythonExecutable": std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            "prompt": "Continue the motion", "steps": 8, "frames": 141, "seed": 31,
+            "firstImagePath": null, "lastImagePath": null,
+            "continuationMode": "video_reference",
+            "referenceVideoPath": clip.to_string_lossy().into_owned(),
+            "fp8": false, "offloadDit": true, "backend": "diffusers",
+            "acknowledgeThirdPartyCode": true
+        })).unwrap();
+        assert!(validate_request(&request).is_ok(), "Resolved artifact must reach Ref2VA worker");
+        request.reference_video_path = None;
+        assert!(validate_request(&request).is_err(), "Unresolved source must fail closed");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -573,12 +761,18 @@ mod tests {
             first_image_path: None,
             last_image_path: None,
             source_gallery_entry_id: None,
+            source_vdn_job_id: None,
+            continuation_mode: "last_frame".into(),
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],
             reference_audio_path: None,
             fp8: false,
             offload_dit: true,
+            memory_mode: "auto".into(),
+            native_two_pass: false,
+            refine_steps: 3,
+            refine_from_job_id: None,
             backend: VdnBackend::Diffusers,
             repo_root: None,
             checkpoint_root: None,

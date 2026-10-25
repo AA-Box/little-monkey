@@ -28,6 +28,8 @@ export function StudioVdnPanel({
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
   const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
+  const [sourceVdnJobId, setSourceVdnJobId] = useState<string | null>(null);
+  const [continuationMode, setContinuationMode] = useState<"last_frame" | "video_reference">("last_frame");
   const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
   const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
   const [references, setReferences] = useState<string[]>([]);
@@ -39,6 +41,8 @@ export function StudioVdnPanel({
   const [seed, setSeed] = useState("0");
   const [fp8, setFp8] = useState(false);
   const [offload, setOffload] = useState(true);
+  const [memoryMode, setMemoryMode] = useState<"auto" | "resident" | "stream_cpu" | "stream_disk">("auto");
+  const [refineSteps, setRefineSteps] = useState(3);
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [licenseReason, setLicenseReason] = useState<string | null | undefined>(undefined);
   const [region, setRegion] = useState<Region>(null);
@@ -49,7 +53,7 @@ export function StudioVdnPanel({
   const [gpuFp8, setGpuFp8] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<GenerationEntry | null>(null);
-  const [preview, setPreview] = useState<GenerationEntry | null>(null);
+
   const job = useRef<string | null>(null);
 
   const refreshLicense = useCallback(async () => {
@@ -73,7 +77,9 @@ export function StudioVdnPanel({
     let unlisten: (() => void) | undefined;
     void listen<PhaseEvent>("studio://vdn-progress", (event) => {
       if (active && job.current === event.payload.jobId) {
-        setPhase(event.payload.phase);
+        setPhase(event.payload.detail
+          ? `${event.payload.phase} · ${event.payload.detail}`
+          : event.payload.phase);
       }
     }).then((clean) => {
       if (active) unlisten = clean;
@@ -105,7 +111,12 @@ export function StudioVdnPanel({
         setGpuFp8(false);
         setFp8(false);
       } else {
-        setProbeInfo(`${report.device} · ${report.computeCapability} · ${((report.vramBytes ?? 0) / (1024 ** 3)).toFixed(1)} GiB VRAM · ${report.visibleGpuCount ?? 1} CUDA GPUs · PyTorch ${report.torch}`);
+        setProbeInfo(`${report.device} · ${report.computeCapability} · ${((report.vramBytes ?? 0) / (1024 ** 3)).toFixed(1)} GiB VRAM · ${report.visibleGpuCount ?? 1} CUDA GPUs · PyTorch ${report.torch}` +
+          (backend === "diffusers"
+            ? report.resourcesReady
+              ? ` · Native plans: ${(report.nativeMemoryPlans ?? []).join(" → ")}`
+              : ` · Insufficient resources: ${report.resourceWarning ?? "No safe tier"}`
+            : ""));
         setGpuFp8(report.fp8Supported === true);
         if (!report.fp8Supported) setFp8(false);
       }
@@ -127,6 +138,49 @@ export function StudioVdnPanel({
       await refreshLicense();
     } catch (cause) {
       setError(String(cause));
+    }
+  }
+
+  function buildRequest(jobId: string, twoPass = false): Parameters<typeof studioClient.vdnSubmit>[0] {
+    return {
+      jobId, pythonExecutable: python, prompt: prompt.trim(),
+      firstImagePath: first, lastImagePath: last,
+      sourceGalleryEntryId: sourceVdnJobId ? null : sourceGalleryId,
+      sourceVdnJobId, continuationMode,
+      referenceImagePaths: references,
+      referenceVideoPath: referenceVideo,
+      referenceAudioPath: referenceAudio,
+      loraPaths, steps, frames, seed: Number(seed) || 0,
+      fp8, offloadDit: offload, memoryMode, backend,
+      nativeTwoPass: twoPass, refineSteps, refineFromJobId: null,
+      repoRoot: repoRoot || null, checkpointRoot: checkpointRoot || null,
+      gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
+      serverPort: backend === "sglang" ? serverPort : null,
+      acknowledgeThirdPartyCode: trustRemoteCode,
+    };
+  }
+
+  async function queueAfter(parent: DurableVdnJob) {
+    if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
+        backend !== "diffusers" || !trustRemoteCode) return;
+    setError(null);
+    try {
+      const jobId = crypto.randomUUID();
+      const request = buildRequest(jobId);
+      const record = await studioClient.vdnSubmit({
+        ...request,
+        firstImagePath: null, lastImagePath: null,
+        sourceGalleryEntryId: null, sourceVdnJobId: parent.id,
+        continuationMode: "video_reference",
+        referenceVideoPath: null,
+        referenceAudioPath: null,
+        nativeTwoPass: false,
+        refineFromJobId: null,
+      });
+      setDurableJobs((items) => [...items, record]);
+      setPhase("Native motion continuation queued after " + parent.id.slice(0, 8));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
     }
   }
 
@@ -161,31 +215,8 @@ export function StudioVdnPanel({
     setPhase("queued");
     setError(null);
     setCreated(null);
-    setPreview(null);
     try {
-      const request = {
-        jobId: id, pythonExecutable: python, prompt: prompt.trim(),
-        firstImagePath: first, lastImagePath: last,
-        sourceGalleryEntryId: sourceGalleryId,
-        referenceImagePaths: references,
-        referenceVideoPath: referenceVideo,
-        referenceAudioPath: referenceAudio,
-        loraPaths, steps, frames, seed: Number(seed) || 0,
-        fp8, offloadDit: offload, backend,
-        repoRoot: repoRoot || null,
-        checkpointRoot: checkpointRoot || null,
-        gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
-        serverPort: backend === "sglang" ? serverPort : null,
-        acknowledgeThirdPartyCode: trustRemoteCode,
-      };
-      if (twoPass && frames > 124) {
-        setPhase("preview");
-        const previewEntry = await queuedRun({ ...request, frames: 124 });
-        setPreview(previewEntry);
-        await onCompleted();
-        request.jobId = crypto.randomUUID();
-        job.current = request.jobId;
-      }
+      const request = buildRequest(id, twoPass);
       const entry = await queuedRun(request);
       setCreated(entry);
       setPhase("completed");
@@ -197,6 +228,33 @@ export function StudioVdnPanel({
       setRunning(false);
       job.current = null;
       void refreshLicense();
+    }
+  }
+
+  async function refineSaved(record: DurableVdnJob) {
+    if (running || !record.request.nativeTwoPass || record.status !== "completed") return;
+    setRunning(true);
+    setError(null);
+    const jobId = crypto.randomUUID();
+    job.current = jobId;
+    try {
+      const result = await queuedRun({
+        ...record.request,
+        jobId,
+        refineFromJobId: record.id,
+        sourceVdnJobId: null,
+        nativeTwoPass: true,
+        refineSteps,
+        memoryMode,
+      });
+      setCreated(result);
+      setPhase("completed");
+      await onCompleted();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRunning(false);
+      job.current = null;
     }
   }
 
@@ -219,7 +277,7 @@ export function StudioVdnPanel({
       <div className="mt-3 grid gap-3">
         <p className="text-muted">
           Run the genuine OpenVDN Diffusers hybrid-attention pipeline with its
-          trained 8-step VDN-H3 weights, directly from Little Monkey.
+          trained VDN-H3 weights for text/keyframe runs. Reference-video/audio requests use the separately trained MiniMax H3 Ref2VA partition.
           It requires an installed compatible CUDA Python environment and
           substantial disk/RAM. No FreeVideo or ComfyUI dependency.
           On macOS, use the native Wan engine above/below instead.
@@ -251,6 +309,17 @@ export function StudioVdnPanel({
           ) : <p className="text-muted">VDN model license is eligible for the declared territory.</p>}
         </div>
 
+        <label className="grid gap-1 text-muted">
+          Native CUDA memory placement
+          <select className="rounded border border-border bg-background p-1 text-foreground"
+            value={memoryMode} disabled={running}
+            onChange={(event) => setMemoryMode(event.target.value as typeof memoryMode)}>
+            <option value="auto">Adaptive GPU / streamed CPU / quantization / disk</option>
+            <option value="resident">GPU resident only</option>
+            <option value="stream_cpu">Stream blocks from CPU (136 GiB available RAM)</option>
+            <option value="stream_disk">Disk-backed block streaming (160 GiB storage + 40 GiB RAM)</option>
+          </select>
+        </label>
         <label className="grid gap-1 text-muted">
           VDN execution backend
           <select aria-label="VDN execution backend" disabled={running}
@@ -418,9 +487,14 @@ export function StudioVdnPanel({
           </label>}
         </div>
 
-        {(backend === "optimized_single" || backend === "optimized_ulysses" || backend === "free_video_adaptive") &&
+        {(backend === "optimized_single" || backend === "optimized_ulysses" || backend === "free_video_adaptive" || backend === "diffusers") &&
           <div className="grid gap-1 text-muted">
-            <span>Reference images/video (native OpenVDN Ref2VA, visual frame conditioning)</span>
+            <span>Image, motion-video and audio references (native Diffusers Ref2VA)</span>
+            {backend === "diffusers" && <p className="text-muted">
+              This loads the original MiniMax H3 transformer_ref checkpoint,
+              not the OpenVDN hybrid transformer. Inputs remain local to the
+              selected Python runtime; model licensing still applies.
+            </p>}
             <div className="flex items-center gap-2">
               <Button size="sm" variant="secondary" disabled={running || references.length >= 8}
                 onClick={() => void open({ multiple: true, filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }] })
@@ -437,7 +511,7 @@ export function StudioVdnPanel({
                 onClick={() => void chooseFile(setReferenceVideo)}>Choose video</Button>
               {referenceVideo && <Button size="sm" variant="secondary" disabled={running}
                 onClick={() => setReferenceVideo(null)}>Remove video</Button>}
-              {backend === "free_video_adaptive" && <>
+              {(backend === "free_video_adaptive" || backend === "diffusers") && <>
                 <Button size="sm" variant="secondary" disabled={running}
                   onClick={() => void chooseFile(setReferenceAudio)}>Choose audio reference</Button>
                 {referenceAudio && <Button size="sm" variant="secondary" disabled={running}
@@ -445,7 +519,7 @@ export function StudioVdnPanel({
               </>}
             </div>
           </div>}
-        {(backend === "optimized_single" || backend === "optimized_ulysses") &&
+        {(backend === "optimized_single" || backend === "optimized_ulysses" || backend === "diffusers") &&
           <div className="grid gap-1 text-muted">
             <span>External LoRA adapters (up to 4 safetensors)</span>
             <div className="flex items-center gap-2">
@@ -461,10 +535,10 @@ export function StudioVdnPanel({
             </div>
           </div>}
         <label className="grid gap-1 text-muted">
-          Continue from a previous Gallery clip (true final frame)
+          Continue from a previous Gallery clip
           <select className="rounded border border-border bg-background p-1 text-foreground"
             value={sourceGalleryId ?? ""} disabled={running || Boolean(first)}
-            onChange={(event) => setSourceGalleryId(event.target.value || null)}>
+            onChange={(event) => { setSourceGalleryId(event.target.value || null); if (event.target.value) setSourceVdnJobId(null); }}>
             <option value="">No previous clip</option>
             {availableClips.map((entry) =>
               <option key={entry.entryId} value={entry.entryId}>
@@ -473,6 +547,31 @@ export function StudioVdnPanel({
             )}
           </select>
         </label>
+        <label className="grid gap-1 text-muted">
+          Queue after an existing VDN job (durable automatic continuation)
+          <select value={sourceVdnJobId ?? ""} disabled={running || Boolean(first)}
+            className="rounded border border-border bg-background p-1 text-foreground"
+            onChange={(event) => {
+              const id = event.target.value || null;
+              setSourceVdnJobId(id);
+              if (id) setSourceGalleryId(null);
+            }}>
+            <option value="">No prerequisite VDN job</option>
+            {durableJobs.filter((entry) => entry.status !== "failed" && entry.status !== "cancelled")
+              .map((entry) => <option key={entry.id} value={entry.id}>
+                {entry.id.slice(0, 8)} · {entry.status} · {entry.request.prompt.slice(0, 30)}
+              </option>)}
+          </select>
+        </label>
+        {(sourceGalleryId || sourceVdnJobId) && backend === "diffusers" && <label className="grid gap-1 text-muted">
+          Native continuation strategy
+          <select value={continuationMode} disabled={running}
+            className="rounded border border-border bg-background p-1 text-foreground"
+            onChange={(event) => setContinuationMode(event.target.value as typeof continuationMode)}>
+            <option value="last_frame">Last video frame (FL2VA)</option>
+            <option value="video_reference">Reference original video motion and audio (Ref2VA)</option>
+          </select>
+        </label>}
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />
@@ -488,21 +587,39 @@ export function StudioVdnPanel({
             <Play size={13} /> Generate with VDN-H3
           </Button>
           <Button size="sm" variant="secondary"
-            disabled={running || frames <= 124 || !python || !probeInfo || !prompt.trim() ||
+            disabled={running || backend !== "diffusers" || !python || !probeInfo || !prompt.trim() ||
               licenseReason !== null || !trustRemoteCode}
             onClick={() => void run(true)}>
-            <Play size={13} /> Preview then render (two passes)
+            <Play size={13} /> Native latent two-pass (reuses pass one)
           </Button>
           {running && <Button size="sm" variant="secondary" onClick={() => void cancel()}>
             <Square size={13} /> Cancel VDN job
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
+        {backend === "diffusers" && <label className="grid gap-1 text-muted">
+          Native latent refinement evaluations
+          <input type="number" min={1} max={12} disabled={running} value={refineSteps}
+            className="rounded border border-border bg-background p-1 text-foreground"
+            onChange={(event) => setRefineSteps(Math.max(1, Math.min(12, Number(event.target.value) || 3)))} />
+        </label>}
         {durableJobs.length > 0 && <div className="grid gap-1">
           <strong>Persisted VDN jobs</strong>
           {durableJobs.slice(-8).map((item) =>
             <div key={item.id} className="flex items-center gap-2">
               <span>{item.id.slice(0, 8)} · {item.status}</span>
+              {(item.status === "queued" || item.status === "running" || item.status === "completed") &&
+                <Button size="sm" variant="secondary"
+                  disabled={backend !== "diffusers" || !python || !probeInfo || !prompt.trim() ||
+                    licenseReason !== null || !trustRemoteCode}
+                  onClick={() => void queueAfter(item)}>
+                  Queue next (native motion)
+                </Button>}
+              {item.status === "completed" && item.request.nativeTwoPass &&
+                <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => void refineSaved(item)}>
+                  Refine saved native latents
+                </Button>}
               {(item.status === "failed" || item.status === "interrupted") &&
                 <Button size="sm" variant="secondary"
                   onClick={() => void studioClient.vdnResume(item.id)
@@ -519,9 +636,6 @@ export function StudioVdnPanel({
           )}
         </div>}
         {error && <p role="alert" className="text-danger">{error}</p>}
-        {preview && <p className="text-foreground">
-          Preview saved to Gallery: {preview.frameCount} frames. This uses a separate real inference pass, not reused motion latents.
-        </p>}
         {created && <p className="text-foreground">
           Video saved to Studio Gallery: {created.frameCount} frames,
           {(created.durationMs / 1000).toFixed(1)} seconds, audio/video MP4.

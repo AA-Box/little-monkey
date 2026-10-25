@@ -64,6 +64,9 @@ jobs:
       - name: VDN adaptive memory policy tests
         run: python3 -m unittest discover -s tests -p test_studio_vdn_memory.py
 
+      - name: Native VDN memory, reference and latent-checkpoint contracts
+        run: python3 -m unittest discover -s tests -p "test_studio_vdn_native_contract.py"
+
       - name: Syntax-check live real-model benchmark harness (no model mocks)
         run: pnpm test:swarm-models:syntax
 
@@ -412,7 +415,12 @@ jobs:
               busctl --user --no-pager list --acquired || true
               exit 1
             fi
-            pnpm test:rust
+            # The hosted OAuth keyring integration tests in mcp_http access
+            # libsecret. gnome-keyring-daemon can crash if independent Rust
+            # test threads negotiate Secret Service sessions concurrently,
+            # invalidating the session DBus connection for both tests.
+            # Run every test (not a skip) serially against this real daemon.
+            RUST_TEST_THREADS=1 pnpm test:rust
             # Three ACTUAL independently running daemon installations over
             # signed/pinned TLS on loopback, private SQLite and OS keychain.
             # This test owns only disposable GitHub-hosted runner state.

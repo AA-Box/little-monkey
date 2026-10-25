@@ -1,45 +1,62 @@
-"""CPU-only policy regression tests for the standalone VDN worker."""
+"""Native Little Monkey VDN placement tests (no GPU or model downloads)."""
 import importlib.util
 from pathlib import Path
 import unittest
 
 WORKER = Path(__file__).resolve().parents[1] / "scripts" / "studio-vdn-h3-worker.py"
-spec = importlib.util.spec_from_file_location("studio_vdn_h3_worker", WORKER)
+spec = importlib.util.spec_from_file_location("little_monkey_vdn_memory", WORKER)
 worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
+G = 1024 ** 3
 
 
-class MemoryPolicyTests(unittest.TestCase):
-    def test_low_vram_chooses_offload(self):
-        self.assertTrue(worker.choose_memory_policy(20 * 1024 ** 3,
-            fp8=False, offload=False, fp8_supported=False)["offload"])
+class NativePlacementTests(unittest.TestCase):
+    def choose(self, vram=20, ram=160, disk=240, **kwargs):
+        return worker.choose_memory_plans(vram * G, ram * G, disk * G,
+                                          capability=8, **kwargs)
 
-    def test_high_vram_resident_and_explicit_offload(self):
-        self.assertFalse(worker.choose_memory_policy(80 * 1024 ** 3,
-            fp8=False, offload=False, fp8_supported=True)["offload"])
-        self.assertTrue(worker.choose_memory_policy(80 * 1024 ** 3,
-            fp8=False, offload=True, fp8_supported=True)["offload"])
+    def test_low_vram_starts_cpu_stream_and_allows_disk_fallback(self):
+        tiers = self.choose()
+        self.assertEqual(tiers[0], "stream_cpu")
+        self.assertIn("stream_disk", tiers)
 
-    def test_fp8_never_auto_selected_unsupported(self):
-        self.assertFalse(worker.choose_memory_policy(80 * 1024 ** 3,
-            fp8=True, offload=False, fp8_supported=False)["fp8"])
+    def test_abundant_vram_starts_resident_and_can_recover(self):
+        self.assertEqual(self.choose(vram=80)[0], "resident")
 
-    def test_retries_only_cuda_oom(self):
+    def test_forced_cpu_stream_does_not_accidentally_load_gpu_resident(self):
+        self.assertEqual(self.choose(mode="stream_cpu"), ["stream_cpu"])
+
+    def test_forced_disk_without_capacity_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "160 GiB"):
+            self.choose(disk=10, mode="stream_disk")
+
+    def test_no_auto_int8_without_torchao_or_adequate_host_memory(self):
+        self.assertNotIn("int8_cpu", self.choose(torchao_available=False))
+        self.assertNotIn("int8_cpu", self.choose(ram=64, disk=240, mode="auto"))
+
+    def test_fp8_is_rejected_on_non_hopper(self):
+        with self.assertRaisesRegex(ValueError, "9.0"):
+            self.choose(fp8=True)
+
+    def test_new_process_oom_classifier_does_not_hide_other_failures(self):
         self.assertTrue(worker.is_cuda_oom(RuntimeError("CUDA out of memory")))
+        self.assertTrue(worker.is_cuda_oom("torch.OutOfMemoryError: CUDA out of memory"))
         self.assertFalse(worker.is_cuda_oom(RuntimeError("file out of memory")))
-        self.assertFalse(worker.is_cuda_oom(RuntimeError("CUDA illegal access")))
+        self.assertFalse(worker.is_cuda_oom(RuntimeError("CUDA illegal memory access")))
 
-    def test_disk_spill_requires_low_ram_and_sufficient_disk(self):
-        gib = 1024 ** 3
-        self.assertTrue(worker.should_disk_offload(32 * gib, 140 * gib))
-        self.assertFalse(worker.should_disk_offload(32 * gib, 80 * gib))
-        self.assertFalse(worker.should_disk_offload(128 * gib, 140 * gib))
-        self.assertFalse(worker.should_disk_offload(None, 140 * gib))
+    def test_small_host_memory_never_claims_75gb_weights_fit(self):
+        with self.assertRaisesRegex(ValueError, "insufficient"):
+            self.choose(vram=16, ram=16, disk=1000)
+        with self.assertRaisesRegex(ValueError, "136 GiB"):
+            self.choose(vram=24, ram=64, mode="stream_cpu")
 
-    def test_rejects_negative_memory(self):
+    def test_h3_int8_requires_substantial_host_ram(self):
+        self.assertIn("int8_cpu", self.choose(ram=112, disk=240))
+        self.assertNotIn("stream_cpu", self.choose(ram=112, disk=240))
+
+    def test_negative_memory_rejected(self):
         with self.assertRaises(ValueError):
-            worker.choose_memory_policy(-1, fp8=False, offload=False,
-                                        fp8_supported=False)
+            worker.choose_memory_plans(-1, 90 * G, 90 * G, capability=9)
 
 
 if __name__ == "__main__":
