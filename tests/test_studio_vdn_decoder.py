@@ -27,6 +27,11 @@ class AudioVAE(nn.Module):
     def __init__(self):
         super().__init__()
         self.decoder = nn.Conv1d(4, 2, kernel_size=5, padding=2).eval()
+    def encode(self, samples, return_dict=True):
+        mean = samples.mean(dim=-1, keepdim=True).repeat(1, 4, 1)
+        logs = torch.zeros_like(mean)
+        posterior = types.SimpleNamespace(mean=mean, logs=logs, mode=lambda: mean)
+        return types.SimpleNamespace(latent_dist=posterior) if return_dict else (posterior,)
     def decode(self, latents, return_dict=True):
         signal = self.decoder(latents)
         return types.SimpleNamespace(sample=signal) if return_dict else (signal,)
@@ -34,6 +39,13 @@ class AudioVAE(nn.Module):
 
 sys.modules[packages[3]].AutoencoderKLMiniMaxH3 = VideoVAE
 sys.modules[packages[4]].AutoencoderKLMiniMaxH3Audio = AudioVAE
+class AudioPosterior:
+    def __init__(self, mean, logs):
+        self.mean, self.logs = mean, logs
+    def mode(self):
+        return self.mean
+sys.modules[packages[4]].MiniMaxH3AudioDiagonalGaussianDistribution = AudioPosterior
+sys.modules[packages[4]].MiniMaxH3AudioEncoderOutput = lambda latent_dist: types.SimpleNamespace(latent_dist=latent_dist)
 sys.modules[packages[5]].DecoderOutput = lambda sample: types.SimpleNamespace(sample=sample)
 spec = importlib.util.spec_from_file_location(
     "native_video_audio_decoder",
@@ -61,6 +73,16 @@ class NativeDecoderTests(unittest.TestCase):
         self.assertEqual(video.tiling["tile_sample_min_height"], 128)
         self.assertEqual(video.tiling["tile_sample_min_overlap_width"], 64)
         self.assertTrue(video.slicing)
+
+    def test_real_stereo_reference_audio_encoding_preserves_order(self):
+        video, audio = VideoVAE(), AudioVAE()
+        samples = torch.randn(2, 1, 83)
+        original = audio.encode(samples, return_dict=False)[0].mean
+        native.install_lowmem_decoders(video, audio,
+                                       free_vram=10 * 1024**3, verbose=False)
+        streamed = audio.encode(samples, return_dict=False)[0]
+        torch.testing.assert_close(streamed.mean, original)
+        self.assertEqual(streamed.mean.shape[0], 2)
 
     def test_decoder_memory_tiers_and_idempotent_hook(self):
         g = 1024**3
