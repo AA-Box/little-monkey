@@ -84,8 +84,8 @@ fn verify_local_inputs(job: &VdnJob) -> Result<(), String> {
         return Err("Native VDN local input set changed after submission".into());
     }
     for (label, path) in inputs {
-        if job.input_hashes.get(&label).map(String::as_str)
-            != Some(hash_local_file(&path)?.as_str()) {
+        let current_hash = hash_local_file(&path)?;
+        if job.input_hashes.get(&label).map(String::as_str) != Some(current_hash.as_str()) {
             return Err(format!("Native VDN {label} changed after job submission"));
         }
     }
@@ -504,6 +504,19 @@ mod tests {
         assert_eq!(loaded.source_artifact_id, record.source_artifact_id);
         assert_eq!(loaded.attempts, 1);
         assert_eq!(loaded.created_at_ms, 10);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sha256_source_pin_detects_changed_bytes() {
+        let root = std::env::temp_dir().join(format!("vdn-hash-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let asset = root.join("original.png");
+        fs::write(&asset, b"first version").unwrap();
+        let first = hash_local_file(asset.to_str().unwrap()).unwrap();
+        fs::write(&asset, b"second version").unwrap();
+        let second = hash_local_file(asset.to_str().unwrap()).unwrap();
+        assert_ne!(first, second);
         fs::remove_dir_all(root).unwrap();
     }
 
