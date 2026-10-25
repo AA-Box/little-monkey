@@ -35,6 +35,8 @@ if "native_sampler_recovery" not in globals():
     from studio_vdn_sampler import (
         native_sampler_recovery, clear_native_sampler_stage,
     )
+if "render_temporal_video" not in globals():
+    from studio_vdn_temporal import render_temporal_video, temporal_frame_plan
 
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
@@ -56,6 +58,7 @@ def parse_args(argv=None):
     parser.add_argument("--lora", action="append", default=[])
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--frames", type=int, default=141)
+    parser.add_argument("--segments", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--offload-dit", action="store_true")
@@ -126,6 +129,12 @@ def parse_args(argv=None):
         parser.error("Step count must be from 1 to 50")
     if not 120 <= args.frames <= 360 or (args.frames - 5) % 17:
         parser.error("Frame count must be a supported 17n+5 value (120..360)")
+    try:
+        temporal_frame_plan(args.frames, args.segments)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.segments > 1 and args.two_pass:
+        parser.error("Native multi-segment continuity cannot share one two-pass checkpoint")
     if args.step_checkpoint_root and not Path(args.step_checkpoint_root).is_absolute():
         parser.error("Native step checkpoint location must be absolute and app-owned")
     if args.refine_from and not args.two_pass:
@@ -287,6 +296,7 @@ def run(args):
           flush=True)
     original = [str(Path(__file__).resolve()), "--prompt", args.prompt,
                 "--output", args.output, "--frames", str(args.frames),
+                "--segments", str(args.segments),
                 "--steps", str(args.steps), "--seed", str(args.seed),
                 "--device", args.device]
     for flag, value in (("--first", args.first), ("--last", args.last),
@@ -340,7 +350,7 @@ for _sig in (signal.SIGTERM, signal.SIGINT):
 def checkpoint_identity(args):
     """Content-address the original request, never scratch-file job paths."""
     digest = hashlib.sha256()
-    for value in (args.prompt, args.frames, args.seed, args.steps):
+    for value in (args.prompt, args.frames, args.segments, args.seed, args.steps):
         digest.update(str(value).encode("utf-8"))
         digest.update(b"\\0")
     media = [
@@ -630,6 +640,15 @@ def _run_once(args):
 
     print(json.dumps({"phase": "sampling", "steps": args.steps,
                       "frames": args.frames}), flush=True)
+    if args.segments > 1:
+        report = render_temporal_video(
+            pipe, args, torch, device, keyframes, references, checkpoint,
+            encode_video, native_sampler_recovery, clear_native_sampler_stage)
+        print(json.dumps({"phase": "completed", "path": args.output,
+                          "frames": report["videos"], "fps": FPS,
+                          "audioSamples": report["audioSamples"],
+                          "nativeTemporal": True}), flush=True)
+        return
     if args.two_pass:
         sample = native_two_pass(pipe, args, torch, device, keyframes, references)
     else:
