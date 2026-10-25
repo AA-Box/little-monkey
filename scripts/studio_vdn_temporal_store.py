@@ -38,7 +38,10 @@ def _save(path, tensors, metadata):
     p.parent.mkdir(parents=True, exist_ok=True)
     if p.parent.is_symlink():
         raise ValueError("Unsafe native H3 checkpoint directory")
-    safe = {k: v.detach().float().cpu().contiguous() for k, v in tensors.items()}
+    # Safetensors rejects distinct keys that share storage (single-pass low/high
+    # audio tails may intentionally be the same tensor). Give each key its own
+    # immutable, contiguous allocation before the atomic write.
+    safe = {k: v.detach().float().cpu().contiguous().clone() for k, v in tensors.items()}
     if any(not torch.isfinite(v).all() for v in safe.values()):
         raise ValueError("Nonfinite AV latent checkpoint")
     temp = p.parent / ("." + p.name + "." + uuid.uuid4().hex + ".tmp")
