@@ -130,34 +130,48 @@ export function StudioVdnPanel({
     }
   }
 
+  async function queuedRun(request: Parameters<typeof studioClient.vdnSubmit>[0]): Promise<GenerationEntry> {
+    const record = await studioClient.vdnSubmit(request);
+    setDurableJobs((records) => [...records, record]);
+    for (;;) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1000));
+      const records = await studioClient.vdnJobs();
+      setDurableJobs(records);
+      const current = records.find((item) => item.id === request.jobId);
+      if (!current) throw new Error("Persisted VDN job disappeared");
+      setPhase(current.status);
+      if (current.status === "completed") {
+        const gallery = await studioClient.gallery();
+        const result = gallery.find((entry) => entry.entryId === current.resultEntryId);
+        if (!result) throw new Error("VDN completed without a Gallery artifact");
+        return result;
+      }
+      if (["cancelled", "failed", "interrupted"].includes(current.status)) {
+        throw new Error(current.error || `VDN job ${current.status}`);
+      }
+    }
+  }
+
   async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
         !trustRemoteCode || running) return;
     const id = crypto.randomUUID();
     job.current = id;
     setRunning(true);
-    setPhase("starting");
+    setPhase("queued");
     setError(null);
     setCreated(null);
     setPreview(null);
     try {
       const request = {
-        jobId: id,
-        pythonExecutable: python,
-        prompt: prompt.trim(),
-        firstImagePath: first,
-        lastImagePath: last,
+        jobId: id, pythonExecutable: python, prompt: prompt.trim(),
+        firstImagePath: first, lastImagePath: last,
         sourceGalleryEntryId: sourceGalleryId,
         referenceImagePaths: references,
         referenceVideoPath: referenceVideo,
         referenceAudioPath: referenceAudio,
-        loraPaths,
-        steps,
-        frames,
-        seed: Number(seed) || 0,
-        fp8,
-        offloadDit: offload,
-        backend,
+        loraPaths, steps, frames, seed: Number(seed) || 0,
+        fp8, offloadDit: offload, backend,
         repoRoot: repoRoot || null,
         checkpointRoot: checkpointRoot || null,
         gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
@@ -166,16 +180,13 @@ export function StudioVdnPanel({
       };
       if (twoPass && frames > 124) {
         setPhase("preview");
-        const previewEntry = await studioClient.vdnRun({ ...request, frames: 124 });
+        const previewEntry = await queuedRun({ ...request, frames: 124 });
         setPreview(previewEntry);
         await onCompleted();
-        // A preview is a genuine shorter inference, not a cached latent. A
-        // fresh job ID keeps cancellation targeted to the full pass.
         request.jobId = crypto.randomUUID();
         job.current = request.jobId;
       }
-      setPhase("final render");
-      const entry = await studioClient.vdnRun(request);
+      const entry = await queuedRun(request);
       setCreated(entry);
       setPhase("completed");
       await onCompleted();
@@ -193,8 +204,8 @@ export function StudioVdnPanel({
     const id = job.current;
     if (!id) return;
     try {
-      const cancelled = await studioClient.vdnCancel(id);
-      setPhase(cancelled ? "cancelling" : "already finished");
+      await studioClient.vdnCancelJob(id);
+      setPhase("cancelling");
     } catch (cause) {
       setError(String(cause));
     }
