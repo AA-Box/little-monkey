@@ -390,8 +390,9 @@ pub async fn generation_vdn_run(
     if crate::studio_vdn_jobs::is_cancelled(&app, &request.job_id)? {
         return Err("VDN job cancelled before GPU allocation".into());
     }
-    if request.source_gallery_entry_id.is_some() {
-        return Err("Use durable VDN queue for Gallery continuation".into());
+    if request.source_gallery_entry_id.is_some()
+        || request.source_vdn_job_id.is_some() {
+        return Err("Native VDN continuation requires a resolved durable job; direct rendering cannot bypass source handoff".into());
     }
     crate::generation_commands::ensure_vdn_usage(&app)?;
     let (cancel, _registration) = register(&request.job_id)?;
