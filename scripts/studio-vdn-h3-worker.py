@@ -48,11 +48,10 @@ def parse_args(argv=None):
     parser.add_argument("--offload-dit", action="store_true")
     parser.add_argument("--memory-mode", choices=("auto", "resident", "stream_cpu", "stream_disk"), default="auto")
     parser.add_argument("--two-pass", action="store_true")
-    parser.add_argument("--preview-only", action="store_true")
     parser.add_argument("--refine-from", default="")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--refine-steps", type=int, default=3)
-    parser.add_argument("--internal-attempt", choices=("resident", "stream_cpu", "stream_disk", "int8_cpu", "fp8_cpu"), default="")
+    parser.add_argument("--internal-attempt", choices=("resident", "resident_fp8", "stream_cpu", "stream_disk", "fp8_disk", "int8_cpu", "fp8_cpu"), default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
     if args.self_test:
@@ -97,8 +96,6 @@ def parse_args(argv=None):
         parser.error("Step count must be from 1 to 50")
     if not 120 <= args.frames <= 360 or (args.frames - 5) % 17:
         parser.error("Frame count must be a supported 17n+5 value (120..360)")
-    if args.preview_only and not args.two_pass:
-        parser.error("Preview-only needs native two-pass mode")
     if args.refine_from and not args.two_pass:
         parser.error("Refine-from needs native two-pass mode")
     if args.two_pass and (not args.checkpoint or not Path(args.checkpoint).is_absolute()):
@@ -169,13 +166,13 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
         if tier not in plans:
             plans.append(tier)
     if mode == "resident":
-        add("resident")
+        add("resident_fp8" if fp8 else "resident")
     elif mode == "stream_cpu":
-        add("stream_cpu")
+        add("fp8_cpu" if fp8 else "stream_cpu")
     elif mode == "stream_disk":
         if not disk_ok:
             raise ValueError("Disk streaming needs at least 96 GiB of available space")
-        add("stream_disk")
+        add("fp8_disk" if fp8 else "stream_disk")
     else:
         if not offload and free_vram >= 44 * GiB:
             add("resident")
@@ -213,10 +210,10 @@ def run(args):
         raise RuntimeError("VDN-H3 requires CUDA; no CPU-only inference claim")
     major, _ = torch.cuda.get_device_capability()
     if args.internal_attempt:
-        args.offload_dit = args.internal_attempt != "resident"
-        args.disk_offload = args.internal_attempt == "stream_disk"
+        args.offload_dit = not args.internal_attempt.startswith("resident")
+        args.disk_offload = args.internal_attempt.endswith("_disk") or args.internal_attempt == "stream_disk"
         args.int8 = args.internal_attempt == "int8_cpu"
-        args.fp8 = args.internal_attempt == "fp8_cpu"
+        args.fp8 = args.internal_attempt.startswith("fp8") or args.internal_attempt == "resident_fp8"
         with tempfile.TemporaryDirectory(prefix="vdn-spill-", dir=Path(args.output).parent) as cache:
             args.disk_offload_path = cache if args.disk_offload else None
             return _run_once(args)
@@ -251,11 +248,9 @@ def run(args):
         original.extend(["--lora", lora])
     if args.two_pass:
         original.extend(["--two-pass", "--refine-steps", str(args.refine_steps)])
-    if args.preview_only:
-        original.append("--preview-only")
     for tier in plans:
         argv = [sys.executable, "-u", *original, "--internal-attempt", tier]
-        if tier == "fp8_cpu":
+        if tier.startswith("fp8") or tier == "resident_fp8":
             argv.append("--fp8")
         print(json.dumps({"phase": "attempt", "tier": tier}), flush=True)
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
@@ -370,11 +365,6 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
 
     latents = latents.to(device=device, dtype=torch.float32)
     audio_latents = audio_latents.to(device=device, dtype=torch.float32)
-    if args.preview_only:
-        # Decode at the first-pass canvas without a fresh sampling pass.
-        from diffusers.utils.export_utils import encode_video
-        raise RuntimeError("Native preview-only needs a pipeline decoder; use two-pass render")
-
     target_frames = latents.shape[2]
     upscaled = functional.interpolate(
         latents, size=(target_frames, 48, 84), mode="trilinear", align_corners=False)
