@@ -49,10 +49,10 @@ test("stable-diffusion runtime covers every desktop release target", () => {
 });
 
 test("stable-diffusion runtime is pinned to the latest qualified Qwen Image 2.1 release", () => {
-  assert.equal(MANAGED_SD_VERSION, "master-987-a77d362");
+  assert.equal(MANAGED_SD_VERSION, "master-1006-0886f11");
   assert.equal(
     MANAGED_SD_SOURCE_COMMIT,
-    "a77d3623180b2bc1886f3dd04c0aa04156a987ef",
+    "0886f11b6b8b4d1f6259e0f1337cae554284c37a",
   );
 
   for (const target of RELEASE_TARGETS) {
@@ -66,7 +66,7 @@ test("compatible published targets use verified upstream accelerated archives", 
     assert.equal(typeof asset.archive, "string", target);
     assert.match(asset.sha256, /^[0-9a-f]{64}$/, target);
     assert.equal(asset.sourceCommit, undefined, target);
-    assert.match(asset.url, /releases\/download\/master-987-a77d362\//, target);
+    assert.match(asset.url, /releases\/download\/master-1006-0886f11\//, target);
   }
 });
 
@@ -75,7 +75,7 @@ test("source-built targets are tied to the exact upstream release commit", () =>
     const asset = MANAGED_SD_ASSETS[target];
     assert.equal(asset.archive, undefined, target);
     assert.equal(asset.sourceCommit, MANAGED_SD_SOURCE_COMMIT, target);
-    assert.match(asset.url, /releases\/tag\/master-987-a77d362$/, target);
+    assert.match(asset.url, /releases\/tag\/master-1006-0886f11$/, target);
 
     const args = managedRuntimeSourceCmakeArgs(asset);
     assert.ok(args.includes("-DSD_BUILD_SHARED_LIBS=OFF"), target);
