@@ -24,12 +24,19 @@ class NativeVdnTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             out = Path(folder) / "out.mp4"
             args = worker.parse_args(self.basic(out, "--two-pass", "--checkpoint",
-                                                str(Path(folder) / "saved.safetensors")))
+                                                str(Path(folder) / "saved.safetensors"),
+                                                "--upscaler-cache-dir", folder))
             self.assertTrue(args.two_pass)
             self.assertEqual(args.refine_steps, 3)
+            self.assertEqual(args.upscaler_cache_dir, folder)
+            with self.assertRaises(SystemExit):
+                worker.parse_args(self.basic(out, "--two-pass", "--steps", "9",
+                    "--checkpoint", str(out) + ".safetensors",
+                    "--upscaler-cache-dir", folder))
             with self.assertRaises(SystemExit):
                 worker.parse_args(self.basic(out, "--two-pass", "--checkpoint",
                                                    str(out) + ".safetensors",
+                                                   "--upscaler-cache-dir", folder,
                                                    "--refine-steps", "0"))
 
     def test_audio_requires_visual_reference(self):
@@ -48,6 +55,7 @@ class NativeVdnTests(unittest.TestCase):
 
     def test_native_preview_layout_is_bounded_before_gpu_allocation(self):
         worker.validate_preview_layout((1, 24, 9, 24, 42), (2, 32, 40))
+        worker.validate_preview_layout((1, 24, 42, 24, 42), (2, 32, 235))
         for video, audio in (
             ((2, 24, 9, 24, 42), (2, 32, 40)),
             ((1, 24, 9, 48, 84), (2, 32, 40)),
