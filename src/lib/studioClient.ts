@@ -250,6 +250,9 @@ export interface VdnGenerationRequest {
   fp8: boolean;
   offloadDit: boolean;
   memoryMode: "auto" | "resident" | "stream_cpu" | "stream_disk";
+  nativeTwoPass: boolean;
+  refineSteps: number;
+  refineFromJobId: string | null;
   backend: VdnBackend;
   repoRoot: string | null;
   checkpointRoot: string | null;
