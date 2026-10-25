@@ -24,6 +24,15 @@ pub struct VdnJob {
     #[serde(default)]
     pub source_artifact_id: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub created_at_ms: u64,
+    #[serde(default)]
+    pub updated_at_ms: u64,
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64).unwrap_or(0)
 }
 fn lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -74,6 +83,7 @@ fn modify(app: &AppHandle, id: &str, f: impl FnOnce(&mut VdnJob) -> Result<(), S
     let dir = directory(app)?;
     let mut j = load(&dir, id)?;
     f(&mut j)?;
+    j.updated_at_ms = now_ms();
     store(&dir, &j)?;
     Ok(j)
 }
@@ -207,8 +217,10 @@ pub fn generation_vdn_submit(app: AppHandle, request: crate::studio_vdn::VdnRunR
         }
         Some(entry.artifact_id)
     } else { None };
+    let timestamp = now_ms();
     let job = VdnJob { id: id.clone(), request, status: VdnJobStatus::Queued,
-        attempts: 0, result_entry_id: None, source_artifact_id, error: None };
+        attempts: 0, result_entry_id: None, source_artifact_id, error: None,
+        created_at_ms: timestamp, updated_at_ms: timestamp };
     {
         let _guard = lock().lock().map_err(|e| e.to_string())?;
         let dir = directory(&app)?;
