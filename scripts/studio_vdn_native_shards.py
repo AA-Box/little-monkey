@@ -152,7 +152,18 @@ class NativeOriginalShardHooks:
             self.fp8_config = Float8WeightOnlyConfig
             self.fp8_quantize = quantize_
         registered = []
+        fp32_protected = tuple(getattr(model, "_keep_in_fp32_modules", ()) or ())
         for prefix, module in model.named_modules():
+            # Restrict FP8 to the same safe modules selected by the
+            # published H3/Qwen quantization recipe. The FP32 time/patch/
+            # output paths and Qwen's visual tower must remain untouched.
+            protected = (any(name in prefix for name in fp32_protected)
+                         or (component == "text_encoder" and (
+                             prefix.startswith("model.visual")
+                             or prefix.startswith("model.language_model.embed_tokens")
+                             or prefix.startswith("model.language_model.norm")
+                             or prefix.startswith("lm_head"))))
+            module._little_monkey_fp8_allowed = not protected
             # Non-persistent RoPE/sinusoidal buffers come from constructor,
             # not the weight map. Keep their tiny deterministic values on the
             # execution device so they can multiply CUDA position tensors.
@@ -217,7 +228,7 @@ class NativeOriginalShardHooks:
                             else:
                                 module._buffers[name] = materialized
                         hydrated.append((name, parameter, shape, dtype))
-                    if self.fp8 and isinstance(module, torch.nn.Linear):
+                    if self.fp8 and isinstance(module, torch.nn.Linear) and module._little_monkey_fp8_allowed:
                         # An explicitly installed TorchAO FP8 weight-only
                         # operator; no unsafe BF16 fallback when FP8 requested.
                         self.fp8_quantize(module, self.fp8_config())
