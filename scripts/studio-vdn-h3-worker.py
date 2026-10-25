@@ -645,7 +645,7 @@ def _run_once(args):
     if args.segments > 1:
         report = render_temporal_video(
             pipe, args, torch, device, keyframes, references, checkpoint,
-            encode_video, native_sampler_recovery, clear_native_sampler_stage)
+            denoiser, encode_video, native_sampler_recovery, clear_native_sampler_stage)
         print(json.dumps({"phase": "completed", "path": args.output,
                           "frames": report["videos"], "fps": FPS,
                           "audioSamples": report["audioSamples"],
