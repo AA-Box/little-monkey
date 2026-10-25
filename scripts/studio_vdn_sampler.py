@@ -64,13 +64,16 @@ class NativeStepStore:
             raise ValueError("Invalid step checkpoint slot")
         return self.root / ("%s.%s.safetensors" % (self.stage, slot))
 
-    def metadata(self, completed):
-        return {"schema": CHECKPOINT_SCHEMA, "identity": self.identity,
+    def metadata(self, completed, payload_digest=None):
+        meta = {"schema": CHECKPOINT_SCHEMA, "identity": self.identity,
                 "stage": self.stage, "total": str(self.total),
                 "schedule": self.schedule_digest,
                 "completed": str(completed),
                 "video_shape": ",".join(map(str, self.video_shape)),
                 "audio_shape": ",".join(map(str, self.audio_shape))}
+        if payload_digest:
+            meta["payload_sha256"] = payload_digest
+        return meta
 
     def latest(self):
         """Pick highest fully committed slot, rejecting mismatches and corruption."""
@@ -95,14 +98,24 @@ class NativeStepStore:
                     audio = checkpoint.get_tensor("audio")
                     if (tuple(video.shape) != self.video_shape
                             or tuple(audio.shape) != self.audio_shape
-                            or not video.is_floating_point()
-                            or not audio.is_floating_point()):
+                            or video.dtype != audio.dtype
+                            or str(video.dtype) != "torch.float32"):
+                        continue
+                    if checkpoint.metadata().get("payload_sha256") != self.tensor_digest(video, audio):
                         continue
                     best = step, video, audio
             except (OSError, ValueError, RuntimeError, KeyError):
                 # A crash during write cannot destroy the previous slot.
                 continue
         return best
+
+    @staticmethod
+    def tensor_digest(video, audio):
+        digest = hashlib.sha256()
+        for name, tensor in (("video", video), ("audio", audio)):
+            digest.update(name.encode("ascii"))
+            digest.update(tensor.detach().float().cpu().contiguous().numpy().tobytes())
+        return digest.hexdigest()
 
     def save(self, completed, video, audio):
         from safetensors.torch import save_file
@@ -115,9 +128,12 @@ class NativeStepStore:
         dest = self.filename(completed % 2)
         temporary = self.root / (".%s.%s.tmp" % (self.stage, uuid.uuid4()))
         try:
-            save_file({"video": video.detach().float().cpu().contiguous(),
-                       "audio": audio.detach().float().cpu().contiguous()},
-                      str(temporary), metadata=self.metadata(completed))
+            video_cpu = video.detach().float().cpu().contiguous()
+            audio_cpu = audio.detach().float().cpu().contiguous()
+            save_file({"video": video_cpu, "audio": audio_cpu},
+                      str(temporary),
+                      metadata=self.metadata(
+                          completed, self.tensor_digest(video_cpu, audio_cpu)))
             if temporary.stat().st_size > STEP_CHECKPOINT_MAX_BYTES:
                 raise ValueError("Native sampler step checkpoint exceeds 64 MiB")
             with open(temporary, "rb") as handle:
