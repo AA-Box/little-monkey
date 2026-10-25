@@ -28,6 +28,7 @@ export function StudioVdnPanel({
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
   const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
+  const [sourceVdnJobId, setSourceVdnJobId] = useState<string | null>(null);
   const [continuationMode, setContinuationMode] = useState<"last_frame" | "video_reference">("last_frame");
   const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
   const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
@@ -169,7 +170,8 @@ export function StudioVdnPanel({
       const request = {
         jobId: id, pythonExecutable: python, prompt: prompt.trim(),
         firstImagePath: first, lastImagePath: last,
-        sourceGalleryEntryId: sourceGalleryId,
+        sourceGalleryEntryId: sourceVdnJobId ? null : sourceGalleryId,
+        sourceVdnJobId,
         continuationMode,
         referenceImagePaths: references,
         referenceVideoPath: referenceVideo,
@@ -208,6 +210,7 @@ export function StudioVdnPanel({
         ...record.request,
         jobId,
         refineFromJobId: record.id,
+        sourceVdnJobId: null,
         nativeTwoPass: true,
         refineSteps,
         memoryMode,
@@ -498,7 +501,7 @@ export function StudioVdnPanel({
           Continue from a previous Gallery clip
           <select className="rounded border border-border bg-background p-1 text-foreground"
             value={sourceGalleryId ?? ""} disabled={running || Boolean(first)}
-            onChange={(event) => setSourceGalleryId(event.target.value || null)}>
+            onChange={(event) => { setSourceGalleryId(event.target.value || null); if (event.target.value) setSourceVdnJobId(null); }}>
             <option value="">No previous clip</option>
             {availableClips.map((entry) =>
               <option key={entry.entryId} value={entry.entryId}>
@@ -507,7 +510,23 @@ export function StudioVdnPanel({
             )}
           </select>
         </label>
-        {sourceGalleryId && backend === "diffusers" && <label className="grid gap-1 text-muted">
+        <label className="grid gap-1 text-muted">
+          Queue after an existing VDN job (durable automatic continuation)
+          <select value={sourceVdnJobId ?? ""} disabled={running || Boolean(first)}
+            className="rounded border border-border bg-background p-1 text-foreground"
+            onChange={(event) => {
+              const id = event.target.value || null;
+              setSourceVdnJobId(id);
+              if (id) setSourceGalleryId(null);
+            }}>
+            <option value="">No prerequisite VDN job</option>
+            {durableJobs.filter((entry) => entry.status !== "failed" && entry.status !== "cancelled")
+              .map((entry) => <option key={entry.id} value={entry.id}>
+                {entry.id.slice(0, 8)} · {entry.status} · {entry.request.prompt.slice(0, 30)}
+              </option>)}
+          </select>
+        </label>
+        {(sourceGalleryId || sourceVdnJobId) && backend === "diffusers" && <label className="grid gap-1 text-muted">
           Native continuation strategy
           <select value={continuationMode} disabled={running}
             className="rounded border border-border bg-background p-1 text-foreground"
