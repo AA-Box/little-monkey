@@ -231,11 +231,11 @@ async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
         request.reference_video_path = Some(temp.to_string_lossy().into_owned());
         return Ok((request, Some(temp)));
     }
-    // Ref2VA images/audio and FL2VA keyframe anchors are mutually exclusive.
-    // Native latent conditioning itself works with either, so leave Ref2VA
-    // reference requests unchanged instead of injecting a conflicting image.
-    if request.continuation_mode == "latent_context"
-        && (!request.reference_image_paths.is_empty() || request.reference_audio_path.is_some()) {
+    // The retained AV prefix starts 22 frames before the previous ending.
+    // An extracted *final* frame is therefore NOT the first frame of this
+    // window: injecting it as FL2VA would conflict with the fixed prefix.
+    // Use the actual latent context alone, with optional caller Ref2VA refs.
+    if request.continuation_mode == "latent_context" {
         return Ok((request, None));
     }
     let png_base64 = crate::studio_video_jobs::extract_final_frame(
