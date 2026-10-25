@@ -63,10 +63,10 @@ def native_h3_attention(attn, hidden_states, rotary_emb=None, attention_mask=Non
     else:
         supported = all(_is_plain_linear(getattr(attn, name))
                         for name in ("to_q", "to_k", "to_v"))
-    if not supported:
-        if fallback is None:
-            raise TypeError("Quantized H3 projection requires original processor")
-        return fallback(attn, hidden_states, rotary_emb, attention_mask)
+    # TorchAO/quantized projections may not expose sliceable row weights.
+    # Execute those modules on TOKEN tiles and collect only the active
+    # attention heads. This is slower than sliced ordinary Linear but it
+    # bounds the intermediate projection memory and works with INT8 layers.
     if budget_bytes is None:
         budget_bytes = (torch.cuda.mem_get_info(hidden_states.device)[0]
                         if hidden_states.is_cuda else 512 * 1024**2)
@@ -75,16 +75,33 @@ def native_h3_attention(attn, hidden_states, rotary_emb=None, attention_mask=Non
                                    heads_override=head_chunk)
     merged = torch.empty((batch, tokens, heads, dim),
                          device=hidden_states.device, dtype=hidden_states.dtype)
+    def project(kind, x, lo, hi):
+        if supported:
+            if fused:
+                offset = {"q": 0, "k": heads * dim, "v": 2 * heads * dim}[kind]
+                return _plain_linear_rows(projection, x, offset + lo, offset + hi)
+            return _plain_linear_rows(getattr(attn, "to_" + kind), x, lo, hi)
+        if fused:
+            full = attn.to_qkv(x)
+            offset = {"q": 0, "k": heads * dim, "v": 2 * heads * dim}[kind]
+            return full[..., offset + lo:offset + hi]
+        return getattr(attn, "to_" + kind)(x)[..., lo:hi]
+
+    def kv_for_group(kind, lo, hi):
+        if supported:
+            return project(kind, hidden_states, lo, hi)
+        # Quantized projection output is limited to a token tile, never a
+        # whole 75k-token X 3*56*128 tensor. Each head group is streamed.
+        pieces = []
+        for offset in range(0, tokens, q_chunk):
+            pieces.append(project(kind, hidden_states[:, offset:offset + q_chunk], lo, hi))
+        return torch.cat(pieces, dim=1)
+
     for first_head in range(0, heads, h_chunk):
         last_head = min(heads, first_head + h_chunk)
         lo, hi = first_head * dim, last_head * dim
-        if fused:
-            width = heads * dim
-            key = _plain_linear_rows(projection, hidden_states, width + lo, width + hi)
-            value = _plain_linear_rows(projection, hidden_states, 2 * width + lo, 2 * width + hi)
-        else:
-            key = _plain_linear_rows(attn.to_k, hidden_states, lo, hi)
-            value = _plain_linear_rows(attn.to_v, hidden_states, lo, hi)
+        key = kv_for_group("k", lo, hi)
+        value = kv_for_group("v", lo, hi)
         key = attn.norm_k(key.unflatten(-1, (last_head-first_head, dim)))
         if rotary_emb is not None:
             key = _apply_rotary_emb(key, *rotary_emb)
@@ -92,10 +109,7 @@ def native_h3_attention(attn, hidden_states, rotary_emb=None, attention_mask=Non
         value = value.unflatten(-1, (last_head-first_head, dim)).transpose(1, 2).contiguous()
         for begin in range(0, tokens, q_chunk):
             end = min(tokens, begin + q_chunk)
-            if fused:
-                query = _plain_linear_rows(projection, hidden_states[:, begin:end], lo, hi)
-            else:
-                query = _plain_linear_rows(attn.to_q, hidden_states[:, begin:end], lo, hi)
+            query = project("q", hidden_states[:, begin:end], lo, hi)
             query = attn.norm_q(query.unflatten(-1, (last_head-first_head, dim)))
             if rotary_emb is not None:
                 query = _apply_rotary_emb(query,
