@@ -59,8 +59,11 @@ def verify_upscaler_file(path):
     file = Path(path)
     if not file.is_file() or file.stat().st_size != UPSCALER_BYTES:
         raise ValueError("H3 learned upscaler checkpoint missing or truncated")
+    digest = hashlib.sha256()
     with file.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    digest = digest.hexdigest()
     if digest != UPSCALER_SHA256:
         raise ValueError("H3 learned upscaler checkpoint SHA256 mismatch")
     return file
