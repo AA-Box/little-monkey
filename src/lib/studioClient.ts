@@ -693,7 +693,9 @@ export const studioClient = {
     serverPort: number | null,
   ) => invoke<{status?: string; phase?: string; backend: string; model: string;
     device?: string; computeCapability?: string; vramBytes?: number;
-    torch?: string; fp8Supported?: boolean; visibleGpuCount?: number; port?: number}>(
+    torch?: string; fp8Supported?: boolean; visibleGpuCount?: number; port?: number;
+    freeVramBytes?: number; hostRamAvailableBytes?: number | null; diskFreeBytes?: number;
+    nativeMemoryPlans?: string[]; resourcesReady?: boolean; resourceWarning?: string}>(
       "generation_vdn_probe",
       { pythonExecutable, backend, repoRoot, checkpointRoot, gpuClass, serverPort }
     ),
