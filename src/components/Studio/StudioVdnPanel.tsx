@@ -39,6 +39,7 @@ export function StudioVdnPanel({
   const [seed, setSeed] = useState("0");
   const [fp8, setFp8] = useState(false);
   const [offload, setOffload] = useState(true);
+  const [memoryMode, setMemoryMode] = useState<"auto" | "resident" | "stream_cpu" | "stream_disk">("auto");
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [licenseReason, setLicenseReason] = useState<string | null | undefined>(undefined);
   const [region, setRegion] = useState<Region>(null);
@@ -171,7 +172,7 @@ export function StudioVdnPanel({
         referenceVideoPath: referenceVideo,
         referenceAudioPath: referenceAudio,
         loraPaths, steps, frames, seed: Number(seed) || 0,
-        fp8, offloadDit: offload, backend,
+        fp8, offloadDit: offload, memoryMode, backend,
         repoRoot: repoRoot || null,
         checkpointRoot: checkpointRoot || null,
         gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
@@ -251,6 +252,17 @@ export function StudioVdnPanel({
           ) : <p className="text-muted">VDN model license is eligible for the declared territory.</p>}
         </div>
 
+        <label className="grid gap-1 text-muted">
+          Native CUDA memory placement
+          <select className="rounded border border-border bg-background p-1 text-foreground"
+            value={memoryMode} disabled={running}
+            onChange={(event) => setMemoryMode(event.target.value as typeof memoryMode)}>
+            <option value="auto">Adaptive GPU / streamed CPU / quantization / disk</option>
+            <option value="resident">GPU resident only</option>
+            <option value="stream_cpu">Stream blocks from CPU with prefetch</option>
+            <option value="stream_disk">Disk-backed block streaming (96 GiB available required)</option>
+          </select>
+        </label>
         <label className="grid gap-1 text-muted">
           VDN execution backend
           <select aria-label="VDN execution backend" disabled={running}
