@@ -239,6 +239,9 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if request.segments > 1 && request.native_two_pass {
         return Err("Multi-segment native continuation cannot reuse a single two-pass checkpoint".into());
     }
+    if request.segments > 1 && request.last_image_path.is_some() {
+        return Err("Multi-segment native continuation cannot use a fixed terminal keyframe".into());
+    }
     if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) && request.steps != 8 {
         return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
     }
