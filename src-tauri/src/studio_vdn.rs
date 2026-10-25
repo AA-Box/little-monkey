@@ -514,8 +514,16 @@ pub async fn generation_vdn_run(
                     Err("VDN worker output is not a valid MP4 header".into())
                 } else {
                     crate::generation_commands::publish_vdn_video(
-                        &app, &request.job_id, &request.prompt, request.steps, request.seed,
-                        request.frames, first.is_some(), &bytes
+                        &app, &request.job_id,
+                        if request.backend == VdnBackend::Diffusers
+                            && (!request.reference_image_paths.is_empty()
+                                || request.reference_video_path.is_some()
+                                || request.reference_audio_path.is_some()) {
+                            "minimax-h3-ref2va-diffusers"
+                        } else { "vdn-h3-diffusers" },
+                        &request.prompt, request.steps, request.seed,
+                        request.frames, first.is_some() || !request.reference_image_paths.is_empty()
+                            || request.reference_video_path.is_some(), &bytes
                     )
                 }
             }
