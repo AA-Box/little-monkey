@@ -53,7 +53,7 @@ export function StudioVdnPanel({
   const [gpuFp8, setGpuFp8] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<GenerationEntry | null>(null);
-  const [preview, setPreview] = useState<GenerationEntry | null>(null);
+
   const job = useRef<string | null>(null);
 
   const refreshLicense = useCallback(async () => {
@@ -134,6 +134,49 @@ export function StudioVdnPanel({
     }
   }
 
+  function buildRequest(jobId: string, twoPass = false): Parameters<typeof studioClient.vdnSubmit>[0] {
+    return {
+      jobId, pythonExecutable: python, prompt: prompt.trim(),
+      firstImagePath: first, lastImagePath: last,
+      sourceGalleryEntryId: sourceVdnJobId ? null : sourceGalleryId,
+      sourceVdnJobId, continuationMode,
+      referenceImagePaths: references,
+      referenceVideoPath: referenceVideo,
+      referenceAudioPath: referenceAudio,
+      loraPaths, steps, frames, seed: Number(seed) || 0,
+      fp8, offloadDit: offload, memoryMode, backend,
+      nativeTwoPass: twoPass, refineSteps, refineFromJobId: null,
+      repoRoot: repoRoot || null, checkpointRoot: checkpointRoot || null,
+      gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
+      serverPort: backend === "sglang" ? serverPort : null,
+      acknowledgeThirdPartyCode: trustRemoteCode,
+    };
+  }
+
+  async function queueAfter(parent: DurableVdnJob) {
+    if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
+        backend !== "diffusers" || !trustRemoteCode) return;
+    setError(null);
+    try {
+      const jobId = crypto.randomUUID();
+      const request = buildRequest(jobId);
+      const record = await studioClient.vdnSubmit({
+        ...request,
+        firstImagePath: null, lastImagePath: null,
+        sourceGalleryEntryId: null, sourceVdnJobId: parent.id,
+        continuationMode: "video_reference",
+        referenceVideoPath: null,
+        referenceAudioPath: null,
+        nativeTwoPass: false,
+        refineFromJobId: null,
+      });
+      setDurableJobs((items) => [...items, record]);
+      setPhase("Native motion continuation queued after " + parent.id.slice(0, 8));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   async function queuedRun(request: Parameters<typeof studioClient.vdnSubmit>[0]): Promise<GenerationEntry> {
     const record = await studioClient.vdnSubmit(request);
     setDurableJobs((records) => [...records, record]);
@@ -165,26 +208,8 @@ export function StudioVdnPanel({
     setPhase("queued");
     setError(null);
     setCreated(null);
-    setPreview(null);
     try {
-      const request = {
-        jobId: id, pythonExecutable: python, prompt: prompt.trim(),
-        firstImagePath: first, lastImagePath: last,
-        sourceGalleryEntryId: sourceVdnJobId ? null : sourceGalleryId,
-        sourceVdnJobId,
-        continuationMode,
-        referenceImagePaths: references,
-        referenceVideoPath: referenceVideo,
-        referenceAudioPath: referenceAudio,
-        loraPaths, steps, frames, seed: Number(seed) || 0,
-        fp8, offloadDit: offload, memoryMode, backend,
-        nativeTwoPass: twoPass, refineSteps, refineFromJobId: null,
-        repoRoot: repoRoot || null,
-        checkpointRoot: checkpointRoot || null,
-        gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
-        serverPort: backend === "sglang" ? serverPort : null,
-        acknowledgeThirdPartyCode: trustRemoteCode,
-      };
+      const request = buildRequest(id, twoPass);
       const entry = await queuedRun(request);
       setCreated(entry);
       setPhase("completed");
@@ -576,6 +601,13 @@ export function StudioVdnPanel({
           {durableJobs.slice(-8).map((item) =>
             <div key={item.id} className="flex items-center gap-2">
               <span>{item.id.slice(0, 8)} · {item.status}</span>
+              {(item.status === "queued" || item.status === "running" || item.status === "completed") &&
+                <Button size="sm" variant="secondary"
+                  disabled={backend !== "diffusers" || !python || !probeInfo || !prompt.trim() ||
+                    licenseReason !== null || !trustRemoteCode}
+                  onClick={() => void queueAfter(item)}>
+                  Queue next (native motion)
+                </Button>}
               {item.status === "completed" && item.request.nativeTwoPass &&
                 <Button size="sm" variant="secondary" disabled={running}
                   onClick={() => void refineSaved(item)}>
@@ -597,9 +629,6 @@ export function StudioVdnPanel({
           )}
         </div>}
         {error && <p role="alert" className="text-danger">{error}</p>}
-        {preview && <p className="text-foreground">
-          Preview saved to Gallery: {preview.frameCount} frames. This uses a separate real inference pass, not reused motion latents.
-        </p>}
         {created && <p className="text-foreground">
           Video saved to Studio Gallery: {created.frameCount} frames,
           {(created.durationMs / 1000).toFixed(1)} seconds, audio/video MP4.
