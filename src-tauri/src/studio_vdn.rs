@@ -521,12 +521,18 @@ pub async fn generation_vdn_run(
                 } else {
                     crate::generation_commands::publish_vdn_video(
                         &app, &request.job_id,
-                        if request.backend == VdnBackend::Diffusers
-                            && (!request.reference_image_paths.is_empty()
-                                || request.reference_video_path.is_some()
-                                || request.reference_audio_path.is_some()) {
-                            "minimax-h3-ref2va-diffusers"
-                        } else { "vdn-h3-diffusers" },
+                        match request.backend {
+                            VdnBackend::Diffusers
+                                if !request.reference_image_paths.is_empty()
+                                   || request.reference_video_path.is_some()
+                                   || request.reference_audio_path.is_some() =>
+                                "minimax-h3-ref2va-diffusers",
+                            VdnBackend::Diffusers => "vdn-h3-diffusers",
+                            VdnBackend::OptimizedSingle => "vdn-h3-optimized",
+                            VdnBackend::OptimizedUlysses => "vdn-h3-ulysses",
+                            VdnBackend::Sglang => "vdn-h3-sglang",
+                            VdnBackend::FreeVideoAdaptive => "vdn-h3-freevideo-adaptive",
+                        },
                         &request.prompt, request.steps, request.seed,
                         request.frames, first.is_some() || !request.reference_image_paths.is_empty()
                             || request.reference_video_path.is_some(), &bytes
