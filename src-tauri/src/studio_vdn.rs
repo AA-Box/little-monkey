@@ -94,6 +94,8 @@ fn worker_args(
 }
 
 
+fn default_native_memory_mode() -> String { "auto".into() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VdnRunRequest {
@@ -117,6 +119,8 @@ pub struct VdnRunRequest {
     pub reference_audio_path: Option<String>,
     pub fp8: bool,
     pub offload_dit: bool,
+    #[serde(default = "default_native_memory_mode")]
+    pub memory_mode: String,
     #[serde(default)]
     pub backend: VdnBackend,
     #[serde(default)]
@@ -201,6 +205,9 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) && request.steps != 8 {
         return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
+    }
+    if !matches!(request.memory_mode.as_str(), "auto" | "resident" | "stream_cpu" | "stream_disk") {
+        return Err("Invalid Little Monkey native memory policy".into());
     }
     if request.seed < 0 {
         return Err("VDN seed must be nonnegative".into());
@@ -362,6 +369,9 @@ pub async fn generation_vdn_run(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true);
+    if request.backend == VdnBackend::Diffusers {
+        process.arg("--memory-mode").arg(&request.memory_mode);
+    }
     if request.backend == VdnBackend::Diffusers && request.offload_dit {
         process.arg("--offload-dit");
     }
@@ -579,6 +589,7 @@ mod tests {
             reference_audio_path: None,
             fp8: false,
             offload_dit: true,
+            memory_mode: "auto".into(),
             backend: VdnBackend::Diffusers,
             repo_root: None,
             checkpoint_root: None,
