@@ -175,12 +175,79 @@ fn published_entry(app: &AppHandle, id: &str) -> Result<Option<String>, String> 
         .map(|entry| entry.entry_id))
 }
 
+/// A child is dispatched only after its parent has published an actual
+/// content-addressed video. No placeholder source or successful status alone
+/// is sufficient to unlock the dependency.
+fn predecessor(app: &AppHandle, child: &VdnJob)
+    -> Result<Option<(String, String)>, String> {
+    let Some(parent_id) = child.request.source_vdn_job_id.as_deref() else {
+        return Ok(Some((String::new(), String::new())));
+    };
+    let jobs = list(app)?;
+    let parent = jobs.into_iter().find(|job| job.id == parent_id)
+        .ok_or("Native VDN predecessor not found in this profile")?;
+    match parent.status {
+        VdnJobStatus::Completed => {
+            let entry_id = parent.result_entry_id.ok_or(
+                "VDN predecessor is completed without a Gallery entry")?;
+            let entry = crate::generation_commands::generation_gallery(app.clone())?
+                .into_iter().find(|item| item.entry_id == entry_id
+                    && item.video_job_id.as_deref() == Some(parent_id))
+                .ok_or("VDN predecessor Gallery artifact disappeared")?;
+            Ok(Some((entry_id, entry.artifact_id)))
+        },
+        VdnJobStatus::Failed | VdnJobStatus::Cancelled | VdnJobStatus::Interrupted =>
+            Err("Native VDN predecessor failed or was cancelled".into()),
+        VdnJobStatus::Running | VdnJobStatus::Queued => Ok(None),
+    }
+}
+
+fn dispatch_waiting(app: &AppHandle) {
+    if let Ok(jobs) = list(app) {
+        for job in jobs {
+            if matches!(job.status, VdnJobStatus::Queued) {
+                dispatch(app.clone(), job.id);
+            }
+        }
+    }
+}
+
 fn dispatch(app: AppHandle, id: String) {
     let already = active().lock().map(|mut running| !running.insert(id.clone())).unwrap_or(true);
     if already { return; }
     tauri::async_runtime::spawn(async move {
+        let dependency = {
+            let pending = list(&app).ok().and_then(|jobs| jobs.into_iter()
+                .find(|job| job.id == id));
+            match pending {
+                Some(ref child) => predecessor(&app, child),
+                None => Err("Queued VDN job no longer exists".into()),
+            }
+        };
+        if dependency.as_ref().ok().is_some_and(|ready| ready.is_none()) {
+            if let Ok(mut jobs) = active().lock() { jobs.remove(&id); }
+            return;
+        }
+        if let Err(error) = &dependency {
+            let _ = modify(&app, &id, |j| {
+                if matches!(j.status, VdnJobStatus::Queued) {
+                    j.status = VdnJobStatus::Failed;
+                    j.error = Some(error.clone());
+                }
+                Ok(())
+            });
+            if let Ok(mut jobs) = active().lock() { jobs.remove(&id); }
+            dispatch_waiting(&app);
+            return;
+        }
         let job = modify(&app, &id, |j| {
             if !matches!(j.status, VdnJobStatus::Queued) { return Err("VDN job not queued".into()); }
+            if let Some((entry_id, artifact_id)) = dependency.as_ref().ok().and_then(|v| v.as_ref()) {
+                if j.request.source_vdn_job_id.is_some() {
+                    j.request.source_gallery_entry_id = Some(entry_id.clone());
+                    j.source_artifact_id = Some(artifact_id.clone());
+                }
+            }
             j.status = VdnJobStatus::Running;
             j.attempts += 1;
             Ok(())
@@ -228,6 +295,7 @@ fn dispatch(app: AppHandle, id: String) {
             }
         }
         if let Ok(mut running) = active().lock() { running.remove(&id); }
+        dispatch_waiting(&app);
     });
 }
 #[tauri::command(rename_all="camelCase")]
@@ -236,6 +304,13 @@ pub fn generation_vdn_submit(app: AppHandle, request: crate::studio_vdn::VdnRunR
     crate::generation_commands::ensure_vdn_usage(&app)?;
     crate::studio_vdn::validate_for_durable_submit(&request)?;
     let id = request.job_id.clone();
+    if let Some(parent_id) = &request.source_vdn_job_id {
+        let records = list(&app)?;
+        if !records.iter().any(|row| row.id == *parent_id) {
+            return Err("Native VDN predecessor must already be a persisted job".into());
+        }
+    }
+
     let source_artifact_id = if let Some(source_id) = request.source_gallery_entry_id.as_deref() {
         let entry = crate::generation_commands::generation_gallery(app.clone())?
             .into_iter().find(|entry| entry.entry_id == source_id)
