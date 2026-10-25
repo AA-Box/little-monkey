@@ -468,7 +468,6 @@ pub async fn generation_vdn_run(
         .arg("--output").arg(&output)
         .arg("--steps").arg(request.steps.to_string())
         .arg("--frames").arg(request.frames.to_string())
-        .arg("--segments").arg(request.segments.to_string())
         .arg("--seed").arg(request.seed.to_string())
         .arg("--device").arg("cuda")
         .current_dir(&directory)
@@ -477,6 +476,7 @@ pub async fn generation_vdn_run(
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true);
     if request.backend == VdnBackend::Diffusers {
+        process.arg("--segments").arg(request.segments.to_string());
         process.arg("--memory-mode").arg(&request.memory_mode);
         let checkpoint_home = directory.join("step-checkpoints");
         std::fs::create_dir_all(&checkpoint_home).map_err(|e| e.to_string())?;
