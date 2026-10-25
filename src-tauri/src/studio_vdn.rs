@@ -95,6 +95,8 @@ pub struct VdnRunRequest {
     pub seed: i64,
     pub first_image_path: Option<String>,
     pub last_image_path: Option<String>,
+    #[serde(default)]
+    pub reference_image_paths: Vec<String>,
     pub fp8: bool,
     pub offload_dit: bool,
     #[serde(default)]
@@ -189,6 +191,16 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         .map_err(|_| "Choose the Python executable from the OpenVDN-compatible environment")?;
     if !python.is_file() {
         return Err("Python executable is not a file".into());
+    }
+    if request.reference_image_paths.len() > 8 {
+        return Err("VDN supports at most eight reference images".into());
+    }
+    if !request.reference_image_paths.is_empty() &&
+        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("Ref2VA is supported only by native optimized OpenVDN backends".into());
+    }
+    for reference in &request.reference_image_paths {
+        validate_image(&Some(reference.clone()))?;
     }
     let first = validate_image(&request.first_image_path)?;
     let last = validate_image(&request.last_image_path)?;
@@ -290,6 +302,10 @@ pub async fn generation_vdn_run(
     if request.fp8 { process.arg("--fp8"); }
     if let Some(ref image) = first { process.arg("--first").arg(image); }
     if let Some(ref image) = last { process.arg("--last").arg(image); }
+    if !request.reference_image_paths.is_empty() {
+        process.arg("--refs");
+        for reference in &request.reference_image_paths { process.arg(reference); }
+    }
     let mut child = process.spawn().map_err(|error|
         format!("Could not start the installed Python VDN environment: {error}"))?;
     let _ = app.emit("studio://vdn-progress", VdnProgress {
@@ -481,6 +497,7 @@ mod tests {
             seed: 0,
             first_image_path: None,
             last_image_path: None,
+            reference_image_paths: vec![],
             fp8: false,
             offload_dit: true,
             backend: VdnBackend::Diffusers,
