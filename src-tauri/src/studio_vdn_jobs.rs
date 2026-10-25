@@ -169,6 +169,10 @@ fn list(app: &AppHandle) -> Result<Vec<VdnJob>, String> {
 async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
     -> Result<(crate::studio_vdn::VdnRunRequest, Option<PathBuf>), String> {
     let mut request = job.request.clone();
+    // The dependency has already been resolved to a pinned Gallery artifact.
+    // Clear the orchestration-only predecessor ID before validating the
+    // executable render request with its extracted keyframe or media.
+    request.source_vdn_job_id = None;
     let Some(source_id) = request.source_gallery_entry_id.take() else {
         return Ok((request, None));
     };
@@ -465,6 +469,9 @@ pub fn start_background_recovery(app: AppHandle) {
                 _ => {}
             }
         }
+        // Parent publication may have been recovered after an earlier child
+        // was scanned. Retry dependency dispatch once the journal is reconciled.
+        dispatch_waiting(&app);
     });
 }
 #[cfg(test)]
