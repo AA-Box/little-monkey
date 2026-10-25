@@ -5,6 +5,9 @@
 use crate::profiles::ProfileScopedPaths;
 use serde::{Deserialize, Serialize};
 use base64::Engine as _;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::{fs, path::{Path, PathBuf}, sync::{Mutex, OnceLock}, collections::HashSet};
 use tauri::AppHandle;
 
@@ -23,6 +26,8 @@ pub struct VdnJob {
     pub result_entry_id: Option<String>,
     #[serde(default)]
     pub source_artifact_id: Option<String>,
+    #[serde(default)]
+    pub input_hashes: BTreeMap<String, String>,
     pub error: Option<String>,
     #[serde(default)]
     pub created_at_ms: u64,
@@ -34,6 +39,59 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64).unwrap_or(0)
 }
+fn local_inputs(request: &crate::studio_vdn::VdnRunRequest) -> BTreeMap<String, String> {
+    let mut inputs = BTreeMap::new();
+    if let Some(path) = &request.first_image_path { inputs.insert("first".into(), path.clone()); }
+    if let Some(path) = &request.last_image_path { inputs.insert("last".into(), path.clone()); }
+    if let Some(path) = &request.reference_video_path { inputs.insert("video".into(), path.clone()); }
+    if let Some(path) = &request.reference_audio_path { inputs.insert("audio".into(), path.clone()); }
+    for (index, path) in request.reference_image_paths.iter().enumerate() {
+        inputs.insert(format!("image:{index}"), path.clone());
+    }
+    for (index, path) in request.lora_paths.iter().enumerate() {
+        inputs.insert(format!("lora:{index}"), path.clone());
+    }
+    inputs
+}
+
+fn hash_local_file(path: &str) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|error|
+        format!("VDN source file is unavailable: {error}"))?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 8 * 1024 * 1024 * 1024 {
+        return Err("Native VDN input must be a bounded regular file".into());
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut digest = Sha256::new();
+    let mut buf = [0_u8; 1024 * 1024];
+    loop {
+        let len = reader.read(&mut buf).map_err(|error| error.to_string())?;
+        if len == 0 { break; }
+        digest.update(&buf[..len]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn pin_local_inputs(request: &crate::studio_vdn::VdnRunRequest)
+    -> Result<BTreeMap<String, String>, String> {
+    local_inputs(request).into_iter()
+        .map(|(label, path)| Ok((label, hash_local_file(&path)?))).collect()
+}
+
+fn verify_local_inputs(job: &VdnJob) -> Result<(), String> {
+    let inputs = local_inputs(&job.request);
+    if inputs.len() != job.input_hashes.len() {
+        return Err("Native VDN local input set changed after submission".into());
+    }
+    for (label, path) in inputs {
+        if job.input_hashes.get(&label).map(String::as_str)
+            != Some(hash_local_file(&path)?.as_str()) {
+            return Err(format!("Native VDN {label} changed after job submission"));
+        }
+    }
+    Ok(())
+}
+
 fn lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -74,8 +132,16 @@ fn store(dir: &Path, j: &VdnJob) -> Result<(), String> {
     let bytes = serde_json::to_vec(j).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_RECORD_BYTES { return Err("VDN journal too large".into()); }
     let temp = dir.join(format!(".{}.{}.tmp", j.id, uuid::Uuid::new_v4()));
-    fs::write(&temp, &bytes).map_err(|e| e.to_string())?;
-    fs::rename(&temp, dest).map_err(|e| e.to_string())
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(&temp).map_err(|e| e.to_string())?;
+    file.write_all(&bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    fs::rename(&temp, dest).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(dir).and_then(|handle| handle.sync_all())
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 fn modify(app: &AppHandle, id: &str, f: impl FnOnce(&mut VdnJob) -> Result<(), String>)
     -> Result<VdnJob, String> {
@@ -265,13 +331,17 @@ fn dispatch(app: AppHandle, id: String) {
                 if let Ok(mut active) = active().lock() { active.remove(&id); }
                 return;
             }
-            let result = match prepare_continuation(&app, &j).await {
+            let verified = verify_local_inputs(&j);
+            let result = match verified {
+                Err(error) => Err(error),
+                Ok(()) => match prepare_continuation(&app, &j).await {
                 Ok((request, scratch)) => {
                     let result = crate::studio_vdn::generation_vdn_run(app.clone(), request).await;
                     if let Some(path) = scratch { let _ = fs::remove_file(path); }
                     result
                 }
                 Err(error) => Err(error),
+                },
             };
             let _ = modify(&app, &id, |j| {
                 if matches!(j.status, VdnJobStatus::Cancelled) && result.is_err() {
@@ -320,9 +390,10 @@ pub fn generation_vdn_submit(app: AppHandle, request: crate::studio_vdn::VdnRunR
         }
         Some(entry.artifact_id)
     } else { None };
+    let input_hashes = pin_local_inputs(&request)?;
     let timestamp = now_ms();
     let job = VdnJob { id: id.clone(), request, status: VdnJobStatus::Queued,
-        attempts: 0, result_entry_id: None, source_artifact_id, error: None,
+        attempts: 0, result_entry_id: None, source_artifact_id, input_hashes, error: None,
         created_at_ms: timestamp, updated_at_ms: timestamp };
     {
         let _guard = lock().lock().map_err(|e| e.to_string())?;
@@ -421,6 +492,7 @@ mod tests {
             attempts: 1,
             result_entry_id: None,
             source_artifact_id: Some("deadbeef".repeat(8)),
+            input_hashes: BTreeMap::new(),
             error: Some("app crashed".into()),
             created_at_ms: 10,
             updated_at_ms: 11,
