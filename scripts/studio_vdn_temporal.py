@@ -266,6 +266,8 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                         low_prefix.finish(preview_latents, preview_audio)
                     save_preview(source_path, preview_latents, preview_audio, preview_fingerprint)
                     clear_native_sampler_stage(args, stage + "_preview")
+                original_low_video = preview_latents.detach().float().cpu().contiguous().clone()
+                original_low_audio = preview_audio.detach().float().cpu().contiguous().clone()
                 preview_latents = preview_latents.to(device=device, dtype=torch.float32)
                 preview_audio = preview_audio.to(device=device, dtype=torch.float32)
                 upscaled = functional.interpolate(
@@ -341,7 +343,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             context = capture_context(sample["latents"], sample["audio_latents"],
                                       source_frame, source_frames + cursor)
             if args.two_pass:
-                low_context = capture_context(preview_latents, preview_audio,
+                low_context = capture_context(original_low_video, original_low_audio,
                                               source_frame, source_frames + cursor)
             else:
                 low_context = preview_fallback(context)
