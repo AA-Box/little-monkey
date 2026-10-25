@@ -59,4 +59,4 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.5.1+cpu"
       - name: Run real CPU AV snapshot and mocked full two-pass/continuation contracts
         run: |
-          python -m unittest -v tests.test_studio_vdn_temporal_store
+          python -m unittest discover -s tests -p "test_studio_vdn_temporal_store.py" -v
