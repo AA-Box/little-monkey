@@ -30,7 +30,7 @@ jobs:
           from pathlib import Path
           native = Path("scripts/studio_vdn_sampler.py").read_text()
           worker = Path("scripts/studio-vdn-h3-worker.py").read_text()
-          compile(native + "\\n" + worker, "staged-vdn-worker.py", "exec")
+          compile(native + "\n" + worker, "staged-vdn-worker.py", "exec")
           PY
       - name: Run actual worker subprocess input contracts
         run: python3 scripts/test-studio-vdn-h3-worker.py
