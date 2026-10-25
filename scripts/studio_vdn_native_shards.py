@@ -88,7 +88,10 @@ def instantiate_meta_component(cls, repo, subfolder, revision=None, *,
                                transformers_model=False, dtype=None):
     """Instantiate a *real* architecture from config, with zero initialized weights."""
     from accelerate import init_empty_weights
-    with init_empty_weights(include_buffers=True):
+    # Non-persistent RoPE/scheduler buffers are derived from config, not in
+    # SafeTensors. Keep those small deterministic buffers on CPU. Persistent
+    # checkpoint buffers are streamed explicitly below.
+    with init_empty_weights(include_buffers=False):
         if transformers_model:
             config = cls.config_class.from_pretrained(
                 repo, subfolder=subfolder or None, revision=revision)
@@ -146,7 +149,8 @@ class NativeOriginalShardHooks:
                 if param is not None:
                     names.append((name, True, param.shape, param.dtype))
             for name, buffer in module.named_buffers(recurse=False):
-                if buffer is not None and buffer.is_meta:
+                key = prefix + "." + name if prefix else name
+                if buffer is not None and key in store.index:
                     names.append((name, False, buffer.shape, buffer.dtype))
             if not names:
                 continue
