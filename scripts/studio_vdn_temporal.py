@@ -222,7 +222,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             # call. For subsequent windows it must agree with the protected
             # latent prefix, never reset to the original opening image.
             window_keyframes = (keyframes if not was_continuing else
-                                {"image": continuation_anchor} if continuation_anchor is not None else {})
+                                {"image": continuation_anchor} if keyframes and continuation_anchor is not None else {})
             if args.two_pass:
                 import torch.nn.functional as functional
                 low_prefix = (NativeTemporalPrefix(denoiser, low_context, device)
