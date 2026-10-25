@@ -137,6 +137,74 @@ class OriginalShardNativeTests(unittest.TestCase):
             self.assertTrue(all(p.is_meta for p in model.parameters()))
             self.assertTrue(model.conv.weight.is_meta)
 
+    def test_fresh_process_after_kill_mid_forward_keeps_original_shards(self):
+        import hashlib
+        import subprocess
+        import sys
+        torch.manual_seed(42)
+        original = nn.Linear(8, 8).eval()
+        inputs = torch.randn(2, 8)
+        expected = original(inputs)
+        with tempfile.TemporaryDirectory() as root:
+            store = make_original_shards(original, root)
+            before = {name: hashlib.sha256(path.read_bytes()).digest()
+                      for name, path in store.files.items()}
+            script = """
+import importlib.util, sys, time, torch
+from torch import nn
+from pathlib import Path
+from safetensors import safe_open
+script, root = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('stream', script)
+stream = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(stream)
+class Slow(nn.Linear):
+    def forward(self, x):
+        print('hydrated-original-shard', flush=True)
+        time.sleep(60)
+        return super().forward(x)
+with torch.device('meta'):
+    model = Slow(8, 8)
+files = {p.name: p for p in Path(root).glob('*.safetensors')}
+mapping = {'weight': sorted(files)[0], 'bias': sorted(files)[1]}
+index = {'weight_map': mapping}
+store = stream.OriginalShardStore(index, files)
+stream.NativeOriginalShardHooks(model, store, device='cpu', component='killed')
+model(torch.ones(2, 8))
+"""
+            # Use a deliberately single-item shard to avoid relying on
+            # dictionary iteration order in the subprocess manifest.
+            one = Path(root) / "single.safetensors"
+            save_file({k: v.detach().contiguous()
+                       for k, v in original.state_dict().items()}, str(one))
+            child = script.replace(
+                "files = {p.name: p for p in Path(root).glob('*.safetensors')}\nmapping = {'weight': sorted(files)[0], 'bias': sorted(files)[1]}",
+                "files = {'single.safetensors': Path(root) / 'single.safetensors'}\nmapping = {'weight': 'single.safetensors', 'bias': 'single.safetensors'}"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-u", "-c", child, str(SCRIPT), root],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                line = process.stdout.readline().strip()
+                self.assertEqual(line, "hydrated-original-shard",
+                                 process.stderr.read() if process.poll() is not None else "")
+            finally:
+                process.kill()
+                process.communicate(timeout=15)
+            self.assertNotEqual(process.returncode, 0)
+            after = {name: hashlib.sha256(path.read_bytes()).digest()
+                     for name, path in store.files.items()}
+            self.assertEqual(before, after)
+            with torch.device("meta"):
+                resumed = nn.Linear(8, 8)
+            fresh_store = native.OriginalShardStore(
+                {"weight_map": {"weight": "single.safetensors",
+                                "bias": "single.safetensors"}},
+                {"single.safetensors": one})
+            native.NativeOriginalShardHooks(
+                resumed, fresh_store, device="cpu", component="restarted")
+            torch.testing.assert_close(resumed(inputs), expected)
+
     def test_shard_map_rejects_traversal_and_missing_weights(self):
         with self.assertRaises(ValueError):
             native.validate_weight_map({"weight_map": {"weight": "../x.safetensors"}})
