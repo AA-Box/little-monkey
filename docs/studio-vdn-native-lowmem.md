@@ -22,27 +22,50 @@ weight-license check in Rust.
 3. **Token-chunked FFN.** Each MiniMax-H3 `FeedForward` layer performs its
    own forward pass in bounded token groups, reducing intermediate SwiGLU/FF
    activations while preserving token-independent math.
-4. **Placement and offloading.** Existing Diffusers native group-offloading
-   streams denoiser and text-encoder weights from CPU or disk. Real measured
-   free VRAM and host RAM now select layer grouping and asynchronous prefetch:
-   small budgets avoid a second pinned-memory/VRAM transfer slot.
-5. **Recovery and observability.** The Rust-owned worker passes low-memory
+4. **Initial disk-mapped SafeTensors loading for both H3 and Qwen.**
+   For the native `stream_disk` tier, `studio_vdn_disk_loader.py` reads each
+   component's small shard index from the *actual* Diffusers component spec
+   (OpenVDN H3 is under `h3-base/transformer`; Qwen may resolve to the
+   separate `MiniMaxAI/MiniMax-H3/text_encoder` source). It verifies that
+   indexed weights are SafeTensors rather than pickle and passes
+   `device_map="auto"`, separate bounded `max_memory`, per-component
+   `offload_folder`, `low_cpu_mem_usage=True`, and
+   `offload_state_dict=True` to the models' original
+   `from_pretrained` loaders. **These options act during shard loading,**
+   before the full model is resident. Accelerate can offload most modules to
+   disk and materialize them as their forward hooks run. The app **checks
+   both H3 and Qwen have real disk-dispatched modules** before sampling.
+   Accelerate's disk format may create extra cache files; this is not yet a
+   zero-copy original-SafeTensors mmap engine.
+5. **Other placements.** Existing Diffusers group-offload hooks still
+   stream CPU-resident weights for non-disk tiers. Disk-dispatched modules
+   retain Accelerate's hooks; applying group hooks a second time is
+   prohibited. Available VRAM/RAM governs prefetch and block grouping.
+   Streaming with 12 GiB *available* host RAM and 180 GiB scratch space is
+   admitted for a trial with at least 8 GiB *free* CUDA VRAM; this is not a
+   guarantee that a whole video will finish or fit.
+6. **Recovery and observability.** The Rust-owned worker passes low-memory
    settings to subprocesses. CUDA OOM triggers one stricter, smaller-tile
    attempt in a *fresh process* before moving to the next tier. Per-step
    sampler checkpoints include the effective tile settings, preventing an
    incompatible resume. Successful runs log peak CUDA allocated/reserved
    memory, Linux high-water RSS, whether disk streaming occurred, and whether
    native tiling was active.
-6. **Studio.** `auto` tiles CPU/Disk offload plans, `force` also tiles
+7. **Studio.** `auto` tiles CPU/Disk offload plans, `force` also tiles
    resident-model runs, and `off` uses upstream reference attention. Query
    tokens / head count are bounded adaptive ceilings; 0 means auto. FFN
    tokens default to 256 (0 disables FFN tiling).
 
 ## How this is validated
 
-- Native VDN contract suite: imports/compiles the exact concatenated Rust
-  worker + native sampler + low-memory source; checks tile planning and
-  transfer policy without CUDA.
+- Native VDN contract suite: compiles the exact concatenated Rust worker,
+  sampler, low-memory code and shard-loader; checks tier admission, SafeTensors
+  weight-map handling, source mapping, disk dispatch requirements and transfer
+  policy without CUDA.
+- Accelerate CPU acceptance: builds real sharded SafeTensors checkpoint files
+  for a small actual PyTorch network, initializes a meta model, performs a
+  real `load_checkpoint_and_dispatch` (part CPU, part disk), runs two forwards,
+  compares to eager output and verifies the offloaded layer is evicted.
 - PyTorch CPU parity suite: checks ordinary and fused QKV, actual
   full-context attention against PyTorch SDPA across multiple chunk widths,
   custom quantized-style projections limited to token tiles, FFN numerical
@@ -53,14 +76,19 @@ weight-license check in Rust.
 
 - Full model inference on a consumer NVIDIA GPU, target video quality or
   reproducibility against a real licensed checkpoint.
-- 8 GiB VRAM / 16 GiB RAM production support. The existing Diffusers
-  `load_components` weight loader still builds large H3/Qwen components
-  before the disk/CPU offload hooks can stream them; chunking activations
-  **does not remove that initial host-RAM peak**. Conservative memory
-  admission is intentional, rather than claiming the model fits.
-- A native, low-RAM, disk-backed *checkpoint loader* that materializes only
-  individual blocks from sharded SafeTensors at initialization. This is the
-  architectural feature needed to challenge FreeVideo's 16 GiB RAM result.
+- **8 GiB VRAM / 16 GiB RAM production support is not established.**
+  The loader no longer requires full BF16 H3 and Qwen residency at initial
+  load in the disk tier, but Accelerate may materialize individual shards,
+  temporary weights and execution buffers. Full model CUDA acceptance is
+  still required to measure process RSS, true peak allocation and output.
+  The 12 GiB minimum refers to *currently available* host RAM, not installed.
+- The new loader dispatches standard Hugging Face shards into Accelerate's
+  disk offload storage. A fully first-party zero-copy loader that reads
+  exact per-block tensor slices directly from the *original* SafeTensors
+  files during each forward remains future work. No training/quantization
+  changes are implied by this PR.
+- FP8 and LoRA injection into disk-mapped layers are not yet validated and
+  fail explicitly rather than silently reverting to eager loading.
 - Guaranteed speedups: smaller chunks trade memory for more kernel launches
   and may be slower, especially with quantized module projections.
 
