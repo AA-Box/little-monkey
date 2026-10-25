@@ -21,6 +21,12 @@ OVERLAP_FRAMES = 22
 VISUAL_CONTEXT_LATENTS = 7
 MAX_SEGMENTS = 8
 
+if "save_context" not in globals():
+    from studio_vdn_temporal_store import (
+        load_context, save_context, preview_fallback, preview_identity,
+        preview_path, load_preview, save_preview,
+    )
+
 
 def audio_origin(frame):
     """Convert absolute 24-fps frame position to nearest 40-Hz audio tick."""
@@ -178,10 +184,17 @@ class NativeTemporalPrefix:
 
 def render_temporal_video(pipe, args, torch, device, keyframes, references,
                           checkpoint, denoiser, encode_video, native_sampler_recovery,
-                          clear_native_sampler_stage):
+                          clear_native_sampler_stage, request_identity):
     """Sample bounded rolling windows with fixed AV context and one final mux."""
     import numpy as np
+    stored = (load_context(args.temporal_context_in,
+                           args.temporal_source_video_sha256, checkpoint,
+                           args.temporal_source_job_id)
+              if args.temporal_context_in else None)
+    source_frames = stored["total_frames"] if stored else 0
     frames_total = temporal_frame_plan(args.frames, args.segments)
+    if stored is not None:
+        frames_total -= OVERLAP_FRAMES
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     cursor = 0
@@ -189,35 +202,88 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
     sample_rate = None
     video_file = None
     video_memory = None
-    context = None
-    continuation_anchor = None
+    context = stored["high"] if stored else None
+    low_context = stored["low"] if stored else None
+    continuation_anchor = keyframes.get("image") if stored else None
     audio_chunks = []
     with tempfile.TemporaryDirectory(prefix=".vdn-temporal-", dir=output.parent) as work:
         workdir = Path(work)
         for part in range(args.segments):
-            source_frame = 0 if part == 0 else cursor - OVERLAP_FRAMES
+            source_frame = 0 if context is None else source_frames + cursor - OVERLAP_FRAMES
             prefix = NativeTemporalPrefix(denoiser, context, device) if context else None
             stage = "temporal_%d" % part
+            was_continuing = context is not None
             print(json.dumps({"phase": "temporal_sampling", "part": part + 1,
                               "parts": args.segments, "overlapFrames": 0 if part == 0 else 22}),
                   flush=True)
             # FL2VA still requires its explicit first-image input on every
             # call. For subsequent windows it must agree with the protected
             # latent prefix, never reset to the original opening image.
-            window_keyframes = (keyframes if part == 0 else
-                                {"image": continuation_anchor} if keyframes else {})
-            with native_sampler_recovery(args, stage, pipe, model_identity=checkpoint,
-                                         temporal_context=prefix,
-                                         temporal_transformer=denoiser):
-                sample = pipe(
-                    prompt=args.prompt,
-                    num_frames=args.frames,
-                    num_inference_steps=args.steps + 1,
-                    generator=torch.Generator(device).manual_seed(args.seed + part),
-                    output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
-                    **({"references": references} if references else
-                       window_keyframes),
-                )
+            window_keyframes = (keyframes if not was_continuing else
+                                {"image": continuation_anchor} if continuation_anchor is not None else {})
+            if args.two_pass:
+                import torch.nn.functional as functional
+                low_prefix = (NativeTemporalPrefix(denoiser, low_context, device)
+                              if low_context else None)
+                preview_fingerprint = preview_identity(
+                    request_identity, part,
+                    low_prefix.digest if low_prefix else None)
+                source_path = preview_path(
+                    args.refine_from or args.checkpoint, part)
+                if Path(source_path).is_file() or Path(source_path).is_symlink():
+                    preview_latents, preview_audio = load_preview(
+                        source_path, preview_fingerprint)
+                    print(json.dumps({"phase": "temporal_preview_reused",
+                                      "segment": part + 1}), flush=True)
+                elif args.refine_from:
+                    raise RuntimeError("Missing compatible saved temporal preview segment")
+                else:
+                    with native_sampler_recovery(
+                            args, stage + "_preview", pipe, model_identity=checkpoint,
+                            temporal_context=low_prefix,
+                            temporal_transformer=denoiser):
+                        preview = pipe(
+                            prompt=args.prompt, num_frames=args.frames,
+                            height=384, width=672,
+                            num_inference_steps=args.steps + 1,
+                            generator=torch.Generator(device).manual_seed(args.seed + 3 * part),
+                            output=["latents", "audio_latents"],
+                            **({"references": references} if references else window_keyframes))
+                    preview_latents, preview_audio = preview["latents"], preview["audio_latents"]
+                    if low_prefix:
+                        low_prefix.finish(preview_latents, preview_audio)
+                    save_preview(source_path, preview_latents, preview_audio, preview_fingerprint)
+                    clear_native_sampler_stage(args, stage + "_preview")
+                preview_latents = preview_latents.to(device=device, dtype=torch.float32)
+                preview_audio = preview_audio.to(device=device, dtype=torch.float32)
+                upscaled = functional.interpolate(
+                    preview_latents, size=(preview_latents.shape[2], 48, 84),
+                    mode="trilinear", align_corners=False)
+                generator = torch.Generator(device).manual_seed(args.seed + 3 * part + 1)
+                # Reintroduce noise for the new frames while preserving the
+                # protected AV prefix throughout H3 denoising.
+                upscaled = .90 * upscaled + .10 * torch.randn(
+                    upscaled.shape, device=device, dtype=upscaled.dtype, generator=generator)
+                with native_sampler_recovery(
+                        args, stage + "_refine", pipe, model_identity=checkpoint,
+                        temporal_context=prefix, temporal_transformer=denoiser):
+                    sample = pipe(
+                        prompt=args.prompt, num_frames=args.frames,
+                        height=768, width=1344, num_inference_steps=args.refine_steps + 1,
+                        generator=torch.Generator(device).manual_seed(args.seed + 3 * part + 2),
+                        latents=upscaled, audio_latents=preview_audio,
+                        output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
+                        **({"references": references} if references else window_keyframes))
+            else:
+                with native_sampler_recovery(
+                        args, stage, pipe, model_identity=checkpoint,
+                        temporal_context=prefix, temporal_transformer=denoiser):
+                    sample = pipe(
+                        prompt=args.prompt, num_frames=args.frames,
+                        num_inference_steps=args.steps + 1,
+                        generator=torch.Generator(device).manual_seed(args.seed + part),
+                        output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
+                        **({"references": references} if references else window_keyframes))
             if prefix:
                 prefix.finish(sample["latents"], sample["audio_latents"])
             if int(sample["sampling_rate"]) != AUDIO_SAMPLE_RATE:
@@ -227,7 +293,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             video_frames = sample["videos"][0]
             if len(video_frames) != args.frames:
                 raise RuntimeError("H3 emitted an unexpected temporal segment length")
-            overlap = OVERLAP_FRAMES if part else 0
+            overlap = OVERLAP_FRAMES if was_continuing else 0
             length = len(video_frames) - overlap
             if video_memory is None:
                 first = np.asarray(video_frames[0])
@@ -250,7 +316,8 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             if decoded_audio.ndim != 2 or decoded_audio.shape[0] != 2:
                 raise RuntimeError("H3 output lost its stereo soundtrack")
             # Trimming is in H3 audio-latent ticks, not frame-count guesses.
-            audio_trim = 0 if context is None else context["audio"].shape[2] * SAMPLES_PER_AUDIO_LATENT
+            audio_trim = (context["audio"].shape[2] * SAMPLES_PER_AUDIO_LATENT
+                          if was_continuing else 0)
             next_cursor = cursor + length
             wanted = emitted_audio_samples(next_cursor, AUDIO_SAMPLE_RATE) - audio_cursor
             audio_slice = decoded_audio[:, audio_trim:]
@@ -259,11 +326,15 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             audio_chunks.append(audio_slice)
             audio_cursor += audio_slice.shape[1]
             cursor = next_cursor
-            if part != args.segments - 1:
-                context = capture_context(sample["latents"], sample["audio_latents"],
-                                          source_frame, cursor)
-                continuation_anchor = video_frames[-OVERLAP_FRAMES]
-            clear_native_sampler_stage(args, stage)
+            context = capture_context(sample["latents"], sample["audio_latents"],
+                                      source_frame, source_frames + cursor)
+            if args.two_pass:
+                low_context = capture_context(preview_latents, preview_audio,
+                                              source_frame, source_frames + cursor)
+            else:
+                low_context = preview_fallback(context)
+            continuation_anchor = video_frames[-OVERLAP_FRAMES]
+            clear_native_sampler_stage(args, stage + "_refine" if args.two_pass else stage)
             print(json.dumps({"phase": "temporal_part_completed", "part": part + 1,
                               "framesDelivered": cursor, "audioSamples": audio_cursor}),
                   flush=True)
@@ -281,5 +352,8 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
         if not target.is_file() or target.stat().st_size < 32:
             raise RuntimeError("Native temporal encoder produced no video")
         os.replace(target, output)
+        if args.temporal_context_out:
+            save_context(args.temporal_context_out, context, low_context,
+                         output, checkpoint, args.job_id, source_frames + frames_total)
         del video_memory
     return {"videos": frames_total, "audioSamples": audio_cursor}
