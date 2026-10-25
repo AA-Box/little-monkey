@@ -156,7 +156,8 @@ class NativeStepStore:
 
 
 @contextlib.contextmanager
-def native_sampler_recovery(args, stage, pipeline, *, model_identity, temporal_context=None):
+def native_sampler_recovery(args, stage, pipeline, *, model_identity,
+                            temporal_context=None, temporal_transformer=None):
     """Own the real Diffusers H3 loop for this worker call only.
 
     On restart, reconstruct the *original* deterministic text/keyframe/reference
@@ -254,7 +255,7 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity, temporal_c
         loop.set_block_state(state, block)
         return components, state
 
-    handle = (pipeline.transformer.register_forward_pre_hook(
+    handle = (temporal_transformer.register_forward_pre_hook(
         temporal_context.before, with_kwargs=True, prepend=True)
         if temporal_context is not None else None)
     MiniMaxH3DenoiseLoopWrapper.__call__ = run_with_checkpoints
