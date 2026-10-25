@@ -97,6 +97,8 @@ pub struct VdnRunRequest {
     pub last_image_path: Option<String>,
     #[serde(default)]
     pub reference_image_paths: Vec<String>,
+    #[serde(default)]
+    pub reference_video_path: Option<String>,
     pub fp8: bool,
     pub offload_dit: bool,
     #[serde(default)]
@@ -191,6 +193,17 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         .map_err(|_| "Choose the Python executable from the OpenVDN-compatible environment")?;
     if !python.is_file() {
         return Err("Python executable is not a file".into());
+    }
+    if request.reference_video_path.is_some() &&
+        !matches!(request.backend, VdnBackend::OptimizedSingle | VdnBackend::OptimizedUlysses) {
+        return Err("Video reference frames require optimized OpenVDN".into());
+    }
+    if let Some(path) = &request.reference_video_path {
+        let video = Path::new(path).canonicalize().map_err(|_| "Reference video not found")?;
+        let metadata = std::fs::metadata(&video).map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() > MAX_VIDEO_BYTES || metadata.len() < 32 {
+            return Err("Reference video must be a local file of 32 bytes to 256 MB".into());
+        }
     }
     if request.reference_image_paths.len() > 8 {
         return Err("VDN supports at most eight reference images".into());
@@ -302,6 +315,9 @@ pub async fn generation_vdn_run(
     if request.fp8 { process.arg("--fp8"); }
     if let Some(ref image) = first { process.arg("--first").arg(image); }
     if let Some(ref image) = last { process.arg("--last").arg(image); }
+    if let Some(reference_video) = &request.reference_video_path {
+        process.arg("--reference-video").arg(reference_video);
+    }
     if !request.reference_image_paths.is_empty() {
         process.arg("--refs");
         for reference in &request.reference_image_paths { process.arg(reference); }
@@ -498,6 +514,7 @@ mod tests {
             first_image_path: None,
             last_image_path: None,
             reference_image_paths: vec![],
+            reference_video_path: None,
             fp8: false,
             offload_dit: true,
             backend: VdnBackend::Diffusers,
