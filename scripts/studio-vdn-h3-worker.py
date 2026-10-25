@@ -26,6 +26,8 @@ import importlib.util
 import hashlib
 
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
+# Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
+REF_MODEL_REPOSITORY = "MiniMaxAI/MiniMax-H3"
 FPS = 24
 
 
@@ -110,9 +112,22 @@ def parse_args(argv=None):
         parser.error("Ref2VA audio requires an image or video reference")
     if len(args.refs) > 9 or len(args.lora) > 4:
         parser.error("Ref2VA supports at most nine image references and four LoRA adapters")
-    for path in (args.first, args.last, *args.refs, args.reference_video, args.reference_audio, *args.lora):
-        if path and (not Path(path).is_file() or Path(path).stat().st_size > (256 * 1024 * 1024 if path == args.reference_video else 64 * 1024 * 1024)):
-            parser.error("Reference/keyframe must be an existing bounded local file")
+    for name, path, maximum in (
+        ("first keyframe", args.first, 32 * 1024**2),
+        ("last keyframe", args.last, 32 * 1024**2),
+        *[("reference image", path, 32 * 1024**2) for path in args.refs],
+        ("reference video", args.reference_video, 256 * 1024**2),
+        ("reference audio", args.reference_audio, 64 * 1024**2),
+        *[("LoRA", path, 8 * 1024**3) for path in args.lora],
+    ):
+        if not path:
+            continue
+        candidate = Path(path)
+        if not candidate.is_file() or candidate.is_symlink():
+            parser.error(f"{name} must be a local regular file")
+        size = candidate.stat().st_size
+        if not 8 <= size <= maximum:
+            parser.error(f"{name} size must be 8 bytes to {maximum} bytes")
     return args
 
 
@@ -447,12 +462,17 @@ def _run_once(args):
         if args.last:
             keyframes["last_image"] = load_image(args.last)
 
-    print(json.dumps({"phase": "loading", "model": MODEL_REPOSITORY}), flush=True)
     mode = "ref2va" if references else "fl2va" if keyframes else "t2va"
+    # Native Ref2VA conditioning requires transformer_ref weights from the
+    # original MiniMax H3 release; OpenVDN's hybrid checkpoint is t2va/fl2va.
+    # Never silently treat original reference weights as a hybrid VDN model.
+    checkpoint = REF_MODEL_REPOSITORY if references else MODEL_REPOSITORY
+    print(json.dumps({"phase": "loading", "model": checkpoint}), flush=True)
     print(json.dumps({"phase": "conditioning", "workflow": mode,
                       "images": len(args.refs), "videos": bool(args.reference_video),
-                      "audio": bool(args.reference_audio)}), flush=True)
-    pipe = ModularPipeline.from_pretrained(MODEL_REPOSITORY, workflow=mode)
+                      "audio": bool(args.reference_audio),
+                      "hybridVDN": not references}), flush=True)
+    pipe = ModularPipeline.from_pretrained(checkpoint, workflow=mode)
     kwargs = {"trust_remote_code": True, "torch_dtype": torch.bfloat16}
     if args.fp8:
         kwargs["fp8"] = {"transformer_ref" if references else "transformer": True}
