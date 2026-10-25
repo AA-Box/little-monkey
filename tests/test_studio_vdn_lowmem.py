@@ -32,7 +32,10 @@ class NativeAttentionBudgetTests(unittest.TestCase):
         roomy = low.weight_stream_policy(40*gib, 128*gib, disk_spill=False)
         self.assertTrue(roomy["denoiser_async_prefetch"])
         self.assertTrue(roomy["text_async_prefetch"])
-        self.assertEqual(roomy["denoiser_blocks_per_group"], 2)
+        self.assertEqual(roomy["denoiser_blocks_per_group"], 1)
+        sequential = low.weight_stream_policy(40*gib, 16*gib, disk_spill=True)
+        self.assertEqual(sequential["denoiser_blocks_per_group"], 2)
+        self.assertFalse(sequential["denoiser_async_prefetch"])
         with self.assertRaises(ValueError):
             low.weight_stream_policy(-1, 128*gib)
 
