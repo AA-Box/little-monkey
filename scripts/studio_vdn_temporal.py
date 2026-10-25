@@ -177,7 +177,7 @@ class NativeTemporalPrefix:
 
 
 def render_temporal_video(pipe, args, torch, device, keyframes, references,
-                          checkpoint, encode_video, native_sampler_recovery,
+                          checkpoint, denoiser, encode_video, native_sampler_recovery,
                           clear_native_sampler_stage):
     """Sample bounded rolling windows with fixed AV context and one final mux."""
     import numpy as np
@@ -196,7 +196,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
         workdir = Path(work)
         for part in range(args.segments):
             source_frame = 0 if part == 0 else cursor - OVERLAP_FRAMES
-            prefix = NativeTemporalPrefix(pipe.transformer, context, device) if context else None
+            prefix = NativeTemporalPrefix(denoiser, context, device) if context else None
             stage = "temporal_%d" % part
             print(json.dumps({"phase": "temporal_sampling", "part": part + 1,
                               "parts": args.segments, "overlapFrames": 0 if part == 0 else 22}),
@@ -207,7 +207,8 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             window_keyframes = (keyframes if part == 0 else
                                 {"image": continuation_anchor} if keyframes else {})
             with native_sampler_recovery(args, stage, pipe, model_identity=checkpoint,
-                                         temporal_context=prefix):
+                                         temporal_context=prefix,
+                                         temporal_transformer=denoiser):
                 sample = pipe(
                     prompt=args.prompt,
                     num_frames=args.frames,
