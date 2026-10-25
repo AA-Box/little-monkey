@@ -245,7 +245,7 @@ export interface VdnGenerationRequest {
   lastImagePath: string | null;
   sourceGalleryEntryId: string | null;
   sourceVdnJobId: string | null;
-  continuationMode: "last_frame" | "video_reference";
+  continuationMode: "last_frame" | "video_reference" | "latent_context";
   referenceImagePaths: string[];
   referenceVideoPath: string | null;
   loraPaths: string[];
