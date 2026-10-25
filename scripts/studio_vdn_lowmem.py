@@ -83,9 +83,10 @@ def native_h3_attention(attn, hidden_states, rotary_emb=None, attention_mask=Non
     fused = getattr(attn, "fused_projections", False)
     if fused:
         projection = attn.to_qkv
-        supported = _is_plain_linear(projection)
+        supported = _is_plain_linear(projection) and not getattr(projection, "_little_monkey_original_shards", False)
     else:
-        supported = all(_is_plain_linear(getattr(attn, name))
+        supported = all(_is_plain_linear(getattr(attn, name)) and
+                        not getattr(getattr(attn, name), "_little_monkey_original_shards", False)
                         for name in ("to_q", "to_k", "to_v"))
     # TorchAO/quantized projections may not expose sliceable row weights.
     # Execute those modules on TOKEN tiles and collect only the active
