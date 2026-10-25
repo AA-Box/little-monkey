@@ -322,8 +322,11 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if request.backend == VdnBackend::Diffusers
         && request.reference_audio_path.is_some()
-        && request.reference_video_path.is_none() && request.reference_image_paths.is_empty() {
-        return Err("Native Ref2VA audio reference requires image or video".into());
+        && request.reference_video_path.is_none() && request.reference_image_paths.is_empty()
+        && !(request.continuation_mode == "video_reference"
+            && (request.source_gallery_entry_id.is_some()
+                || request.source_vdn_job_id.is_some())) {
+        return Err("Native Ref2VA audio reference requires image, video or a pinned video continuation".into());
     }
     if request.source_gallery_entry_id.is_some() && request.first_image_path.is_some() {
         return Err("Cannot combine continuation with first image".into());
