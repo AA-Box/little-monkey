@@ -594,7 +594,7 @@ export function StudioVdnPanel({
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="primary"
             disabled={running || !python || !probeInfo || !prompt.trim() ||
-              licenseReason !== null || !trustRemoteCode}
+              (segments > 1 && Boolean(last)) || licenseReason !== null || !trustRemoteCode}
             onClick={() => void run()}>
             <Play size={13} /> Generate with VDN-H3
           </Button>
