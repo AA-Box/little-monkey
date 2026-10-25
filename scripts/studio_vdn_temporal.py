@@ -190,6 +190,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
     video_file = None
     video_memory = None
     context = None
+    continuation_anchor = None
     audio_chunks = []
     with tempfile.TemporaryDirectory(prefix=".vdn-temporal-", dir=output.parent) as work:
         workdir = Path(work)
@@ -200,6 +201,11 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             print(json.dumps({"phase": "temporal_sampling", "part": part + 1,
                               "parts": args.segments, "overlapFrames": 0 if part == 0 else 22}),
                   flush=True)
+            # FL2VA still requires its explicit first-image input on every
+            # call. For subsequent windows it must agree with the protected
+            # latent prefix, never reset to the original opening image.
+            window_keyframes = (keyframes if part == 0 else
+                                {"image": continuation_anchor} if keyframes else {})
             with native_sampler_recovery(args, stage, pipe, model_identity=checkpoint,
                                          temporal_context=prefix):
                 sample = pipe(
@@ -209,7 +215,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                     generator=torch.Generator(device).manual_seed(args.seed + part),
                     output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
                     **({"references": references} if references else
-                       (keyframes if part == 0 else {})),
+                       window_keyframes),
                 )
             if prefix:
                 prefix.finish(sample["latents"], sample["audio_latents"])
@@ -255,6 +261,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             if part != args.segments - 1:
                 context = capture_context(sample["latents"], sample["audio_latents"],
                                           source_frame, cursor)
+                continuation_anchor = video_frames[-OVERLAP_FRAMES]
             clear_native_sampler_stage(args, stage)
             print(json.dumps({"phase": "temporal_part_completed", "part": part + 1,
                               "framesDelivered": cursor, "audioSamples": audio_cursor}),
