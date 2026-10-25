@@ -65,6 +65,7 @@ def parse_args(argv=None):
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--step-checkpoint-root", default="")
     parser.add_argument("--refine-steps", type=int, default=3)
+    parser.add_argument("--upscaler-cache-dir", default="")
     parser.add_argument("--internal-attempt", choices=("resident", "resident_fp8", "stream_cpu", "stream_disk", "fp8_disk", "int8_cpu", "fp8_cpu"), default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
@@ -134,6 +135,11 @@ def parse_args(argv=None):
         parser.error("Native two-pass needs an app-owned absolute checkpoint path")
     if not 1 <= args.refine_steps <= 12:
         parser.error("Native refinement steps must be 1..12")
+    if args.two_pass and (args.steps != 8 or args.refine_steps != 3):
+        parser.error("Trained H3 two-pass requires eight preview and three refinement steps")
+    if args.two_pass and (not args.upscaler_cache_dir or
+                          not Path(args.upscaler_cache_dir).is_absolute()):
+        parser.error("Native two-pass needs an absolute app-owned learned upscaler cache")
     if args.device != "cuda":
         parser.error("This worker currently supports CUDA only; use native Wan for macOS")
     if (args.first or args.last) and (args.refs or args.reference_video or args.reference_audio):
@@ -294,7 +300,8 @@ def run(args):
                         ("--reference-audio", args.reference_audio),
                         ("--checkpoint", args.checkpoint),
                         ("--step-checkpoint-root", args.step_checkpoint_root),
-                        ("--refine-from", args.refine_from)):
+                        ("--refine-from", args.refine_from),
+                        ("--upscaler-cache-dir", args.upscaler_cache_dir)):
         if value:
             original.extend([flag, value])
     if args.refs:
@@ -394,7 +401,7 @@ def validate_preview_layout(video_shape, audio_shape):
     """Prevent malformed/corrupt checkpoints from allocating arbitrary GPU shapes."""
     if len(video_shape) != 5 or video_shape[0] != 1 or video_shape[1] != 24:
         raise ValueError("Native preview must hold 1 x 24-channel video latents")
-    if not 1 <= video_shape[2] <= 32 or tuple(video_shape[3:]) != (24, 42):
+    if not 1 <= video_shape[2] <= 102 or tuple(video_shape[3:]) != (24, 42):
         raise ValueError("Native preview geometry must be half-canvas video latents")
     if len(audio_shape) != 3 or audio_shape[0:2] != (2, 32):
         raise ValueError("Native preview must hold stereo-channel H3 audio latents")
@@ -402,15 +409,50 @@ def validate_preview_layout(video_shape, audio_shape):
         raise ValueError("Native preview audio latent length invalid")
 
 
+def native_h3_refine_schedule(pipe, torch):
+    """Temporarily install the genuine three-step H3 video/audio sigma tail.
+
+    The ModularPipeline normally replaces both schedules at run start.
+    Bound wrappers intercept that reset, then restore the original methods
+    even if denoising is cancelled or a CUDA error interrupts the process.
+    """
+    import contextlib
+    import types
+    video = pipe.scheduler
+    audio = pipe.audio_scheduler
+    original_video = video.set_timesteps
+    original_audio = audio.set_timesteps
+    sigmas = [0.9035, 0.6316, 0.3158, 0.0]
+    base = [sigma / (12.0 + (1.0 - 12.0) * sigma) for sigma in sigmas]
+    audio_sigmas = [3.0 * sigma / (1.0 + 2.0 * sigma) for sigma in base]
+
+    def reset_video(*args, **kwargs):
+        return original_video(sigmas=sigmas, device=kwargs.get("device"))
+
+    def reset_audio(*args, **kwargs):
+        return original_audio(sigmas=audio_sigmas, device=kwargs.get("device"))
+
+    @contextlib.contextmanager
+    def active():
+        video.set_timesteps = reset_video
+        audio.set_timesteps = reset_audio
+        try:
+            yield
+        finally:
+            video.set_timesteps = original_video
+            audio.set_timesteps = original_audio
+    return active()
+
+
 def native_two_pass(pipe, args, torch, device, keyframes, references):
     """Native latent-space two-pass using Diffusers' actual MiniMax-H3 state I/O.
 
-    Pass one samples at half the target height/width. Pass two interpolates
-    its *video latents* on the target latent canvas and denoises them, rather
-    than generating an unrelated clip. It is NOT a trained super-resolution
-    model; its quality has to be benchmarked on compatible weights.
+    Pass one samples at half the target height/width. The separate Little
+    Monkey-owned 3D learned model lifts normalized H3 video latents to the
+    target canvas. Three true H3 diffusion steps then refine those latents.
+    The publisher's pinned model weights must be present and verified.
     """
-    import torch.nn.functional as functional
+    from contextlib import contextmanager
     from safetensors import safe_open
     from safetensors.torch import save_file
 
@@ -471,28 +513,40 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
     validate_preview_layout(tuple(latents.shape), tuple(audio_latents.shape))
     latents = latents.to(device=device, dtype=torch.float32)
     audio_latents = audio_latents.to(device=device, dtype=torch.float32)
-    target_frames = latents.shape[2]
-    upscaled = functional.interpolate(
-        latents, size=(target_frames, 48, 84), mode="trilinear", align_corners=False)
-    if upscaled.shape[3:] != (48, 84):
-        raise RuntimeError("Native latent spatial upscale failed")
-    # Deterministic low-amplitude noise supplies real refinement degrees of
-    # freedom while preserving the preview's learned motion/structure.
+    if latents.shape[2] != (args.frames - 5) // 17 * 5 + 2:
+        raise RuntimeError("Preview latent time axis does not match requested frames")
+    print(json.dumps({"phase": "native_learned_upscaler",
+                      "architecture": "h3-trained-3d-24channel",
+                      "checkpoint": "pinned-sha256"}), flush=True)
+    upscaled = native_learned_upscale(latents, args.upscaler_cache_dir, (48, 84))
+    # Start an actual 3-step H3 tail schedule with calibrated noise, rather
+    # than restarting a full sigma=1 schedule or adding arbitrary 10% noise.
+    # Audio has its own H3 sigma shift and is initialized consistently.
+    video_sigma = 0.9035
+    raw_sigma = video_sigma / (12.0 + (1.0 - 12.0) * video_sigma)
+    audio_sigma = 3.0 * raw_sigma / (1.0 + 2.0 * raw_sigma)
     generator = torch.Generator(device).manual_seed(args.seed + 1)
-    upscaled = 0.90 * upscaled + 0.10 * torch.randn(
-        upscaled.shape, generator=generator, device=device, dtype=upscaled.dtype)
+    upscaled = ((1.0 - video_sigma) * upscaled +
+                video_sigma * torch.randn(upscaled.shape, generator=generator,
+                                           device=device, dtype=upscaled.dtype))
+    audio_latents = ((1.0 - audio_sigma) * audio_latents +
+                     audio_sigma * torch.randn(audio_latents.shape,
+                                               generator=generator, device=device,
+                                               dtype=audio_latents.dtype))
     print(json.dumps({"phase": "native_latent_refinement",
-                      "steps": args.refine_steps, "latentReuse": True}), flush=True)
-    with native_sampler_recovery(args, "refine", pipe, model_identity=(
-            REF_MODEL_REPOSITORY if references else MODEL_REPOSITORY)):
-        return pipe(
-        prompt=args.prompt, num_frames=args.frames, height=768, width=1344,
-        num_inference_steps=args.refine_steps + 1,
-        generator=torch.Generator(device).manual_seed(args.seed + 2),
-        latents=upscaled, audio_latents=audio_latents,
-        output=["videos", "audio", "sampling_rate"],
-        **({"references": references} if references else keyframes),
-        )
+                      "steps": 3, "latentReuse": True, "learnedUpscale": True,
+                      "schedule": "h3-calibrated-three-step"}), flush=True)
+    with native_h3_refine_schedule(pipe, torch):
+        with native_sampler_recovery(args, "refine", pipe, model_identity=(
+                REF_MODEL_REPOSITORY if references else MODEL_REPOSITORY)):
+            return pipe(
+            prompt=args.prompt, num_frames=args.frames, height=768, width=1344,
+            num_inference_steps=4,
+            generator=torch.Generator(device).manual_seed(args.seed + 2),
+            latents=upscaled, audio_latents=audio_latents,
+            output=["videos", "audio", "sampling_rate"],
+            **({"references": references} if references else keyframes),
+            )
 
 
 def _run_once(args):

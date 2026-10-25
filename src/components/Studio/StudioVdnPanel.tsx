@@ -42,7 +42,8 @@ export function StudioVdnPanel({
   const [fp8, setFp8] = useState(false);
   const [offload, setOffload] = useState(true);
   const [memoryMode, setMemoryMode] = useState<"auto" | "resident" | "stream_cpu" | "stream_disk">("auto");
-  const [refineSteps, setRefineSteps] = useState(3);
+  // The released H3 upscaler is calibrated for eight preview and three tail steps.
+  const refineSteps = 3;
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [licenseReason, setLicenseReason] = useState<string | null | undefined>(undefined);
   const [region, setRegion] = useState<Region>(null);
@@ -588,21 +589,21 @@ export function StudioVdnPanel({
           </Button>
           <Button size="sm" variant="secondary"
             disabled={running || backend !== "diffusers" || !python || !probeInfo || !prompt.trim() ||
-              licenseReason !== null || !trustRemoteCode}
+              licenseReason !== null || !trustRemoteCode || steps !== 8}
             onClick={() => void run(true)}>
-            <Play size={13} /> Native latent two-pass (reuses pass one)
+            <Play size={13} /> Native learned 3D latent two-pass
           </Button>
           {running && <Button size="sm" variant="secondary" onClick={() => void cancel()}>
             <Square size={13} /> Cancel VDN job
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
-        {backend === "diffusers" && <label className="grid gap-1 text-muted">
-          Native latent refinement evaluations
-          <input type="number" min={1} max={12} disabled={running} value={refineSteps}
-            className="rounded border border-border bg-background p-1 text-foreground"
-            onChange={(event) => setRefineSteps(Math.max(1, Math.min(12, Number(event.target.value) || 3)))} />
-        </label>}
+        {backend === "diffusers" && <p className="text-muted">
+          Learned 3D latent upscale: 8 preview steps at half resolution, verified
+          24-channel H3 model weights, then 3 calibrated refinement steps.
+          The first use downloads approximately 659 MiB of verified weights
+          from the original publisher. No interpolation fallback.
+        </p>
         {durableJobs.length > 0 && <div className="grid gap-1">
           <strong>Persisted VDN jobs</strong>
           {durableJobs.slice(-8).map((item) =>

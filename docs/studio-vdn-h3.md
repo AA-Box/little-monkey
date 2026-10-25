@@ -47,12 +47,61 @@ path. Use Wan on macOS. In a typical 24-GB GPU, turn on
 `offloadDit` to page transformer blocks between CPU and CUDA memory.
 It may still be slow, and RAM/disk requirements can be substantial.
 
+## Native learned latent upscale and refinement (8+3)
+
+Select **Native learned 3D latent two-pass** in Studio with the Diffusers
+backend. The entire implementation lives in
+`scripts/studio_vdn_learned_upscaler.py` and
+`scripts/studio-vdn-h3-worker.py`; Rust stages those sources together into
+the real worker. This is **not** an adapter to FreeVideo.
+
+1. The licensed OpenVDN H3 model generates eight steps on a 384×672
+   preview canvas and checkpoints its real 24-channel video and audio
+   latents, with the request fingerprint.
+2. Little Monkey downloads the original LBH-123-AI 3D learned H3 resizer
+   on first use to a profile-scoped cache. Its weight revision is
+   `3f941d5d182014dd5c0a5e16330420ee2d4aa0c6`, size 690592672
+   bytes, SHA-256
+   `043e5a48e161610ef6c3ea974645220354d06fa618abca15f76d084812eb55c2`.
+   The loader rejects an invalid or partial file. Code attribution and MIT
+   text: `licenses/h3-latent-upscaler-MIT.txt`.
+3. The native PyTorch 3D network applies the extra 24-channel H3
+   normalization required by the published weights, infers the 2× latent
+   lift (24×42 → 48×84 spatial cells), then reverses normalization.
+   It chunks the temporal dimension on long clips with overlapping seams.
+4. A calibrated 3-step H3 video sigma tail (0.9035, 0.6316, 0.3158, 0)
+   and corresponding audio shift initialize and denoise the result at
+   768×1344. The previously used plain trilinear resize + 10% noise is
+   **not** a fallback: invalid weights stop the job. Existing completed
+   preview checkpoints may be reused only when their fingerprint matches.
+
+This trained checkpoint is calibrated for **exactly eight preview and three
+refinement evaluations**. Single-pass inference still supports the ordinary
+step options. CUDA and substantial system RAM/VRAM are required; the
+native checkpoint is not included in the application binary. EU/UK/US/KR
+restrictions on **VDN-H3 inference model weights** remain in force even if
+the upscaler's own MIT license is permissive.
+
+### Validation limits
+
+The Python tests exercise pure CPU model forward passes with a tiny
+weight-compatible architecture, strict file checks, latent time geometry,
+chunking and schedule restoration. They do **not** establish real H3 GPU
+video quality, audio continuity, exact trained checkpoint loading on CUDA,
+or visual parity with FreeVideo. Those require an eligible machine,
+licensed model weights and rendered video comparisons.
+
 ## Security and lifecycle contracts
 
 - Backend authorizes territory and signed entitlements **before** any model
   code loads and repeats the check throughout inference, including before
   media publication.
-- The only remotely loaded model is `OpenVDN/vdn-minimax-h3`. Python model
+- The native learned two-pass path additionally downloads the 3D upscaler
+  weights only from `LBH-123-AI/Minimax_h3_latent_Upscaler` at a pinned
+  immutable revision. It verifies the exact 690592672-byte file with SHA-256.
+  The standalone inference code is part of Little Monkey; it does **not**
+  import or start FreeVideo/ComfyUI.
+- Upstream VDN model
   dependencies and remote code are separate user-installed third-party
   components with their own supply-chain risks.
 - Python arguments are passed through `tokio::process::Command` directly,
