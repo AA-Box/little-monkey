@@ -29,6 +29,13 @@ class MemoryPolicyTests(unittest.TestCase):
         self.assertFalse(worker.is_cuda_oom(RuntimeError("file out of memory")))
         self.assertFalse(worker.is_cuda_oom(RuntimeError("CUDA illegal access")))
 
+    def test_disk_spill_requires_low_ram_and_sufficient_disk(self):
+        gib = 1024 ** 3
+        self.assertTrue(worker.should_disk_offload(32 * gib, 140 * gib))
+        self.assertFalse(worker.should_disk_offload(32 * gib, 80 * gib))
+        self.assertFalse(worker.should_disk_offload(128 * gib, 140 * gib))
+        self.assertFalse(worker.should_disk_offload(None, 140 * gib))
+
     def test_rejects_negative_memory(self):
         with self.assertRaises(ValueError):
             worker.choose_memory_policy(-1, fp8=False, offload=False,
