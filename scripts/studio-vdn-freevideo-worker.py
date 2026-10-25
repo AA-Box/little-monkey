@@ -84,7 +84,7 @@ def media_request(args):
 
 def command(args, prompt_path, media_path):
     return [
-        sys.executable, "-m", "freevideo_engine.cli", "generate",
+        sys.executable, "-m", "freevideo_engine", "generate",
         "--prompt-file", str(prompt_path),
         "--cache", str(Path(args.cache).resolve()),
         "--media", str(media_path),
