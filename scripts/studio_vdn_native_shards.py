@@ -101,6 +101,15 @@ def instantiate_meta_component(cls, repo, subfolder, revision=None, *,
                                      revision=revision)
     if dtype is not None:
         module.to(dtype=dtype)
+        # Honor Diffusers' checkpoint-specific mixed-precision contract.
+        # H3's timestep MLP, patch input/output projections and RoPE stay
+        # float32; downcasting them would degrade or invalidate predictions.
+        import torch
+        pinned = tuple(getattr(module, "_keep_in_fp32_modules", ()) or ())
+        if pinned:
+            for qualified, submodule in module.named_modules():
+                if any(pattern in qualified for pattern in pinned):
+                    submodule.to(dtype=torch.float32)
     # Model constructors can register buffers on CPU despite meta context;
     # no fallback to allocating the full model is permitted.
     import torch
