@@ -32,7 +32,7 @@ class NativePlacementTests(unittest.TestCase):
 
     def test_no_auto_int8_without_torchao_or_adequate_host_memory(self):
         self.assertNotIn("int8_cpu", self.choose(torchao_available=False))
-        self.assertNotIn("int8_cpu", self.choose(ram=32, disk=240, mode="auto"))
+        self.assertNotIn("int8_cpu", self.choose(ram=64, disk=240, mode="auto"))
 
     def test_fp8_is_rejected_on_non_hopper(self):
         with self.assertRaisesRegex(ValueError, "9.0"):
