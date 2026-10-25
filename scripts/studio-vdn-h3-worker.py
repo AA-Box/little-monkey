@@ -88,7 +88,71 @@ def parse_args(argv=None):
     return args
 
 
+def choose_memory_policy(free_bytes, *, fp8, offload, fp8_supported):
+    """Choose an actual fallback without requiring a GPU in unit tests.
+
+    Offloading is preferable to an optimistic resident load below 40 GiB.
+    FP8 is only considered on devices whose capability was checked at runtime.
+    """
+    if free_bytes < 0:
+        raise ValueError("CUDA free memory must be nonnegative")
+    return {
+        "offload": bool(offload or free_bytes < 40 * 1024 ** 3),
+        "fp8": bool(fp8 and fp8_supported),
+    }
+
+
+def is_cuda_oom(error):
+    """Restrict retry to CUDA allocation failures, not arbitrary model errors."""
+    return "out of memory" in str(error).lower() and (
+        "cuda" in str(error).lower() or "cublas" in str(error).lower()
+    )
+
+
 def run(args):
+    import gc
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("VDN-H3 requires a CUDA GPU")
+    free_bytes, _ = torch.cuda.mem_get_info()
+    major, _ = torch.cuda.get_device_capability()
+    if args.fp8 and major < 9:
+        raise RuntimeError("VDN FP8 requires a CUDA device with compute capability 9.0+")
+    policy = choose_memory_policy(
+        free_bytes, fp8=args.fp8, offload=args.offload_dit,
+        fp8_supported=major >= 9,
+    )
+    args.offload_dit = policy["offload"]
+    print(json.dumps({"phase": "memory_plan", "freeVramBytes": free_bytes,
+                      "offloadDit": args.offload_dit, "fp8": args.fp8}),
+          flush=True)
+    try:
+        return _run_once(args)
+    except RuntimeError as error:
+        if not is_cuda_oom(error):
+            raise
+        # Rebuild all model components instead of trying to reuse a model
+        # after a partially completed CUDA operation.
+        if not args.offload_dit:
+            args.offload_dit = True
+            fallback = "cpu_block_offload"
+        elif not args.fp8 and major >= 9:
+            args.fp8 = True
+            fallback = "fp8_with_cpu_block_offload"
+        else:
+            raise RuntimeError(
+                "VDN exhausted CUDA memory with the available offload/precision "
+                "modes; reduce the clip size or use a larger GPU"
+            ) from error
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(json.dumps({"phase": "oom_retry", "strategy": fallback}),
+              flush=True)
+        return _run_once(args)
+
+
+def _run_once(args):
     # Import only AFTER the host has decided the license permits execution.
     # Do not import or initialize CUDA in '--self-test' mode.
     import numpy as np
