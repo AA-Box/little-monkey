@@ -289,3 +289,73 @@ def attach_native_lora(model, files, *, scale=1.0):
             module.register_forward_hook(apply_lora)
             found += 1
     return found
+
+
+
+def load_native_h3_components(pipe, denoiser_partition, *, device, fp8=False,
+                              lora_files=(), video_vram_bytes=0):
+    """Instantiate all four generation models on meta, then register direct hooks.
+
+    Diffusers uses these models unchanged. H3/Qwen are BF16 by default;
+    the two original VAEs stay FP32. Exactly one copy of their original
+    SafeTensors checkpoint shards is retained in the HF model cache.
+    """
+    import torch
+    from diffusers import (MiniMaxH3Transformer3DModel,
+                           AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio)
+    from transformers import Qwen3VLForConditionalGeneration
+    from studio_vdn_disk_loader import component_spec_source
+    from studio_vdn_decoder import install_lowmem_decoders
+
+    if denoiser_partition not in ("transformer", "transformer_ref"):
+        raise ValueError("Unsupported H3 checkpoint partition")
+    registry = {
+        denoiser_partition: (MiniMaxH3Transformer3DModel, False, torch.bfloat16),
+        "text_encoder": (Qwen3VLForConditionalGeneration, True, torch.bfloat16),
+        "vae": (AutoencoderKLMiniMaxH3, False, torch.float32),
+        "audio_vae": (AutoencoderKLMiniMaxH3Audio, False, torch.float32),
+    }
+    attached = {}
+    info = {}
+    for name, (cls, transformers_model, precision) in registry.items():
+        repo, folder, revision = component_spec_source(pipe, name)
+        store = OriginalShardStore.from_hub(repo, folder, revision)
+        model = instantiate_meta_component(
+            cls, repo, folder, revision, transformers_model=transformers_model,
+            dtype=precision)
+        hooked = NativeOriginalShardHooks(
+            model, store, device=device,
+            fp8=(bool(fp8) and name in (denoiser_partition, "text_encoder")),
+            component=name)
+        pipe.update_components(**{name: model})
+        attached[name] = hooked
+        info[name] = {"mappedParameters": len(hooked.weight_names),
+                      "forwardModules": hooked.layers,
+                      "originalShards": len(store.files),
+                      "dtype": str(precision)}
+    if lora_files:
+        info["loraPairs"] = attach_native_lora(
+            getattr(pipe, denoiser_partition), lora_files)
+    install_lowmem_decoders(
+        pipe.vae, pipe.audio_vae, free_vram=video_vram_bytes)
+    # ModularPipeline.device normally reads the first parameter, which is
+    # meta when no layer is executing. Keep pipeline state CUDA while each
+    # individual parameter is directly sourced at its forward hook.
+    cuda_device = torch.device(device)
+    base = type(pipe)
+    class NativeOriginalShardPipeline(base):
+        @property
+        def device(self):
+            return cuda_device
+
+        @property
+        def _execution_device(self):
+            return cuda_device
+    pipe.__class__ = NativeOriginalShardPipeline
+    # Hold references for job lifetime; hook closures also retain them.
+    pipe._little_monkey_original_shard_hooks = attached
+    print(json.dumps({"phase": "native_original_shards_ready",
+                      "mode": "native_original_no_offload_copy",
+                      "components": info, "fp8": bool(fp8)}),
+          flush=True)
+    return info
