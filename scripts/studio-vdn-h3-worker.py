@@ -18,6 +18,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import shutil
+import tempfile
 
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 FPS = 24
@@ -102,6 +104,24 @@ def choose_memory_policy(free_bytes, *, fp8, offload, fp8_supported):
     }
 
 
+def available_host_ram():
+    """Estimate available RAM without importing heavyweight optional packages."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as mem:
+            for line in mem:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def should_disk_offload(available_ram, free_disk):
+    """Bound disk spill to hosts with enough actual working storage."""
+    return (available_ram is not None and available_ram < 64 * 1024 ** 3
+            and free_disk >= 128 * 1024 ** 3)
+
+
 def is_cuda_oom(error):
     """Restrict retry to CUDA allocation failures, not arbitrary model errors."""
     return "out of memory" in str(error).lower() and (
@@ -124,33 +144,43 @@ def run(args):
         fp8_supported=major >= 9,
     )
     args.offload_dit = policy["offload"]
+    available_ram = available_host_ram()
+    free_disk = shutil.disk_usage(Path(args.output).parent).free
+    args.disk_offload = args.offload_dit and should_disk_offload(available_ram, free_disk)
     print(json.dumps({"phase": "memory_plan", "freeVramBytes": free_bytes,
+                      "hostRamAvailableBytes": available_ram,
+                      "diskFreeBytes": free_disk,
+                      "diskOffload": args.disk_offload,
                       "offloadDit": args.offload_dit, "fp8": args.fp8}),
           flush=True)
-    try:
-        return _run_once(args)
-    except RuntimeError as error:
-        if not is_cuda_oom(error):
-            raise
-        # Rebuild all model components instead of trying to reuse a model
-        # after a partially completed CUDA operation.
-        if not args.offload_dit:
-            args.offload_dit = True
-            fallback = "cpu_block_offload"
-        elif not args.fp8 and major >= 9:
-            args.fp8 = True
-            fallback = "fp8_with_cpu_block_offload"
-        else:
-            raise RuntimeError(
-                "VDN exhausted CUDA memory with the available offload/precision "
-                "modes; reduce the clip size or use a larger GPU"
-            ) from error
-        gc.collect()
-        torch.cuda.empty_cache()
-        print(json.dumps({"phase": "oom_retry", "strategy": fallback}),
-              flush=True)
-        return _run_once(args)
-
+    # Isolate each attempt's spilled weights in an automatically cleaned folder.
+    with tempfile.TemporaryDirectory(prefix="vdn-layer-spill-",
+                                     dir=Path(args.output).parent) as cache:
+        args.disk_offload_path = cache if args.disk_offload else None
+        try:
+            return _run_once(args)
+        except RuntimeError as error:
+            if not is_cuda_oom(error):
+                raise
+            if not args.offload_dit:
+                args.offload_dit = True
+                strategy = "cpu_block_offload"
+            elif not args.fp8 and major >= 9:
+                args.fp8 = True
+                strategy = "fp8_with_cpu_block_offload"
+            elif not args.disk_offload and free_disk >= 128 * 1024 ** 3:
+                args.disk_offload = True
+                strategy = "disk_layer_spill"
+            else:
+                raise RuntimeError(
+                    "VDN exceeded available CUDA memory after bounded retries; "
+                    "use fewer frames or a larger GPU"
+                ) from error
+            args.disk_offload_path = cache if args.disk_offload else None
+            gc.collect()
+            torch.cuda.empty_cache()
+            print(json.dumps({"phase": "oom_retry", "strategy": strategy}), flush=True)
+            return _run_once(args)
 
 def _run_once(args):
     # Import only AFTER the host has decided the license permits execution.
@@ -197,7 +227,8 @@ def _run_once(args):
     if args.offload_dit:
         apply_group_offloading(pipe.transformer, onload_device=device,
                                offload_device="cpu", offload_type="block_level",
-                               num_blocks_per_group=1, use_stream=True)
+                               num_blocks_per_group=1, use_stream=True,
+                               offload_to_disk_path=args.disk_offload_path)
     else:
         pipe.transformer.to(device)
 
