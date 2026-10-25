@@ -321,8 +321,12 @@ def load_native_h3_components(pipe, denoiser_partition, *, device, fp8=False,
     from diffusers import (MiniMaxH3Transformer3DModel,
                            AutoencoderKLMiniMaxH3, AutoencoderKLMiniMaxH3Audio)
     from transformers import Qwen3VLForConditionalGeneration
-    from studio_vdn_disk_loader import component_spec_source
-    from studio_vdn_decoder import install_lowmem_decoders
+    # In the app the Rust host embeds all native source files into one
+    # standalone script. Source-tree testing still permits sibling imports.
+    if "component_spec_source" not in globals():
+        from studio_vdn_disk_loader import component_spec_source
+    if "install_lowmem_decoders" not in globals():
+        from studio_vdn_decoder import install_lowmem_decoders
 
     if denoiser_partition not in ("transformer", "transformer_ref"):
         raise ValueError("Unsupported H3 checkpoint partition")
