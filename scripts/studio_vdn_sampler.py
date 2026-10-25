@@ -47,7 +47,7 @@ class NativeStepStore:
                  video_shape, audio_shape):
         self.root = Path(root)
         if not self.root.is_absolute() or not (stage in ("single", "preview", "refine")
-                or re.fullmatch(r"temporal_[0-7]", stage)):
+                or re.fullmatch(r"temporal_[0-7](?:_(?:preview|refine))?", stage)):
             raise ValueError("Unsafe native H3 step checkpoint root or stage")
         self.stage = stage
         self.identity = identity
