@@ -121,6 +121,22 @@ async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
     Ok((request, Some(dest)))
 }
 
+/// The direct renderer checks this immediately after acquiring the shared
+/// engine gate, closing the race between a queued cancellation and subprocess spawn.
+pub(crate) fn is_cancelled(app: &AppHandle, id: &str) -> Result<bool, String> {
+    let _guard = lock().lock().map_err(|e| e.to_string())?;
+    let dir = directory(app)?;
+    if !path(&dir, id)?.exists() { return Ok(false); }
+    Ok(matches!(load(&dir, id)?.status, VdnJobStatus::Cancelled))
+}
+
+fn published_entry(app: &AppHandle, id: &str) -> Result<Option<String>, String> {
+    Ok(crate::generation_commands::generation_gallery(app.clone())?
+        .into_iter()
+        .find(|entry| entry.video_job_id.as_deref() == Some(id))
+        .map(|entry| entry.entry_id))
+}
+
 fn dispatch(app: AppHandle, id: String) {
     let already = active().lock().map(|mut running| !running.insert(id.clone())).unwrap_or(true);
     if already { return; }
@@ -132,6 +148,18 @@ fn dispatch(app: AppHandle, id: String) {
             Ok(())
         });
         if let Ok(j) = job {
+            // Gallery publication is the durable commit point. Recover a crash
+            // between writing the gallery and updating this journal idempotently.
+            if let Ok(Some(entry_id)) = published_entry(&app, &id) {
+                let _ = modify(&app, &id, |record| {
+                    record.status = VdnJobStatus::Completed;
+                    record.result_entry_id = Some(entry_id);
+                    record.error = None;
+                    Ok(())
+                });
+                if let Ok(mut active) = active().lock() { active.remove(&id); }
+                return;
+            }
             let result = match prepare_continuation(&app, &j).await {
                 Ok((request, scratch)) => {
                     let result = crate::studio_vdn::generation_vdn_run(app.clone(), request).await;
@@ -141,7 +169,9 @@ fn dispatch(app: AppHandle, id: String) {
                 Err(error) => Err(error),
             };
             let _ = modify(&app, &id, |j| {
-                if matches!(j.status, VdnJobStatus::Cancelled) { return Ok(()); }
+                if matches!(j.status, VdnJobStatus::Cancelled) && result.is_err() {
+                    return Ok(());
+                }
                 match &result {
                     Ok(entry) => {
                         j.result_entry_id = Some(entry.entry_id.clone());
@@ -223,6 +253,15 @@ pub fn start_background_recovery(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let Ok(jobs) = list(&app) else { return; };
         for j in jobs {
+            if let Ok(Some(entry_id)) = published_entry(&app, &j.id) {
+                let _ = modify(&app, &j.id, |record| {
+                    record.status = VdnJobStatus::Completed;
+                    record.result_entry_id = Some(entry_id);
+                    record.error = None;
+                    Ok(())
+                });
+                continue;
+            }
             match j.status {
                 VdnJobStatus::Running => {
                     if let Ok(updated) = modify(&app, &j.id, |j| {
