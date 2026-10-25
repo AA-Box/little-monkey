@@ -82,31 +82,12 @@ def media_request(args):
     return value
 
 
-def task_for(args):
-    has_audio = bool(args.reference_audio)
-    has_visual = bool(args.refs or args.reference_video)
-    if has_audio and has_visual:
-        return "ref2va_av"
-    if has_audio:
-        return "ref2va_audio"
-    if has_visual:
-        return "ref2va"
-    if args.first and args.last:
-        return "fl2va"
-    if args.first:
-        return "i2va"
-    if args.last:
-        return "l2va"
-    return "t2va"
-
-
 def command(args, prompt_path, media_path):
     return [
         sys.executable, "-m", "freevideo_engine", "generate",
         "--prompt-file", str(prompt_path),
         "--cache", str(Path(args.cache).resolve()),
         "--media", str(media_path),
-        "--task", task_for(args),
         "--out", args.output,
         "--frames", str(args.frames),
         "--seed", str(args.seed),
