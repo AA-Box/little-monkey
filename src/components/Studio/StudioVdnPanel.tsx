@@ -38,6 +38,7 @@ export function StudioVdnPanel({
   const [loraPaths, setLoraPaths] = useState<string[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
+  const [segments, setSegments] = useState(1);
   const [seed, setSeed] = useState("0");
   const [fp8, setFp8] = useState(false);
   const [offload, setOffload] = useState(true);
@@ -150,7 +151,8 @@ export function StudioVdnPanel({
       referenceImagePaths: references,
       referenceVideoPath: referenceVideo,
       referenceAudioPath: referenceAudio,
-      loraPaths, steps, frames, seed: Number(seed) || 0,
+      loraPaths, steps, frames, segments: backend === "diffusers" ? segments : 1,
+      seed: Number(seed) || 0,
       fp8, offloadDit: offload, memoryMode, backend,
       nativeTwoPass: twoPass, refineSteps, refineFromJobId: null,
       repoRoot: repoRoot || null, checkpointRoot: checkpointRoot || null,
@@ -208,7 +210,7 @@ export function StudioVdnPanel({
 
   async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
-        !trustRemoteCode || running) return;
+        !trustRemoteCode || running || (twoPass && segments > 1)) return;
     const id = crypto.randomUUID();
     job.current = id;
     setRunning(true);
@@ -451,7 +453,7 @@ export function StudioVdnPanel({
           )}
         </div>
 
-        <div className="grid gap-2 sm:grid-cols-3">
+        <div className="grid gap-2 sm:grid-cols-4">
           <label className="grid gap-1 text-muted">Model evaluations
             <input type="number" min={1} max={50} value={steps}
               disabled={running || backend !== "diffusers"}
@@ -466,6 +468,16 @@ export function StudioVdnPanel({
                 <option value={value} key={value}>{(value / 24).toFixed(1)} s — {value} frames</option>
               )}
             </select>
+          </label>
+          <label className="grid gap-1 text-muted">Native continuous segments
+            <select value={backend === "diffusers" ? segments : 1}
+              disabled={running || backend !== "diffusers"}
+              className="rounded border border-border bg-background p-1 text-foreground"
+              onChange={(event) => setSegments(Number(event.target.value))}>
+              {[1, 2, 3, 4, 5, 6, 7, 8].map((count) =>
+                <option key={count} value={count}>{count} — {((frames + (count - 1) * (frames - 22)) / 24).toFixed(1)} s</option>)}
+            </select>
+            <span>22-frame native visual overlap, continuous generated stereo audio</span>
           </label>
           <label className="grid gap-1 text-muted">Seed
             <input type="number" min={0} value={seed} disabled={running}
@@ -587,7 +599,7 @@ export function StudioVdnPanel({
             <Play size={13} /> Generate with VDN-H3
           </Button>
           <Button size="sm" variant="secondary"
-            disabled={running || backend !== "diffusers" || !python || !probeInfo || !prompt.trim() ||
+            disabled={running || backend !== "diffusers" || segments > 1 || !python || !probeInfo || !prompt.trim() ||
               licenseReason !== null || !trustRemoteCode}
             onClick={() => void run(true)}>
             <Play size={13} /> Native latent two-pass (reuses pass one)
