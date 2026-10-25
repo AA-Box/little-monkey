@@ -27,7 +27,7 @@ class NativePlacementTests(unittest.TestCase):
         self.assertEqual(self.choose(mode="stream_cpu"), ["stream_cpu"])
 
     def test_forced_disk_without_capacity_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "160 GiB"):
+        with self.assertRaisesRegex(ValueError, "180 GiB"):
             self.choose(disk=10, mode="stream_disk")
 
     def test_no_auto_int8_without_torchao_or_adequate_host_memory(self):
@@ -44,11 +44,14 @@ class NativePlacementTests(unittest.TestCase):
         self.assertFalse(worker.is_cuda_oom(RuntimeError("file out of memory")))
         self.assertFalse(worker.is_cuda_oom(RuntimeError("CUDA illegal memory access")))
 
-    def test_small_host_memory_never_claims_75gb_weights_fit(self):
-        with self.assertRaisesRegex(ValueError, "insufficient"):
-            self.choose(vram=16, ram=16, disk=1000)
+    def test_low_ram_uses_sharded_disk_loader_instead_of_eager_cpu(self):
+        self.assertEqual(self.choose(vram=16, ram=16, disk=1000), ["stream_disk"])
+        with self.assertRaisesRegex(ValueError, "180 GiB"):
+            self.choose(vram=16, ram=16, disk=80, mode="stream_disk")
         with self.assertRaisesRegex(ValueError, "136 GiB"):
             self.choose(vram=24, ram=64, mode="stream_cpu")
+        with self.assertRaisesRegex(ValueError, "insufficient"):
+            self.choose(vram=6, ram=16, disk=1000)
 
     def test_h3_int8_requires_substantial_host_ram(self):
         self.assertIn("int8_cpu", self.choose(ram=112, disk=240))
