@@ -321,7 +321,7 @@ export function StudioVdnPanel({
             <option value="auto">Adaptive GPU / streamed CPU / quantization / disk</option>
             <option value="resident">GPU resident only</option>
             <option value="stream_cpu">Stream blocks from CPU (136 GiB available RAM)</option>
-            <option value="stream_disk">Disk-backed block streaming (160 GiB storage + 40 GiB RAM)</option>
+            <option value="stream_disk">Sharded H3 + Qwen disk loading (180 GiB scratch + 12 GiB free RAM + 8 GiB VRAM)</option>
           </select>
         </label>
         {backend === "diffusers" && <div className="grid gap-2 text-muted">
