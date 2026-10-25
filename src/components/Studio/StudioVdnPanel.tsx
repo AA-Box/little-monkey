@@ -28,6 +28,7 @@ export function StudioVdnPanel({
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
   const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
+  const [continuationMode, setContinuationMode] = useState<"last_frame" | "video_reference">("last_frame");
   const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
   const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
   const [references, setReferences] = useState<string[]>([]);
@@ -169,6 +170,7 @@ export function StudioVdnPanel({
         jobId: id, pythonExecutable: python, prompt: prompt.trim(),
         firstImagePath: first, lastImagePath: last,
         sourceGalleryEntryId: sourceGalleryId,
+        continuationMode,
         referenceImagePaths: references,
         referenceVideoPath: referenceVideo,
         referenceAudioPath: referenceAudio,
@@ -493,7 +495,7 @@ export function StudioVdnPanel({
             </div>
           </div>}
         <label className="grid gap-1 text-muted">
-          Continue from a previous Gallery clip (true final frame)
+          Continue from a previous Gallery clip
           <select className="rounded border border-border bg-background p-1 text-foreground"
             value={sourceGalleryId ?? ""} disabled={running || Boolean(first)}
             onChange={(event) => setSourceGalleryId(event.target.value || null)}>
@@ -505,6 +507,15 @@ export function StudioVdnPanel({
             )}
           </select>
         </label>
+        {sourceGalleryId && backend === "diffusers" && <label className="grid gap-1 text-muted">
+          Native continuation strategy
+          <select value={continuationMode} disabled={running}
+            className="rounded border border-border bg-background p-1 text-foreground"
+            onChange={(event) => setContinuationMode(event.target.value as typeof continuationMode)}>
+            <option value="last_frame">Last video frame (FL2VA)</option>
+            <option value="video_reference">Reference original video motion and audio (Ref2VA)</option>
+          </select>
+        </label>}
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />
