@@ -288,19 +288,27 @@ for _sig in (signal.SIGTERM, signal.SIGINT):
 
 
 def checkpoint_identity(args):
-    """Tie a latent checkpoint to its prompt, seed, input file bytes and geometry."""
+    """Content-address the original request, never scratch-file job paths."""
     digest = hashlib.sha256()
-    for value in (args.prompt, args.frames, args.seed, args.steps,
-                  args.first, args.last, args.reference_video, args.reference_audio):
+    for value in (args.prompt, args.frames, args.seed, args.steps):
         digest.update(str(value).encode("utf-8"))
         digest.update(b"\\0")
-    for item in (*args.refs, *args.lora, args.first, args.last,
-                 args.reference_video, args.reference_audio):
-        if not item:
+    media = [
+        ("first", args.first), ("last", args.last),
+        ("reference_video", args.reference_video),
+        ("reference_audio", args.reference_audio),
+        *[("ref", path) for path in args.refs],
+        *[("lora", path) for path in args.lora],
+    ]
+    for kind, file in media:
+        digest.update(kind.encode("ascii"))
+        if not file:
+            digest.update(b"none")
             continue
-        with open(item, "rb") as handle:
-            for piece in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(piece)
+        with open(file, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\\0")
     return digest.hexdigest()
 
 
