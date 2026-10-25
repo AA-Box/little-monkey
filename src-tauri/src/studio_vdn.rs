@@ -25,7 +25,7 @@ const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py"
 
 /// An independent real rendering runtime. Each shares licensing, cancellation
 /// and gallery storage; none is implemented by relabeling the Diffusers mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VdnBackend {
     #[default]
@@ -84,7 +84,7 @@ fn worker_args(
 }
 
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VdnRunRequest {
     pub job_id: String,
@@ -193,6 +193,10 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     let first = validate_image(&request.first_image_path)?;
     let last = validate_image(&request.last_image_path)?;
     Ok((python, first, last))
+}
+
+pub(crate) fn validate_for_durable_submit(request: &VdnRunRequest) -> Result<(), String> {
+    validate_request(request).map(|_| ())
 }
 
 fn valid_mp4(bytes: &[u8]) -> bool {
