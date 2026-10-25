@@ -29,6 +29,9 @@ import hashlib
 # staged worker. Running the checked-in Python script directly imports the
 # same Little Monkey-owned implementation from the adjacent source file.
 if "native_sampler_recovery" not in globals():
+    # unittest loads this file by spec_from_file_location and does not add
+    # scripts/ to sys.path. Resolve only the sibling app-owned source module.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from studio_vdn_sampler import (
         native_sampler_recovery, clear_native_sampler_stage,
     )
