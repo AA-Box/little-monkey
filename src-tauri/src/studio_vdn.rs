@@ -244,6 +244,10 @@ pub async fn generation_vdn_run(
         request.checkpoint_root.as_deref(),
         request.gpu_class.as_deref(), request.server_port,
     )?;
+    // Coordinate with native Durable Video Jobs. VDN must never consume or
+    // replace GPU resources concurrently with an active managed video render.
+    // The guard is held until publication/cleanup, including cancellation.
+    let _video_engine_guard = crate::studio_video_jobs::engine_gate().lock().await;
     let (cancel, _registration) = register(&request.job_id)?;
     let directory = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-vdn-h3");
