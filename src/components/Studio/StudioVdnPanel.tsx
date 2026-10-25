@@ -27,6 +27,8 @@ export function StudioVdnPanel({
   const [prompt, setPrompt] = useState("");
   const [first, setFirst] = useState<string | null>(null);
   const [last, setLast] = useState<string | null>(null);
+  const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
+  const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
   const [seed, setSeed] = useState("0");
@@ -61,6 +63,8 @@ export function StudioVdnPanel({
   useEffect(() => {
     void refreshLicense();
     void studioClient.vdnJobs().then(setDurableJobs).catch(() => {});
+    void studioClient.gallery().then((entries) => setAvailableClips(entries.filter((entry) =>
+      entry.mediaType === "video/mp4" || entry.mediaType === "video/webm"))).catch(() => {});
     let active = true;
     let unlisten: (() => void) | undefined;
     void listen<PhaseEvent>("studio://vdn-progress", (event) => {
@@ -135,6 +139,7 @@ export function StudioVdnPanel({
         prompt: prompt.trim(),
         firstImagePath: first,
         lastImagePath: last,
+        sourceGalleryEntryId: sourceGalleryId,
         steps,
         frames,
         seed: Number(seed) || 0,
@@ -382,6 +387,19 @@ export function StudioVdnPanel({
           </label>}
         </div>
 
+        <label className="grid gap-1 text-muted">
+          Continue from a previous Gallery clip (true final frame)
+          <select className="rounded border border-border bg-background p-1 text-foreground"
+            value={sourceGalleryId ?? ""} disabled={running || Boolean(first)}
+            onChange={(event) => setSourceGalleryId(event.target.value || null)}>
+            <option value="">No previous clip</option>
+            {availableClips.map((entry) =>
+              <option key={entry.entryId} value={entry.entryId}>
+                {entry.prompt.slice(0, 48)} · {entry.entryId.slice(-8)}
+              </option>
+            )}
+          </select>
+        </label>
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
             onChange={(event) => setTrustRemoteCode(event.target.checked)} />
