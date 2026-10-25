@@ -36,6 +36,10 @@ def parse_args(argv=None):
     parser.add_argument("--output", default="")
     parser.add_argument("--first", default="")
     parser.add_argument("--last", default="")
+    parser.add_argument("--refs", nargs="+", default=[])
+    parser.add_argument("--reference-video", default="")
+    parser.add_argument("--reference-audio", default="")
+    parser.add_argument("--lora", action="append", default=[])
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--frames", type=int, default=141)
     parser.add_argument("--seed", type=int, default=0)
@@ -89,9 +93,15 @@ def parse_args(argv=None):
         parser.error("Frame count must be a supported 17n+5 value (120..360)")
     if args.device != "cuda":
         parser.error("This worker currently supports CUDA only; use native Wan for macOS")
-    for path in (args.first, args.last):
-        if path and (not Path(path).is_file() or Path(path).stat().st_size > 32 * 1024 * 1024):
-            parser.error("Keyframe must exist and be smaller than 32 MB")
+    if (args.first or args.last) and (args.refs or args.reference_video or args.reference_audio):
+        parser.error("Keyframe and Ref2VA conditioning cannot be combined in one inference")
+    if args.reference_audio and not (args.refs or args.reference_video):
+        parser.error("Ref2VA audio requires an image or video reference")
+    if len(args.refs) > 9 or len(args.lora) > 4:
+        parser.error("Ref2VA supports at most nine image references and four LoRA adapters")
+    for path in (args.first, args.last, *args.refs, args.reference_video, args.reference_audio, *args.lora):
+        if path and (not Path(path).is_file() or Path(path).stat().st_size > (256 * 1024 * 1024 if path == args.reference_video else 64 * 1024 * 1024)):
+            parser.error("Reference/keyframe must be an existing bounded local file")
     return args
 
 
@@ -214,9 +224,15 @@ def run(args):
                 "--output", args.output, "--frames", str(args.frames),
                 "--steps", str(args.steps), "--seed", str(args.seed),
                 "--device", args.device]
-    for flag, value in (("--first", args.first), ("--last", args.last)):
+    for flag, value in (("--first", args.first), ("--last", args.last),
+                        ("--reference-video", args.reference_video),
+                        ("--reference-audio", args.reference_audio)):
         if value:
             original.extend([flag, value])
+    if args.refs:
+        original.extend(["--refs", *args.refs])
+    for lora in args.lora:
+        original.extend(["--lora", lora])
     for tier in plans:
         argv = [sys.executable, "-u", *original, "--internal-attempt", tier]
         if tier == "fp8_cpu":
@@ -264,6 +280,17 @@ def _run_once(args):
     if not torch.cuda.is_available():
         raise RuntimeError("VDN-H3 requires a CUDA GPU. Choose Wan on this machine.")
     keyframes = {}
+    references = []
+    if args.refs or args.reference_video or args.reference_audio:
+        from diffusers.modular_pipelines.minimax_h3.references import (
+            MiniMaxH3ImageReference, MiniMaxH3VideoReference, MiniMaxH3AudioReference,
+        )
+        for path in args.refs:
+            references.append(MiniMaxH3ImageReference.from_file(path))
+        if args.reference_video:
+            references.append(MiniMaxH3VideoReference.from_file(args.reference_video))
+        if args.reference_audio:
+            references.append(MiniMaxH3AudioReference.from_file(args.reference_audio))
     if args.first or args.last:
         from diffusers.utils import load_image
         if args.first:
@@ -272,12 +299,25 @@ def _run_once(args):
             keyframes["last_image"] = load_image(args.last)
 
     print(json.dumps({"phase": "loading", "model": MODEL_REPOSITORY}), flush=True)
-    pipe = ModularPipeline.from_pretrained(
-        MODEL_REPOSITORY, workflow="fl2va" if keyframes else "t2va")
+    mode = "ref2va" if references else "fl2va" if keyframes else "t2va"
+    print(json.dumps({"phase": "conditioning", "workflow": mode,
+                      "images": len(args.refs), "videos": bool(args.reference_video),
+                      "audio": bool(args.reference_audio)}), flush=True)
+    pipe = ModularPipeline.from_pretrained(MODEL_REPOSITORY, workflow=mode)
     kwargs = {"trust_remote_code": True, "torch_dtype": torch.bfloat16}
     if args.fp8:
-        kwargs["fp8"] = {"transformer": True}
+        kwargs["fp8"] = {"transformer_ref" if references else "transformer": True}
     pipe.load_components(**kwargs)
+    denoiser = getattr(pipe, "transformer_ref" if references else "transformer", None)
+    if denoiser is None:
+        raise RuntimeError("Selected VDN weights do not contain the required "
+                           "Ref2VA transformer partition; refusing unconditioned fallback")
+    for lora in args.lora:
+        if not lora.endswith(".safetensors"):
+            raise RuntimeError("LoRA must be a safetensors file")
+        if not hasattr(pipe, "load_lora_weights"):
+            raise RuntimeError("Installed Diffusers lacks native H3 LoRA loading")
+        pipe.load_lora_weights(lora)
     if args.int8:
         try:
             from torchao.quantization import Int8WeightOnlyConfig, quantize_
@@ -287,9 +327,9 @@ def _run_once(args):
             ) from error
         print(json.dumps({"phase": "quantizing", "precision": "int8_weight_only"}),
               flush=True)
-        quantize_(pipe.transformer, Int8WeightOnlyConfig())
+        quantize_(denoiser, Int8WeightOnlyConfig())
     if any(getattr(pipe, name, None) is None for name in
-           ("text_encoder", "vae", "audio_vae", "transformer")):
+           ("text_encoder", "vae", "audio_vae")):
         raise RuntimeError("An OpenVDN component did not load successfully.")
 
     device = torch.device(args.device)
@@ -302,7 +342,7 @@ def _run_once(args):
 
     def decoder_back(module, inputs):
         vae.offload()
-    pipe.transformer.register_forward_pre_hook(decoder_back)
+    denoiser.register_forward_pre_hook(decoder_back)
     if args.offload_dit:
         stream_kwargs = {
             "onload_device": device, "offload_device": "cpu",
@@ -311,9 +351,9 @@ def _run_once(args):
         }
         if args.disk_offload_path:
             stream_kwargs["offload_to_disk_path"] = args.disk_offload_path
-        apply_group_offloading(pipe.transformer, **stream_kwargs)
+        apply_group_offloading(denoiser, **stream_kwargs)
     else:
-        pipe.transformer.to(device)
+        denoiser.to(device)
 
     print(json.dumps({"phase": "sampling", "steps": args.steps,
                       "frames": args.frames}), flush=True)
@@ -323,7 +363,7 @@ def _run_once(args):
         num_inference_steps=args.steps + 1,
         generator=torch.Generator(device).manual_seed(args.seed),
         output=["videos", "audio", "sampling_rate"],
-        **keyframes,
+        **({"references": references} if references else keyframes),
     ).values()
 
     frames = torch.from_numpy(np.stack([np.asarray(frame) for frame in videos[0]]))
