@@ -95,6 +95,7 @@ fn worker_args(
 
 
 fn default_native_memory_mode() -> String { "auto".into() }
+fn default_native_refine_steps() -> u32 { 3 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,6 +122,12 @@ pub struct VdnRunRequest {
     pub offload_dit: bool,
     #[serde(default = "default_native_memory_mode")]
     pub memory_mode: String,
+    #[serde(default)]
+    pub native_two_pass: bool,
+    #[serde(default = "default_native_refine_steps")]
+    pub refine_steps: u32,
+    #[serde(default)]
+    pub refine_from_job_id: Option<String>,
     #[serde(default)]
     pub backend: VdnBackend,
     #[serde(default)]
@@ -208,6 +215,19 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     }
     if !matches!(request.memory_mode.as_str(), "auto" | "resident" | "stream_cpu" | "stream_disk") {
         return Err("Invalid Little Monkey native memory policy".into());
+    }
+    if request.native_two_pass && request.backend != VdnBackend::Diffusers {
+        return Err("Little Monkey native latent refinement currently requires Diffusers".into());
+    }
+    if request.refine_from_job_id.is_some() && !request.native_two_pass {
+        return Err("Refine-from requires native two-pass".into());
+    }
+    if !(1..=12).contains(&request.refine_steps) {
+        return Err("Native refinement requires 1..12 steps".into());
+    }
+    if let Some(prior) = &request.refine_from_job_id {
+        uuid::Uuid::parse_str(prior).map_err(|_| "Invalid native preview job ID")?;
+        if prior == &request.job_id { return Err("Cannot refine from own job ID".into()); }
     }
     if request.seed < 0 {
         return Err("VDN seed must be nonnegative".into());
@@ -383,6 +403,18 @@ pub async fn generation_vdn_run(
         .kill_on_drop(true);
     if request.backend == VdnBackend::Diffusers {
         process.arg("--memory-mode").arg(&request.memory_mode);
+        if request.native_two_pass {
+            let checkpoints = directory.join("latent-checkpoints");
+            std::fs::create_dir_all(&checkpoints).map_err(|e| e.to_string())?;
+            process.arg("--two-pass").arg("--refine-steps").arg(request.refine_steps.to_string());
+            process.arg("--checkpoint").arg(checkpoints.join(format!("{}.safetensors", request.job_id)));
+            if let Some(prior) = &request.refine_from_job_id {
+                if !crate::studio_vdn_jobs::completed_with_preview(&app, prior)? {
+                    return Err("Refine-from requires a completed native two-pass source job".into());
+                }
+                process.arg("--refine-from").arg(checkpoints.join(format!("{prior}.safetensors")));
+            }
+        }
     }
     if request.backend == VdnBackend::Diffusers && request.offload_dit {
         process.arg("--offload-dit");
@@ -602,6 +634,9 @@ mod tests {
             fp8: false,
             offload_dit: true,
             memory_mode: "auto".into(),
+            native_two_pass: false,
+            refine_steps: 3,
+            refine_from_job_id: None,
             backend: VdnBackend::Diffusers,
             repo_root: None,
             checkpoint_root: None,
