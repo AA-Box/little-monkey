@@ -348,7 +348,7 @@ pub async fn generation_vdn_run(
                     Err("VDN worker output is not a valid MP4 header".into())
                 } else {
                     crate::generation_commands::publish_vdn_video(
-                        &app, &request.prompt, request.steps, request.seed,
+                        &app, &request.job_id, &request.prompt, request.steps, request.seed,
                         request.frames, first.is_some(), &bytes
                     )
                 }
