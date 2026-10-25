@@ -39,6 +39,12 @@ if "native_sampler_recovery" not in globals():
 if "install_native_h3_tiles" not in globals():
     from studio_vdn_lowmem import install_native_h3_tiles, weight_stream_policy
 
+if "low_ram_disk_budget" not in globals():
+    from studio_vdn_disk_loader import (
+        low_ram_disk_budget, disk_component_kwargs, verify_model_indexes,
+        assert_disk_mapped_components,
+    )
+
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
 REF_MODEL_REPOSITORY = "MiniMaxAI/MiniMax-H3"
@@ -218,8 +224,8 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
     # disappear. The INT8 documented recipe needs about 75 GB host memory.
     cpu_ok = host_ram is not None and host_ram >= 136 * GiB
     quant_cpu_ok = host_ram is not None and host_ram >= 80 * GiB
-    disk_ok = (host_ram is not None and host_ram >= 40 * GiB
-               and disk_free >= 160 * GiB)
+    disk_ok = (host_ram is not None and host_ram >= 12 * GiB
+               and disk_free >= 180 * GiB and free_vram >= 8 * GiB)
     resident_ok = (host_ram is not None and host_ram >= 68 * GiB
                    and free_vram >= (48 if fp8 else 78) * GiB)
     plans = []
@@ -236,7 +242,7 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
         add("fp8_cpu" if fp8 else "stream_cpu")
     elif mode == "stream_disk":
         if not disk_ok:
-            raise ValueError("Disk streaming needs 160 GiB free storage and 40 GiB available host RAM")
+            raise ValueError("Disk streaming requires 8 GiB free VRAM, 12 GiB available RAM and 180 GiB free storage")
         add("fp8_disk" if fp8 else "stream_disk")
     else:
         if not offload and resident_ok:
@@ -573,6 +579,18 @@ def _run_once(args):
                       "hybridVDN": not references}), flush=True)
     pipe = ModularPipeline.from_pretrained(checkpoint, workflow=mode)
     denoiser_partition = "transformer_ref" if references else "transformer"
+    if args.disk_offload and args.fp8:
+        # The native disk-dispatch path requires exact pre-sharded SafeTensors
+        # representations, not a silent unvalidated FP8 conversion.
+        raise RuntimeError("Native FP8 disk-dispatched loading is not validated; use BF16 stream_disk or FP8 CPU tier")
+    if args.disk_offload:
+        # These are the actual MiniMax-H3 and Qwen component sources selected
+        # by ModularPipeline, not guessed paths inside the VDN model repo.
+        verified = verify_model_indexes(pipe, denoiser_partition)
+        print(json.dumps({"phase": "native_shard_indexes_verified",
+                          "components": {k: {"tensors": v["tensors"],
+                                            "shards": v["shards"]}
+                                         for k, v in verified.items()}}), flush=True)
     if args.int8:
         # The documented H3 consumer-GPU recipe quantizes BOTH large models
         # during loading. Quantizing just the transformer after loading all
@@ -606,13 +624,32 @@ def _run_once(args):
             ),
         })
     kwargs = {"trust_remote_code": True, "dtype": torch.bfloat16}
+    if args.disk_offload:
+        budget = low_ram_disk_budget(
+            torch.cuda.mem_get_info()[0], available_host_ram(),
+            shutil.disk_usage(args.disk_offload_path).free)
+        kwargs.update(disk_component_kwargs(
+            denoiser_partition, args.disk_offload_path, budget))
+        print(json.dumps({"phase": "native_disk_weight_loading",
+                          "weightLoader": "sharded_safetensors_accelerate_dispatch",
+                          "cudaPerComponentBytes": budget["cuda_model_bytes"],
+                          "cpuPerComponentBytes": budget["cpu_model_bytes"]}),
+              flush=True)
     if args.fp8:
         kwargs["fp8"] = {denoiser_partition: True}
     pipe.load_components(**kwargs)
+    if args.disk_offload:
+        # No continuation into sampling unless both original components
+        # REALLY have disk-dispatched layers. Avoid false-positive support.
+        report = assert_disk_mapped_components(pipe, denoiser_partition)
+        print(json.dumps({"phase": "native_disk_weight_loaded",
+                          "components": report}), flush=True)
     denoiser = getattr(pipe, denoiser_partition, None)
     if denoiser is None:
         raise RuntimeError("Selected VDN weights do not contain the required "
                            "Ref2VA transformer partition; refusing unconditioned fallback")
+    if args.disk_offload and args.lora:
+        raise RuntimeError("LoRA injection into disk-dispatched H3 has not been validated; use CPU-stream tier")
     for lora in args.lora:
         if not lora.endswith(".safetensors"):
             raise RuntimeError("LoRA must be a safetensors file")
@@ -652,7 +689,11 @@ def _run_once(args):
         text_stream_kwargs["offload_to_disk_path"] = str(text_path)
     # Stream the language-model layers; Qwen's visual encoder is invoked by
     # the same real Diffusers text-encoding block.
-    apply_group_offloading(pipe.text_encoder.model, **text_stream_kwargs)
+    if not args.disk_offload:
+        # Accelerate's disk-dispatched modules already carry execution
+        # hooks. Installing an additional Diffusers group hook here would
+        # conflict and can load all weights again.
+        apply_group_offloading(pipe.text_encoder.model, **text_stream_kwargs)
     _, vae = cpu_offload_with_hook(pipe.vae, execution_device=device)
     cpu_offload_with_hook(pipe.audio_vae, execution_device=device,
                           prev_module_hook=vae)
@@ -660,7 +701,7 @@ def _run_once(args):
     def decoder_back(module, inputs):
         vae.offload()
     denoiser.register_forward_pre_hook(decoder_back)
-    if args.offload_dit:
+    if args.offload_dit and not args.disk_offload:
         stream_kwargs = {
             "onload_device": device, "offload_device": "cpu",
             "offload_type": "block_level",
@@ -672,7 +713,7 @@ def _run_once(args):
             dit_path.mkdir(parents=True, exist_ok=True)
             stream_kwargs["offload_to_disk_path"] = str(dit_path)
         apply_group_offloading(denoiser, **stream_kwargs)
-    else:
+    elif not args.disk_offload:
         denoiser.to(device)
 
     print(json.dumps({"phase": "sampling", "steps": args.steps,
