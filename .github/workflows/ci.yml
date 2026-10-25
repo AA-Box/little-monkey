@@ -64,6 +64,9 @@ jobs:
       - name: VDN adaptive memory policy tests
         run: python3 -m unittest discover -s tests -p test_studio_vdn_memory.py
 
+      - name: Native VDN memory, reference and latent-checkpoint contracts
+        run: python3 -m unittest discover -s tests -p "test_studio_vdn_native_contract.py"
+
       - name: Syntax-check live real-model benchmark harness (no model mocks)
         run: pnpm test:swarm-models:syntax
 
