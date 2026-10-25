@@ -257,6 +257,14 @@ pub async fn generation_vdn_run(
     // replace GPU resources concurrently with an active managed video render.
     // The guard is held until publication/cleanup, including cancellation.
     let _video_engine_guard = crate::studio_video_jobs::engine_gate().lock().await;
+    if crate::studio_vdn_jobs::is_cancelled(&app, &request.job_id)? {
+        return Err("VDN job was cancelled before GPU allocation".into());
+    }
+    // Old direct callers cannot silently ignore a gallery continuation.
+    if request.source_gallery_entry_id.is_some() {
+        return Err("Submit video continuation through the durable VDN queue".into());
+    }
+    crate::generation_commands::ensure_vdn_usage(&app)?;
     let (cancel, _registration) = register(&request.job_id)?;
     let directory = app.profile_data_dir().map_err(|error| error.to_string())?
         .join("studio-vdn-h3");
