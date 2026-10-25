@@ -307,6 +307,34 @@ def checkpoint_identity(args):
     return digest.hexdigest()
 
 
+def validate_reference_media(args):
+    """Bound decoded media size/duration before allocating video/audio tensors."""
+    if args.reference_video or args.reference_audio:
+        import av
+        for media in (args.reference_video, args.reference_audio):
+            if not media:
+                continue
+            with av.open(media) as container:
+                seconds = (container.duration / av.time_base
+                           if container.duration is not None else None)
+                if seconds is None or seconds <= 0 or seconds > 30:
+                    raise RuntimeError("Reference media duration must be known and at most 30 seconds")
+                if media == args.reference_video:
+                    stream = next((v for v in container.streams if v.type == "video"), None)
+                    if stream is None:
+                        raise RuntimeError("Reference video does not contain video frames")
+                    if stream.width * stream.height > 1920 * 1080:
+                        raise RuntimeError("Reference video exceeds 1080p safety bound")
+                    if stream.frames and stream.frames > 900:
+                        raise RuntimeError("Reference video exceeds 900 frames")
+    if args.refs:
+        from PIL import Image
+        for source in args.refs:
+            with Image.open(source) as photo:
+                if photo.width * photo.height > 16_777_216:
+                    raise RuntimeError("Reference image exceeds 16 megapixels")
+
+
 def native_two_pass(pipe, args, torch, device, keyframes, references):
     """Native latent-space two-pass using Diffusers' actual MiniMax-H3 state I/O.
 
@@ -402,6 +430,7 @@ def _run_once(args):
     keyframes = {}
     references = []
     if args.refs or args.reference_video or args.reference_audio:
+        validate_reference_media(args)
         from diffusers.modular_pipelines.minimax_h3.references import (
             MiniMaxH3ImageReference, MiniMaxH3VideoReference, MiniMaxH3AudioReference,
         )
