@@ -55,6 +55,9 @@ jobs:
       - name: Verify optimized VDN, Ulysses and real SGLang video API contracts
         run: python3 scripts/test-studio-vdn-fast-worker.py
 
+      - name: VDN adaptive memory policy tests
+        run: python3 -m unittest discover -s tests -p test_studio_vdn_memory.py
+
       - name: Syntax-check live real-model benchmark harness (no model mocks)
         run: pnpm test:swarm-models:syntax
 
