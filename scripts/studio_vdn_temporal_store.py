@@ -63,16 +63,19 @@ def _save(path, tensors, metadata):
 
 
 def _read(path, schema):
-    from safetensors import safe_open
+    from safetensors import safe_open, SafetensorError
     p = Path(path)
     if (not p.is_absolute() or p.is_symlink() or not p.is_file() or
             not 128 <= p.stat().st_size <= MAX_BYTES):
         raise ValueError("Unsafe or absent native H3 AV snapshot")
-    with safe_open(str(p), framework="pt", device="cpu") as handle:
-        metadata = handle.metadata() or {}
-        if metadata.get("schema") != schema:
-            raise ValueError("Invalid native H3 AV snapshot schema")
-        values = {key: handle.get_tensor(key) for key in handle.keys()}
+    try:
+        with safe_open(str(p), framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+            if metadata.get("schema") != schema:
+                raise ValueError("Invalid native H3 AV snapshot schema")
+            values = {key: handle.get_tensor(key) for key in handle.keys()}
+    except (SafetensorError, RuntimeError) as error:
+        raise ValueError("Corrupt native H3 Safetensors snapshot") from error
     if (any(str(v.dtype) != "torch.float32" for v in values.values()) or
             metadata.get("payload_sha256") != digest(values)):
         raise ValueError("Corrupt native H3 snapshot payload")
