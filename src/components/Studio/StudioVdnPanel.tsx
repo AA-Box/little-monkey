@@ -29,6 +29,7 @@ export function StudioVdnPanel({
   const [last, setLast] = useState<string | null>(null);
   const [references, setReferences] = useState<string[]>([]);
   const [referenceVideo, setReferenceVideo] = useState<string | null>(null);
+  const [referenceAudio, setReferenceAudio] = useState<string | null>(null);
   const [loraPaths, setLoraPaths] = useState<string[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
@@ -91,7 +92,10 @@ export function StudioVdnPanel({
         python, backend, repoRoot || null, checkpointRoot || null,
         gpuClass, serverPort,
       );
-      if (backend === "sglang") {
+      if (backend === "free_video_adaptive") {
+        setProbeInfo("Installed FreeVideo adaptive runtime detected; actual model readiness is checked at execution.");
+        setGpuFp8(false);
+      } else if (backend === "sglang") {
         setProbeInfo(`Serving ${report.model} through 127.0.0.1:${report.port ?? serverPort}`);
         setGpuFp8(false);
         setFp8(false);
@@ -140,6 +144,7 @@ export function StudioVdnPanel({
         lastImagePath: last,
         referenceImagePaths: references,
         referenceVideoPath: referenceVideo,
+        referenceAudioPath: referenceAudio,
         loraPaths,
         steps,
         frames,
@@ -243,9 +248,22 @@ export function StudioVdnPanel({
             <option value="optimized_single">OpenVDN tuned kernels — Linux, one large CUDA GPU</option>
             <option value="optimized_ulysses">OpenVDN Ulysses — Linux, 8 H200/B200 GPUs</option>
             <option value="sglang">SGLang Diffusion — local accelerated server (1/2/4/8 GPUs)</option>
+            <option value="free_video_adaptive">Adaptive FreeVideo — multimodal references and low-memory runtime</option>
           </select>
         </label>
 
+        {backend === "free_video_adaptive" && <label className="grid gap-1 text-muted">
+          Prepared FreeVideo model cache
+          <div className="flex gap-2">
+            <input className="min-w-0 flex-1 rounded border border-border bg-background p-1 text-foreground"
+              value={checkpointRoot} disabled={running}
+              onChange={(event) => { setCheckpointRoot(event.target.value); setProbeInfo(null); }} />
+            <Button size="sm" variant="secondary" disabled={running}
+              onClick={() => void chooseFile((value) => { setCheckpointRoot(value); setProbeInfo(null); }, true)}>
+              Choose cache
+            </Button>
+          </div>
+        </label>}
         {(backend === "optimized_single" || backend === "optimized_ulysses") && (
           <div className="grid gap-2">
             <label className="grid gap-1 text-muted">
@@ -383,7 +401,7 @@ export function StudioVdnPanel({
           </label>}
         </div>
 
-        {(backend === "optimized_single" || backend === "optimized_ulysses") &&
+        {(backend === "optimized_single" || backend === "optimized_ulysses" || backend === "free_video_adaptive") &&
           <div className="grid gap-1 text-muted">
             <span>Reference images/video (native OpenVDN Ref2VA, visual frame conditioning)</span>
             <div className="flex items-center gap-2">
@@ -402,6 +420,12 @@ export function StudioVdnPanel({
                 onClick={() => void chooseFile(setReferenceVideo)}>Choose video</Button>
               {referenceVideo && <Button size="sm" variant="secondary" disabled={running}
                 onClick={() => setReferenceVideo(null)}>Remove video</Button>}
+              {backend === "free_video_adaptive" && <>
+                <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => void chooseFile(setReferenceAudio)}>Choose audio reference</Button>
+                {referenceAudio && <Button size="sm" variant="secondary" disabled={running}
+                  onClick={() => setReferenceAudio(null)}>Remove audio</Button>}
+              </>}
             </div>
           </div>}
         {(backend === "optimized_single" || backend === "optimized_ulysses") &&
