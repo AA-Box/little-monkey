@@ -36,7 +36,9 @@ if "native_sampler_recovery" not in globals():
         native_sampler_recovery, clear_native_sampler_stage,
     )
 if "render_temporal_video" not in globals():
-    from studio_vdn_temporal import render_temporal_video, temporal_frame_plan
+    from studio_vdn_temporal import render_temporal_video, temporal_frame_plan, capture_context
+if "save_context" not in globals():
+    from studio_vdn_temporal_store import save_context, preview_fallback
 
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
@@ -59,6 +61,11 @@ def parse_args(argv=None):
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--frames", type=int, default=141)
     parser.add_argument("--segments", type=int, default=1)
+    parser.add_argument("--job-id", default="")
+    parser.add_argument("--temporal-context-out", default="")
+    parser.add_argument("--temporal-context-in", default="")
+    parser.add_argument("--temporal-source-video-sha256", default="")
+    parser.add_argument("--temporal-source-job-id", default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--offload-dit", action="store_true")
@@ -133,10 +140,32 @@ def parse_args(argv=None):
         temporal_frame_plan(args.frames, args.segments)
     except ValueError as error:
         parser.error(str(error))
-    if args.segments > 1 and args.two_pass:
-        parser.error("Native multi-segment continuity cannot share one two-pass checkpoint")
+    if args.segments > 1 and args.two_pass and (not args.checkpoint or not Path(args.checkpoint).is_absolute()):
+        parser.error("Native two-pass continuity needs a checkpoint root")
     if args.segments > 1 and args.last:
         parser.error("A fixed last-frame keyframe is unsupported in multi-segment native continuity")
+    if args.temporal_context_out:
+        import uuid
+        if not Path(args.temporal_context_out).is_absolute():
+            parser.error("Native temporal output must be app-owned and absolute")
+        try:
+            if str(uuid.UUID(args.job_id)) != args.job_id:
+                parser.error("Native temporal output requires a canonical job UUID")
+        except ValueError:
+            parser.error("Native temporal output requires a canonical job UUID")
+    if args.temporal_context_in:
+        import uuid
+        if (not Path(args.temporal_context_in).is_absolute() or
+                len(args.temporal_source_video_sha256) != 64 or
+                any(ch not in "0123456789abcdef" for ch in args.temporal_source_video_sha256)):
+            parser.error("Native continuation requires a pinned snapshot and video hash")
+        try:
+            if str(uuid.UUID(args.temporal_source_job_id)) != args.temporal_source_job_id:
+                parser.error("Invalid native source job ID")
+        except ValueError:
+            parser.error("Invalid native source job ID")
+    elif args.temporal_source_video_sha256 or args.temporal_source_job_id:
+        parser.error("Unexpected temporal source metadata without a snapshot")
     if args.step_checkpoint_root and not Path(args.step_checkpoint_root).is_absolute():
         parser.error("Native step checkpoint location must be absolute and app-owned")
     if args.refine_from and not args.two_pass:
@@ -299,6 +328,7 @@ def run(args):
     original = [str(Path(__file__).resolve()), "--prompt", args.prompt,
                 "--output", args.output, "--frames", str(args.frames),
                 "--segments", str(args.segments),
+                "--job-id", args.job_id,
                 "--steps", str(args.steps), "--seed", str(args.seed),
                 "--device", args.device]
     for flag, value in (("--first", args.first), ("--last", args.last),
@@ -306,7 +336,11 @@ def run(args):
                         ("--reference-audio", args.reference_audio),
                         ("--checkpoint", args.checkpoint),
                         ("--step-checkpoint-root", args.step_checkpoint_root),
-                        ("--refine-from", args.refine_from)):
+                        ("--refine-from", args.refine_from),
+                        ("--temporal-context-out", args.temporal_context_out),
+                        ("--temporal-context-in", args.temporal_context_in),
+                        ("--temporal-source-video-sha256", args.temporal_source_video_sha256),
+                        ("--temporal-source-job-id", args.temporal_source_job_id)):
         if value:
             original.extend([flag, value])
     if args.refs:
@@ -352,13 +386,15 @@ for _sig in (signal.SIGTERM, signal.SIGINT):
 def checkpoint_identity(args):
     """Content-address the original request, never scratch-file job paths."""
     digest = hashlib.sha256()
-    for value in (args.prompt, args.frames, args.segments, args.seed, args.steps):
+    for value in (args.prompt, args.frames, args.segments, args.seed, args.steps, args.refine_steps,
+                  args.temporal_source_video_sha256, args.temporal_source_job_id):
         digest.update(str(value).encode("utf-8"))
         digest.update(b"\\0")
     media = [
         ("first", args.first), ("last", args.last),
         ("reference_video", args.reference_video),
         ("reference_audio", args.reference_audio),
+        ("temporal_source", args.temporal_context_in),
         *[("ref", path) for path in args.refs],
         *[("lora", path) for path in args.lora],
     ]
@@ -502,7 +538,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
         num_inference_steps=args.refine_steps + 1,
         generator=torch.Generator(device).manual_seed(args.seed + 2),
         latents=upscaled, audio_latents=audio_latents,
-        output=["videos", "audio", "sampling_rate"],
+        output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
         **({"references": references} if references else keyframes),
         )
 
@@ -642,10 +678,11 @@ def _run_once(args):
 
     print(json.dumps({"phase": "sampling", "steps": args.steps,
                       "frames": args.frames}), flush=True)
-    if args.segments > 1:
+    if args.segments > 1 or args.temporal_context_in:
         report = render_temporal_video(
             pipe, args, torch, device, keyframes, references, checkpoint,
-            denoiser, encode_video, native_sampler_recovery, clear_native_sampler_stage)
+            denoiser, encode_video, native_sampler_recovery, clear_native_sampler_stage,
+            checkpoint_identity(args))
         print(json.dumps({"phase": "completed", "path": args.output,
                           "frames": report["videos"], "fps": FPS,
                           "audioSamples": report["audioSamples"],
@@ -659,7 +696,7 @@ def _run_once(args):
             prompt=args.prompt, num_frames=args.frames,
             num_inference_steps=args.steps + 1,
             generator=torch.Generator(device).manual_seed(args.seed),
-            output=["videos", "audio", "sampling_rate"],
+            output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
             **({"references": references} if references else keyframes),
             )
     videos, audio, sample_rate = (sample["videos"], sample["audio"],
@@ -677,6 +714,10 @@ def _run_once(args):
     if not temporary.is_file() or temporary.stat().st_size < 32:
         raise RuntimeError("OpenVDN produced no video bytes")
     os.replace(temporary, output)
+    if args.temporal_context_out:
+        captured = capture_context(sample["latents"], sample["audio_latents"], 0, args.frames)
+        save_context(args.temporal_context_out, captured, preview_fallback(captured),
+                     output, checkpoint, args.job_id, args.frames)
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
     print(json.dumps({"phase": "completed", "path": str(output),
                       "frames": len(videos[0]), "fps": FPS}), flush=True)
