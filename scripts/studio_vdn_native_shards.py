@@ -303,14 +303,23 @@ def attach_native_lora(model, files, *, scale=1.0):
                 b_shape[1] != a_shape[0]):
                 raise ValueError("Incompatible LoRA rank/target " + prefix)
             rank = a_shape[0]
+            with safe_open(str(path), framework="pt", device="cpu") as src:
+                alpha_keys = [key for key in (prefix + ".alpha",
+                                              prefix + ".lora_alpha") if key in keys]
+                if len(alpha_keys) > 1:
+                    raise ValueError("Ambiguous LoRA alpha for " + prefix)
+                alpha = float(src.get_tensor(alpha_keys[0]).item()) if alpha_keys else float(rank)
+            if not 0 < alpha <= 4096:
+                raise ValueError("Unsafe LoRA alpha for " + prefix)
+            adapter_scale = scale * alpha / rank
 
             def apply_lora(_module, inputs, output, _path=str(path),
-                           _a=pair["A"], _b=pair["B"], _r=rank):
+                           _a=pair["A"], _b=pair["B"], _scale=adapter_scale):
                 from safetensors import safe_open
                 with safe_open(_path, framework="pt", device="cpu") as src:
                     a = src.get_tensor(_a).to(inputs[0].device, inputs[0].dtype)
                     b = src.get_tensor(_b).to(inputs[0].device, inputs[0].dtype)
-                return output + F.linear(F.linear(inputs[0], a), b) * (scale / _r)
+                return output + F.linear(F.linear(inputs[0], a), b) * _scale
 
             module.register_forward_hook(apply_lora)
             found += 1
