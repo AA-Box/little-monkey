@@ -241,6 +241,8 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
             raise ValueError("CPU streaming needs 136 GiB available host RAM (80 GiB FP8)")
         add("fp8_cpu" if fp8 else "stream_cpu")
     elif mode == "stream_disk":
+        if fp8:
+            raise ValueError("FP8 disk-dispatched loading is not supported; choose BF16 disk streaming")
         if not disk_ok:
             raise ValueError("Disk streaming requires 8 GiB free VRAM, 12 GiB available RAM and 180 GiB free storage")
         add("fp8_disk" if fp8 else "stream_disk")
@@ -253,8 +255,8 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
             add("stream_cpu")
         if not fp8 and torchao_available and quant_cpu_ok:
             add("int8_cpu")
-        if disk_ok:
-            add("fp8_disk" if fp8 else "stream_disk")
+        if disk_ok and not fp8:
+            add("stream_disk")
     if not plans:
         raise ValueError("Native H3 requires substantial host RAM or disk-backed model streaming; available resources are insufficient")
     return plans
