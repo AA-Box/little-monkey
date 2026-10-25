@@ -386,7 +386,7 @@ for _sig in (signal.SIGTERM, signal.SIGINT):
 def checkpoint_identity(args):
     """Content-address the original request, never scratch-file job paths."""
     digest = hashlib.sha256()
-    for value in (args.prompt, args.frames, args.segments, args.seed, args.steps, args.refine_steps,
+    for value in (args.prompt, args.frames, args.segments, args.seed, args.steps,
                   args.temporal_source_video_sha256, args.temporal_source_job_id):
         digest.update(str(value).encode("utf-8"))
         digest.update(b"\\0")
