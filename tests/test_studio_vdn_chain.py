@@ -64,6 +64,7 @@ class NativeChainMuxTests(unittest.TestCase):
                 expected_parent_sha256=parent_sha)
             self.assertEqual(result["frames"], 40)
             self.assertEqual(result["audioSamples"], chain.samples_for_frames(40))
+            self.assertIsInstance(result["videoStreamCopy"], bool)
             with av.open(str(joined)) as clip:
                 frame_count = sum(1 for _ in clip.decode(video=0))
             self.assertEqual(frame_count, 40)
@@ -80,6 +81,31 @@ class NativeChainMuxTests(unittest.TestCase):
                 chain.join_native_chain(first, second, root / "bad2.mp4",
                                         parent_frames=25, child_frames=16,
                                         expected_parent_sha256=parent_sha)
+
+    def test_bounded_pcm_generator_matches_legacy_seam_exactly(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            original = root / "first.mp4"
+            later = root / "later.mp4"
+            self.sample(original, 72, 25)
+            self.sample(later, 48, 82)
+            with av.open(str(original)) as first, av.open(str(later)) as second:
+                blocks = list(chain._fixed_audio_blocks(chain._stream_joined_audio(
+                    first, second, chain.samples_for_frames(72),
+                    chain.samples_for_frames(120) - chain.samples_for_frames(72))))
+            self.assertTrue(blocks)
+            self.assertTrue(all(0 < block.shape[1] <= 1024 for block in blocks))
+            self.assertEqual(sum(block.shape[1] for block in blocks),
+                             chain.samples_for_frames(120))
+            with av.open(str(original)) as first, av.open(str(later)) as second:
+                previous = chain._get_audio(first, chain.samples_for_frames(72))
+                child = chain._get_audio(second, chain.samples_for_frames(120) -
+                                        chain.samples_for_frames(72))
+            chain._smooth_seam(previous, child)
+            reference = np.concatenate((previous, child), axis=1)
+            actual = np.concatenate(blocks, axis=1)
+            self.assertTrue(np.allclose(actual, reference, atol=2e-6),
+                            "Streaming PCM differs from the exact seam algorithm")
 
     def test_clock_exact_and_seam_length(self):
         self.assertEqual(chain.samples_for_frames(24), 32000)
