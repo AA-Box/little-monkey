@@ -5,11 +5,22 @@ permissions:
   contents: read
 
 on:
+  push:
+    paths:
+      - "scripts/studio-vdn-h3-worker.py"
+      - "scripts/studio_vdn_*.py"
+      - "tests/test_studio_vdn_*.py"
+      - ".github/workflows/vdn-native-check.yml"
   pull_request:
     paths:
       - "scripts/studio-vdn-h3-worker.py"
       - "scripts/studio_vdn_sampler.py"
       - "scripts/studio_vdn_learned_upscaler.py"
+      - "scripts/studio_vdn_lowmem.py"
+      - "scripts/studio_vdn_disk_loader.py"
+      - "scripts/studio_vdn_decoder.py"
+      - "scripts/studio_vdn_stream_encode.py"
+      - "scripts/studio_vdn_native_shards.py"
       - "scripts/studio-vdn-fast-worker.py"
       - "src-tauri/src/studio_vdn.rs"
       - "src-tauri/src/studio_vdn_jobs.rs"
@@ -26,13 +37,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax-check owned Python workers
         run: |
-          python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py scripts/studio_vdn_sampler.py scripts/studio_vdn_learned_upscaler.py
+          python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py scripts/studio_vdn_sampler.py scripts/studio_vdn_lowmem.py scripts/studio_vdn_disk_loader.py scripts/studio_vdn_native_shards.py scripts/studio_vdn_decoder.py scripts/studio_vdn_learned_upscaler.py scripts/studio_vdn_stream_encode.py
           python3 - <<'PY'
           from pathlib import Path
           native = Path("scripts/studio_vdn_sampler.py").read_text()
+          lowmem = Path("scripts/studio_vdn_lowmem.py").read_text()
+          disk_loader = Path("scripts/studio_vdn_disk_loader.py").read_text()
+          original_shards = Path("scripts/studio_vdn_native_shards.py").read_text()
+          decoder = Path("scripts/studio_vdn_decoder.py").read_text()
+          stream_mp4 = Path("scripts/studio_vdn_stream_encode.py").read_text()
           upscaler = Path("scripts/studio_vdn_learned_upscaler.py").read_text()
           worker = Path("scripts/studio-vdn-h3-worker.py").read_text()
-          compile(native + "\n" + upscaler + "\n" + worker, "staged-vdn-worker.py", "exec")
+          compile(native + "\n" + lowmem + "\n" + disk_loader + "\n" + original_shards + "\n" + decoder + "\n" + stream_mp4 + "\n" + upscaler + "\n" + worker, "staged-vdn-worker.py", "exec")
           PY
       - name: Run actual worker subprocess input contracts
         run: python3 scripts/test-studio-vdn-h3-worker.py
@@ -40,5 +56,28 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -p "test_studio_vdn_memory.py"
           python3 -m unittest discover -s tests -p "test_studio_vdn_native_contract.py"
-          python3 -m unittest discover -s tests -p "test_studio_vdn_learned_upscaler.py"
           python3 -m unittest discover -s tests -p "test_studio_vdn_sampler.py"
+          python3 -m unittest discover -s tests -p "test_studio_vdn_lowmem.py"
+          python3 -m unittest discover -s tests -p "test_studio_vdn_disk_loader.py"
+          python3 -m unittest discover -s tests -p "test_studio_vdn_learned_upscaler.py"
+
+  native-lowmem-torch-cpu-parity:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PyTorch CPU kernel without downloading model weights
+        run: |
+          python -m pip install --disable-pip-version-check "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --disable-pip-version-check "accelerate>=1.8,<2" safetensors "av>=15,<17" numpy
+      - name: Real full-context attention projection and FFN parity
+        run: |
+          python -m unittest discover -s tests -p "test_studio_vdn_lowmem_torch.py" -v
+          python -m unittest discover -s tests -p "test_studio_vdn_disk_loader_accelerate.py" -v
+          python -m unittest discover -s tests -p "test_studio_vdn_native_shards.py" -v
+          python -m unittest discover -s tests -p "test_studio_vdn_decoder.py" -v
+          python -m unittest discover -s tests -p "test_studio_vdn_stream_encode.py" -v
+          python -m unittest discover -s tests -p "test_studio_vdn_mp4_probe.py" -v

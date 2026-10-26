@@ -176,6 +176,11 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity):
     digest.update(stage.encode("ascii"))
     digest.update(model_identity.encode("utf-8"))
     digest.update(str(args.internal_attempt).encode("ascii"))
+    # Different chunk/KV projection strategies may round differently. A
+    # previously committed trajectory must not cross native tiling settings.
+    for value in (args.lowmem, args.query_chunk, args.head_chunk, args.ff_chunk):
+        digest.update(str(value).encode("ascii"))
+        digest.update(b"\0")
     digest.update(str(diffusers.__version__).encode("ascii"))
     digest.update(str(torch.__version__).encode("ascii"))
     if stage == "refine":

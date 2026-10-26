@@ -252,6 +252,10 @@ export interface VdnGenerationRequest {
   fp8: boolean;
   offloadDit: boolean;
   memoryMode: "auto" | "resident" | "stream_cpu" | "stream_disk";
+  lowmem: "auto" | "off" | "force";
+  queryChunk: number;
+  headChunk: number;
+  ffChunk: number;
   nativeTwoPass: boolean;
   refineSteps: number;
   refineFromJobId: string | null;

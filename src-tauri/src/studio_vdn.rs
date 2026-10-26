@@ -23,6 +23,11 @@ const MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
 const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
 const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py");
 const LEARNED_UPSCALER_SOURCE: &str = include_str!("../../scripts/studio_vdn_learned_upscaler.py");
+const LOWMEM_SOURCE: &str = include_str!("../../scripts/studio_vdn_lowmem.py");
+const DISK_LOADER_SOURCE: &str = include_str!("../../scripts/studio_vdn_disk_loader.py");
+const NATIVE_SHARDS_SOURCE: &str = include_str!("../../scripts/studio_vdn_native_shards.py");
+const DECODER_SOURCE: &str = include_str!("../../scripts/studio_vdn_decoder.py");
+const STREAM_ENCODER_SOURCE: &str = include_str!("../../scripts/studio_vdn_stream_encode.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -51,7 +56,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{LOWMEM_SOURCE}\n{DISK_LOADER_SOURCE}\n{NATIVE_SHARDS_SOURCE}\n{DECODER_SOURCE}\n{STREAM_ENCODER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
@@ -107,6 +112,8 @@ fn worker_args(
 
 
 fn default_native_memory_mode() -> String { "auto".into() }
+fn default_native_lowmem_mode() -> String { "auto".into() }
+fn default_native_ff_chunk() -> u32 { 256 }
 fn default_native_refine_steps() -> u32 { 3 }
 fn default_continuation_mode() -> String { "last_frame".into() }
 
@@ -139,6 +146,14 @@ pub struct VdnRunRequest {
     pub offload_dit: bool,
     #[serde(default = "default_native_memory_mode")]
     pub memory_mode: String,
+    #[serde(default = "default_native_lowmem_mode")]
+    pub lowmem: String,
+    #[serde(default)]
+    pub query_chunk: u32,
+    #[serde(default)]
+    pub head_chunk: u32,
+    #[serde(default = "default_native_ff_chunk")]
+    pub ff_chunk: u32,
     #[serde(default)]
     pub native_two_pass: bool,
     #[serde(default = "default_native_refine_steps")]
@@ -275,6 +290,11 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if let Some(prior) = &request.refine_from_job_id {
         uuid::Uuid::parse_str(prior).map_err(|_| "Invalid native preview job ID")?;
         if prior == &request.job_id { return Err("Cannot refine from own job ID".into()); }
+    }
+    if !matches!(request.lowmem.as_str(), "auto" | "off" | "force")
+        || request.query_chunk > 8192 || request.head_chunk > 128
+        || request.ff_chunk > 4096 {
+        return Err("Invalid native H3 low-memory tiling options".into());
     }
     if request.seed < 0 {
         return Err("VDN seed must be nonnegative".into());
@@ -465,6 +485,10 @@ pub async fn generation_vdn_run(
         .kill_on_drop(true);
     if request.backend == VdnBackend::Diffusers {
         process.arg("--memory-mode").arg(&request.memory_mode);
+        process.arg("--lowmem").arg(&request.lowmem);
+        process.arg("--query-chunk").arg(request.query_chunk.to_string());
+        process.arg("--head-chunk").arg(request.head_chunk.to_string());
+        process.arg("--ff-chunk").arg(request.ff_chunk.to_string());
         let checkpoint_home = directory.join("step-checkpoints");
         std::fs::create_dir_all(&checkpoint_home).map_err(|e| e.to_string())?;
         let root_metadata = std::fs::symlink_metadata(&checkpoint_home)
@@ -785,6 +809,10 @@ mod tests {
             fp8: false,
             offload_dit: true,
             memory_mode: "auto".into(),
+            lowmem: "auto".into(),
+            query_chunk: 0,
+            head_chunk: 0,
+            ff_chunk: 256,
             native_two_pass: false,
             refine_steps: 3,
             refine_from_job_id: None,
