@@ -106,8 +106,13 @@ def preview_fallback(high):
     return low
 
 
-def save_context(path, high, low, video_path, model, job_id, frames):
+def save_context(path, high, low, video_path, model, job_id, frames, identity_sha256=""):
     validate_context(high, low, frames)
+    if identity_sha256 and (
+        len(identity_sha256) != 64 or
+        any(ch not in "0123456789abcdef" for ch in identity_sha256)
+    ):
+        raise ValueError("Invalid native first-frame identity digest")
     with open(video_path, "rb") as source:
         sha = hashlib.sha256()
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -123,10 +128,11 @@ def save_context(path, high, low, video_path, model, job_id, frames):
         "total_frames": str(frames),
         "frame_origin": str(high["frame_origin"]),
         "audio_origin": str(high["audio_origin"]),
+        "identity_sha256": identity_sha256,
     })
 
 
-def load_context(path, video_sha256, model, job_id):
+def load_context(path, video_sha256, model, job_id, identity_sha256=None):
     values, meta = _read(path, SCHEMA)
     if (len(video_sha256) != 64 or
             meta.get("video_sha256") != video_sha256 or
@@ -134,6 +140,8 @@ def load_context(path, video_sha256, model, job_id):
             meta.get("job_id") != job_id or
             set(values) != {"high_video", "high_audio", "low_video", "low_audio"}):
         raise ValueError("Native AV latent source does not match its Gallery artifact")
+    if identity_sha256 is not None and meta.get("identity_sha256") != identity_sha256:
+        raise ValueError("Native source first-frame identity differs from Gallery lineage")
     try:
         frames = int(meta["total_frames"])
         frame_origin = int(meta["frame_origin"])
@@ -145,7 +153,8 @@ def load_context(path, video_sha256, model, job_id):
     low = dict(video=values["low_video"], audio=values["low_audio"],
                frame_origin=frame_origin, audio_origin=tick)
     validate_context(high, low, frames)
-    return dict(high=high, low=low, total_frames=frames)
+    return dict(high=high, low=low, total_frames=frames,
+                identity_sha256=meta.get("identity_sha256", ""))
 
 
 def preview_path(checkpoint, segment):
