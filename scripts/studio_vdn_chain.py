@@ -136,6 +136,21 @@ def _stream_joined_audio(parent, child, expected_parent, expected_child):
     yield from source
 
 
+def _fixed_audio_blocks(chunks):
+    """Feed AAC full-size frames without ever buffering the whole soundtrack."""
+    import numpy as np
+    pending = np.empty((2, 0), dtype=np.float32)
+    for chunk in chunks:
+        if not chunk.shape[1]:
+            continue
+        pending = np.concatenate((pending, chunk), axis=1)
+        while pending.shape[1] >= 1024:
+            yield np.ascontiguousarray(pending[:, :1024])
+            pending = pending[:, 1024:]
+    if pending.shape[1]:
+        yield np.ascontiguousarray(pending)
+
+
 def _smooth_seam(left, right):
     """Repair 10-ms PCM boundary without dropping or duplicating samples."""
     import numpy as np
@@ -218,7 +233,8 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
             cursor = 0
             # Bounded streaming resampler + 10-ms edge only: peak audio
             # memory no longer scales with the size of the parent film.
-            for values in _stream_joined_audio(one, two, expected_parent, expected_child):
+            for values in _fixed_audio_blocks(
+                    _stream_joined_audio(one, two, expected_parent, expected_child)):
                 if not values.shape[1]:
                     continue
                 frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(values),
