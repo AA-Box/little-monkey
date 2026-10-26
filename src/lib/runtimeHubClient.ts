@@ -587,10 +587,21 @@ export interface BenchmarkReport {
   unavailable: BenchmarkFieldNote[];
 }
 
+/** Captured on the Rust side while the measured stream was executing. */
+export interface BenchmarkEvidence {
+  workloadSha256: string;
+  modelDigest: string | null;
+  modelSizeBytes: number;
+  runtimeProcessId: number | null;
+  configuredSettingsSha256: string;
+  completedMeasuredRepeats: number;
+}
+
 /** Mirrors the Rust `M3BenchmarkResponse`. */
 export interface BenchmarkRunResponse {
   report: BenchmarkReport;
   hardware: HardwareSnapshot;
+  evidence: BenchmarkEvidence;
 }
 
 /** Mirrors `benchmark::MachineIdentity` — the stable parts a stored report is valid for. */
@@ -616,6 +627,8 @@ export interface BenchmarkHistoryEntry {
   report: BenchmarkReport;
   machine: BenchmarkMachineIdentity;
   measuredAtMs: number;
+  /** Legacy history lacks this field and is never labelled verified. */
+  evidence: BenchmarkEvidence | null;
   freshness: BenchmarkFreshness;
 }
 
@@ -997,6 +1010,33 @@ export interface M3LoadModelRequest {
   replaceExisting: boolean;
 }
 
+/** Returned by the real load command after the backend accepted these settings. */
+export type M3LoadAttemptOutcome = "success" | "out_of_memory" | "other_failure" | "unsafe_to_retry";
+
+export interface M3LoadAttempt {
+  ordinal: number;
+  contextTokens: number;
+  gpuLayers: number;
+  outcome: M3LoadAttemptOutcome;
+}
+
+export interface M3LoadRecoveryRecord {
+  atMs: number;
+  runtimeId: string;
+  assetId: string;
+  recovered: boolean;
+  attempts: M3LoadAttempt[];
+}
+
+export interface M3LoadExecutionPlan {
+  runtimeId: string;
+  assetId: string;
+  effectiveSettings: Record<string, SettingValue>;
+  offload: OffloadPlan | null;
+  decisions: string[];
+  recoveryAttempts: M3LoadAttempt[];
+}
+
 export interface M3UnloadModelRequest {
   runtimeId: string;
   modelId: string;
@@ -1338,8 +1378,12 @@ export const runtimeHubClient = {
     invoke<M3RuntimeStatusView>("m3_runtime_status", args),
   runtimeInventory: (args: OperationArgs & { runtimeId: string }) =>
     invoke<RuntimeInventory>("m3_runtime_inventory", args),
+  runtimePlanModelLoad: (request: M3LoadModelRequest) =>
+    invoke<M3LoadExecutionPlan>("m3_runtime_plan_model_load", { request }),
   runtimeLoadModel: (args: OperationArgs & { request: M3LoadModelRequest }) =>
-    invoke<void>("m3_runtime_load_model", args),
+    invoke<M3LoadExecutionPlan>("m3_runtime_load_model", args),
+  runtimeLoadRecoveryHistory: () =>
+    invoke<M3LoadRecoveryRecord[]>("m3_runtime_load_recovery_history"),
   runtimeUnloadModel: (args: OperationArgs & { request: M3UnloadModelRequest }) =>
     invoke<void>("m3_runtime_unload_model", args),
   runtimeLogs: (args: OperationArgs & { runtimeId: string; maxBytes: number }) =>

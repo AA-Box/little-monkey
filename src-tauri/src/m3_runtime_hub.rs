@@ -33,7 +33,8 @@ use crate::compatibility_hub::{
 };
 use crate::runtime_adapter::{
     validate_setting_values, AcceleratorKind, AdvancedSettingCapability, HardwareProfile,
-    HardwareSnapshot, KeepAlive, ModelLoadRequest, ModelUnloadRequest, RunningModel,
+    HardwareSnapshot, KeepAlive, LocalOffloadPlanner, MemoryRequirement, ModelLoadRequest,
+    ModelUnloadRequest, OffloadModelProfile, OffloadPlan, OffloadPlanInput, RunningModel,
     RuntimeAdapter, RuntimeCapabilities, RuntimeInventory, RuntimeLogRequest, RuntimeLogTail,
     RuntimeOperationContext, RuntimeOperationLimits, RuntimeStatus, SettingValue, UnloadPolicy,
 };
@@ -1465,6 +1466,98 @@ pub struct M3LoadModelRequest {
     pub asset_id: String,
     pub keep_alive: Option<KeepAlive>,
     pub replace_existing: bool,
+}
+
+/// A live plan for a *specific* installed model and load request. The
+/// effective settings, not just the suggested placement, are passed to the
+/// actual backend. An empty offload plan means the runtime does not expose
+/// controllable llama.cpp placement, or the hardware could not be probed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct M3LoadExecutionPlan {
+    pub runtime_id: String,
+    pub asset_id: String,
+    pub effective_settings: BTreeMap<String, SettingValue>,
+    pub offload: Option<OffloadPlan>,
+    pub decisions: Vec<String>,
+    /// Actual ordered launch attempts. Empty for a preview.
+    #[serde(default)]
+    pub recovery_attempts: Vec<crate::oom_recovery::LoadAttempt>,
+}
+
+/// Apply only backend-supported controls to a llama.cpp load. Never override
+/// an explicit user setting and never mistake guessed layer counts for GGUF
+/// metadata. In particular, the heuristic estimated_total_layers in an
+/// OffloadPlan is *not* the actual GGUF block count.
+fn adaptive_llama_settings(
+    original: &BTreeMap<String, SettingValue>,
+    plan: &OffloadPlan,
+    verified_block_count: Option<u64>,
+    replacing_resident: bool,
+) -> (BTreeMap<String, SettingValue>, Vec<String>) {
+    let mut settings = original.clone();
+    let mut decisions = Vec::new();
+    if replacing_resident {
+        decisions.push(
+            "This load replaces an existing model; live free memory still includes the outgoing              model. Keep explicit/default controls until an after-unload measurement is available."
+                .to_string(),
+        );
+        return (settings, decisions);
+    }
+
+    // The llama.cpp default is 4096; never expand it implicitly. An explicit
+    // context_size (even one larger than the estimate) is user authority and
+    // remains the backend's responsibility to accept or reject.
+    if !settings.contains_key("context_size") && plan.context_tokens < 4_096 {
+        settings.insert(
+            "context_size".to_string(),
+            SettingValue::Integer {
+                value: i64::from(plan.context_tokens),
+            },
+        );
+        decisions.push(format!(
+            "Reduced the implicit llama.cpp context from 4096 to {} tokens              using live free memory and this model's declared footprint.",
+            plan.context_tokens
+        ));
+    }
+
+    // On a discrete GPU, the planner can lower the implicit -ngl -1 when not
+    // all the weights fit. Scale the fraction against the GGUF's actual layer
+    // count, never against a filesize-derived guessed count.
+    let discrete_gpu = matches!(
+        plan.accelerator,
+        AcceleratorKind::Cuda
+            | AcceleratorKind::Rocm
+            | AcceleratorKind::Vulkan
+            | AcceleratorKind::DirectMl
+    );
+    if !settings.contains_key("gpu_layers")
+        && discrete_gpu
+        && plan.available_vram_bytes > 0
+        && plan.gpu_layers < plan.estimated_total_layers
+        && plan.estimated_total_layers > 0
+    {
+        if let Some(blocks) = verified_block_count.filter(|blocks| *blocks > 0 && *blocks <= 999) {
+            let count = blocks
+                .saturating_mul(u64::from(plan.gpu_layers))
+                / u64::from(plan.estimated_total_layers);
+            settings.insert(
+                "gpu_layers".to_string(),
+                SettingValue::Integer {
+                    value: i64::try_from(count).unwrap_or(0),
+                },
+            );
+            decisions.push(format!(
+                "Set GPU offload to {count} of {blocks} verified GGUF blocks                  instead of requesting full offload under the current VRAM budget."
+            ));
+        } else {
+            decisions.push(
+                "No verified GGUF block count; retained llama.cpp's own GPU-layer                  placement rather than applying a guessed count."
+                    .to_string(),
+            );
+        }
+    }
+    (settings, decisions)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3780,11 +3873,172 @@ impl M3RuntimeHub {
         self.runtime(runtime_id)?.inventory(context).await
     }
 
+    /// Loads a model and returns the settings that the backend actually received.
+    /// Keeping the plan as part of the success value makes runtime telemetry
+    /// reflect the *executed* placement, not an earlier UI preview.
+    pub async fn load_model_with_plan(
+        &self,
+        request: &M3LoadModelRequest,
+        context: &M3OperationContext,
+    ) -> M3HubResult<M3LoadExecutionPlan> {
+        use crate::oom_recovery::{self, LoadAttempt, LoadAttemptOutcome, LoadRecoveryRecord};
+        validate_identifier(&request.runtime_id, "runtimeId")?;
+        validate_identifier(&request.asset_id, "assetId")?;
+        // Serialize with uninstall, refresh, and unload. A second load may not
+        // race the status check between an OOM and its recovery attempt.
+        let _mutation = self.mutation_lock.lock().await;
+        let runtime = self.runtime(&request.runtime_id)?;
+        let model = self.resolve_installed_model(&request.asset_id)?;
+        if runtime.descriptor().kind != model.runtime {
+            return Err(M3HubError::Conflict(
+                "selected runtime cannot load this model format".to_string(),
+            ));
+        }
+        let settings = self.runtime_config(&request.runtime_id)?.unwrap_or_default();
+        self.enforce_draft_model_gate(&model, &settings)?;
+        runtime.validate_config(&settings)?;
+        let mut execution = self.build_load_execution_plan(&model, &request.runtime_id, &settings, request.replace_existing)?;
+        let can_recover = model.runtime == M3RuntimeKind::LlamaCpp && request.keep_alive.is_none();
+        let verified_blocks = if can_recover {
+            crate::quantization::sniff_gguf_file(&model.artifact_path)
+                .ok().and_then(|header| header.block_count)
+        } else {
+            None
+        };
+        let gpu_offload_available = execution.offload.as_ref().is_some_and(|plan|
+            plan.accelerator != AcceleratorKind::Cpu
+        );
+        let mut effective = execution.effective_settings.clone();
+
+        for attempt_number in 1..=oom_recovery::MAX_LOAD_ATTEMPTS {
+            context.preflight("load model with OOM recovery")?;
+            runtime.validate_config(&effective)?;
+            let load_result = runtime.load(
+                &model,
+                &effective,
+                request.keep_alive.clone(),
+                request.replace_existing,
+                context,
+            ).await;
+            match load_result {
+                Ok(()) => {
+                    execution.recovery_attempts.push(LoadAttempt::from_settings(
+                        attempt_number, &effective, LoadAttemptOutcome::Success,
+                    ));
+                    execution.effective_settings = effective;
+                    let recovered = attempt_number > 1;
+                    if recovered {
+                        // The original hardware offload estimate described the
+                        // *first* launch, not the recovered settings. Reporting
+                        // it as the executed plan would falsify telemetry.
+                        execution.offload = None;
+                        execution.decisions.push(format!(
+                            "Model loaded after {attempt_number} verified launch attempts with reduced implicit memory settings; the initial offload estimate no longer represents the executed placement."
+                        ));
+                    }
+                    let persistence = self.clock.now_ms().and_then(|at_ms| {
+                        self.append_load_recovery_record(LoadRecoveryRecord {
+                            at_ms,
+                            runtime_id: request.runtime_id.clone(),
+                            asset_id: request.asset_id.clone(),
+                            recovered,
+                            attempts: execution.recovery_attempts.clone(),
+                        })
+                    });
+                    if let Err(error) = persistence {
+                        // Do not report a successfully loaded model as failed.
+                        execution.decisions.push(format!(
+                            "The load succeeded, but the attempt history could not be saved: {error}"
+                        ));
+                    }
+                    return Ok(execution);
+                }
+                Err(error) => {
+                    let is_oom = can_recover && matches!(&error,
+                        M3HubError::Runtime(message) if oom_recovery::classify_managed_llama_oom(message)
+                    );
+                    execution.recovery_attempts.push(LoadAttempt::from_settings(
+                        attempt_number, &effective,
+                        if is_oom { LoadAttemptOutcome::OutOfMemory } else { LoadAttemptOutcome::OtherFailure },
+                    ));
+
+                    // The original error is never hidden by recovery machinery.
+                    // Retry only once we can prove that this specific owned
+                    // process has exited, and the caller's settings are stable.
+                    let next = if is_oom && attempt_number < oom_recovery::MAX_LOAD_ATTEMPTS {
+                        oom_recovery::next_lower_memory_settings(
+                            &settings, &effective, verified_blocks, gpu_offload_available,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(lower) = next {
+                        let unchanged = self.runtime_config(&request.runtime_id)?.unwrap_or_default() == settings;
+                        let stopped = match runtime.status(context).await {
+                            Ok(M3RuntimeStatusView::Adapter { status, running_models }) =>
+                                running_models.is_empty()
+                                && matches!(status.state,
+                                    crate::runtime_adapter::RuntimeLifecycleState::Stopped
+                                    | crate::runtime_adapter::RuntimeLifecycleState::Error
+                                ),
+                            _ => false,
+                        };
+                        if unchanged && stopped && self.resolve_installed_model(&request.asset_id)? == model {
+                            runtime.validate_config(&lower)?;
+                            execution.decisions.push(format!(
+                                "Load attempt {attempt_number} failed with an allocator-confirmed OOM. Retrying with lower implicit context/GPU layers."
+                            ));
+                            effective = lower;
+                            continue;
+                        }
+                        if let Some(last) = execution.recovery_attempts.last_mut() {
+                            last.outcome = LoadAttemptOutcome::UnsafeToRetry;
+                        }
+                    }
+                    let persistence = self.clock.now_ms().and_then(|at_ms| {
+                        self.append_load_recovery_record(LoadRecoveryRecord {
+                            at_ms,
+                            runtime_id: request.runtime_id.clone(),
+                            asset_id: request.asset_id.clone(),
+                            recovered: false,
+                            attempts: execution.recovery_attempts.clone(),
+                        })
+                    }).err();
+                    let suffix = if execution.recovery_attempts.len() > 1 {
+                        format!("; model-load recovery made {} bounded attempts (contexts/GPU layers: {})",
+                            execution.recovery_attempts.len(),
+                            execution.recovery_attempts.iter()
+                                .map(|item| format!("{}/{}", item.context_tokens, item.gpu_layers))
+                                .collect::<Vec<_>>().join(", ")
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let suffix = if let Some(save_error) = persistence {
+                        format!("{suffix}; could not save attempt history: {save_error}")
+                    } else { suffix };
+                    if suffix.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(M3HubError::Runtime(format!("{error}{suffix}")));
+                }
+            }
+        }
+        unreachable!("bounded OOM recovery always returns or retries")
+    }
+
+    /// Backward-compatible hub API for callers that only need success/failure.
     pub async fn load_model(
         &self,
         request: &M3LoadModelRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
+        self.load_model_with_plan(request, context).await.map(|_| ())
+    }
+
+    /// Preview the same per-load settings that the authoritative load path
+    /// applies. This doesn't mutate persisted user configuration.
+    pub fn plan_model_load(&self, request: &M3LoadModelRequest) -> M3HubResult<M3LoadExecutionPlan> {
         validate_identifier(&request.runtime_id, "runtimeId")?;
         validate_identifier(&request.asset_id, "assetId")?;
         let runtime = self.runtime(&request.runtime_id)?;
@@ -3794,19 +4048,105 @@ impl M3RuntimeHub {
                 "selected runtime cannot load this model format".to_string(),
             ));
         }
-        let settings = self
-            .runtime_config(&request.runtime_id)?
-            .unwrap_or_default();
+        let settings = self.runtime_config(&request.runtime_id)?.unwrap_or_default();
         self.enforce_draft_model_gate(&model, &settings)?;
-        runtime
-            .load(
-                &model,
-                &settings,
-                request.keep_alive,
-                request.replace_existing,
-                context,
-            )
-            .await
+        runtime.validate_config(&settings)?;
+        let execution = self.build_load_execution_plan(&model, &request.runtime_id, &settings, request.replace_existing)?;
+        runtime.validate_config(&execution.effective_settings)?;
+        Ok(execution)
+    }
+
+    fn build_load_execution_plan(
+        &self,
+        model: &M3ResolvedModel,
+        runtime_id: &str,
+        settings: &BTreeMap<String, SettingValue>,
+        replace_existing: bool,
+    ) -> M3HubResult<M3LoadExecutionPlan> {
+        let mut result = M3LoadExecutionPlan {
+            runtime_id: runtime_id.to_string(),
+            asset_id: model.asset_id.clone(),
+            effective_settings: settings.clone(),
+            offload: None,
+            decisions: Vec::new(),
+            recovery_attempts: Vec::new(),
+        };
+        if model.runtime != M3RuntimeKind::LlamaCpp {
+            result.decisions.push(
+                "Runtime placement is backend-owned; no unsupported settings were injected."
+                    .to_string(),
+            );
+            return Ok(result);
+        }
+        let inventory = self.list_installed_models()?;
+        let selected = inventory
+            .iter()
+            .find(|entry| entry.asset_id == model.asset_id)
+            .ok_or_else(|| M3HubError::NotFound(format!("model {}", model.asset_id)))?;
+        let hardware = match self.hardware_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                result.decisions.push(format!(
+                    "Hardware probe unavailable ({error}); preserving runtime defaults."
+                ));
+                return Ok(result);
+            }
+        };
+        let requested_context_tokens = match settings.get("context_size") {
+            Some(SettingValue::Integer { value }) => u32::try_from(*value).ok(),
+            _ => Some(4_096),
+        };
+        // Live available RAM/VRAM already reflects resident models; adding
+        // their footprints to 'reserved' would subtract the same memory twice.
+        let projector_memory_bytes = selected
+            .versions
+            .iter()
+            .find(|version| version.active)
+            .and_then(|version| version.estimated_projector_memory_bytes)
+            .unwrap_or(0);
+        let input = OffloadPlanInput {
+            hardware,
+            model: OffloadModelProfile {
+                weights_bytes: model.size_bytes,
+                estimated_ram_bytes: selected.estimated_ram_bytes,
+                estimated_vram_bytes: selected.estimated_vram_bytes,
+                required_accelerator: selected
+                    .required_accelerator
+                    .as_deref()
+                    .map(parse_accelerator)
+                    .transpose()?,
+                has_vision_projector: selected
+                    .versions
+                    .iter()
+                    .any(|version| version.active && version.projector.is_some()),
+                projector_memory_bytes,
+            },
+            reserved: MemoryRequirement {
+                ram_bytes: 0,
+                vram_bytes: 0,
+            },
+            other_resident_count: 0,
+            requested_context_tokens,
+        };
+        let offload = LocalOffloadPlanner::plan(&input).map_err(runtime_error)?;
+        let verified_block_count = match crate::quantization::sniff_gguf_file(&model.artifact_path) {
+            Ok(header) => header.block_count,
+            Err(error) => {
+                result.decisions.push(format!(
+                    "GGUF header cannot be verified for layer sizing ({error}); no GPU-layer override."
+                ));
+                None
+            }
+        };
+        // Only apply adaptive reductions when they can be backed by a live
+        // snapshot and the local GGUF's own header; otherwise the driver owns
+        // the fallbacks. Explicit settings are never silently overwritten.
+        let (applied, mut decisions) =
+            adaptive_llama_settings(settings, &offload, verified_block_count, replace_existing);
+        result.effective_settings = applied;
+        result.decisions.append(&mut decisions);
+        result.offload = Some(offload);
+        Ok(result)
     }
 
     /// Authoritative, server-side half of the speculative-decoding gate: the
@@ -3859,6 +4199,7 @@ impl M3RuntimeHub {
         request: &M3UnloadModelRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
+        let _mutation = self.mutation_lock.lock().await;
         validate_identifier(&request.runtime_id, "runtimeId")?;
         validate_identifier(&request.model_id, "modelId")?;
         self.runtime(&request.runtime_id)?
@@ -3886,10 +4227,60 @@ impl M3RuntimeHub {
         self.runtime(runtime_id)?.metrics(context).await
     }
 
+    /// Bounded, private on-disk attempt audit; no raw model logs, prompts,
+    /// credentials, or inferencing output are written here.
+    pub fn load_recovery_history(&self) -> M3HubResult<Vec<crate::oom_recovery::LoadRecoveryRecord>> {
+        let _guard = lock(&self.state_lock)?;
+        self.read_load_recovery_history()
+    }
+
+    fn read_load_recovery_history(&self) -> M3HubResult<Vec<crate::oom_recovery::LoadRecoveryRecord>> {
+        let path = self.state_root.join("load-recovery-history.json");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(io_at("inspect load recovery history", &path, source)),
+        };
+        if !metadata.file_type().is_file() || metadata.len() > 256 * 1024 {
+            return Err(M3HubError::State(
+                "load recovery history must be a regular file below its size cap".into(),
+            ));
+        }
+        let bytes = fs::read(&path)
+            .map_err(|source| io_at("read load recovery history", &path, source))?;
+        if bytes.len() > 256 * 1024 {
+            return Err(M3HubError::State("load recovery history exceeds its size cap".into()));
+        }
+        let rows: Vec<crate::oom_recovery::LoadRecoveryRecord> = serde_json::from_slice(&bytes)?;
+        if rows.len() > crate::oom_recovery::MAX_LOAD_HISTORY {
+            return Err(M3HubError::State("load recovery history exceeds its entry cap".into()));
+        }
+        Ok(rows)
+    }
+
+    fn append_load_recovery_record(
+        &self,
+        record: crate::oom_recovery::LoadRecoveryRecord,
+    ) -> M3HubResult<()> {
+        let _guard = lock(&self.state_lock)?;
+        let mut history = self.read_load_recovery_history()?;
+        history.push(record);
+        if history.len() > crate::oom_recovery::MAX_LOAD_HISTORY {
+            history.drain(..history.len() - crate::oom_recovery::MAX_LOAD_HISTORY);
+        }
+        let path = self.state_root.join("load-recovery-history.json");
+        atomic_write_private(&path, &canonical_json(&history)?)
+    }
+
     pub fn set_runtime_config(
         &self,
         request: &M3SetRuntimeConfigRequest,
     ) -> M3HubResult<BTreeMap<String, SettingValue>> {
+        // Sync setter cannot wait for an ongoing launch. Refuse to alter
+        // the settings underneath an in-flight recovery sequence.
+        let _mutation = self.mutation_lock.try_lock().map_err(|_| {
+            M3HubError::Conflict("runtime mutation or model load is in progress".into())
+        })?;
         validate_identifier(&request.runtime_id, "runtimeId")?;
         self.runtime(&request.runtime_id)?
             .validate_config(&request.values)?;
@@ -8093,6 +8484,75 @@ mod tests {
                 platform: crate::runtime_adapter::PlatformCapabilities::current(Vec::new()),
             })
         }
+    }
+
+    #[test]
+    fn adaptive_load_respects_user_overrides_and_unknown_layers() {
+        let plan = OffloadPlan {
+            schema_version: 1,
+            accelerator: AcceleratorKind::Cuda,
+            context_tokens: 2_048,
+            requested_context_tokens: 4_096,
+            batch_size: 128,
+            gpu_layers: 14,
+            estimated_total_layers: 28,
+            cpu_spill_layers: 14,
+            projector_placement: crate::runtime_adapter::ProjectorPlacement::NotApplicable,
+            parallel_sequences: 1,
+            available_ram_bytes: 8_000_000_000,
+            available_vram_bytes: 4_000_000_000,
+            device_split: crate::runtime_adapter::DeviceSplit::SingleDevice { index: 0 },
+            rationale: Vec::new(),
+            improvement_suggestions: Vec::new(),
+        };
+        let empty = BTreeMap::new();
+        let (effective, notes) = adaptive_llama_settings(&empty, &plan, Some(40), false);
+        assert_eq!(
+            effective.get("context_size"),
+            Some(&SettingValue::Integer { value: 2_048 })
+        );
+        assert_eq!(
+            effective.get("gpu_layers"),
+            Some(&SettingValue::Integer { value: 20 })
+        );
+        assert_eq!(notes.len(), 2);
+
+        let (unknown_layers, notes) = adaptive_llama_settings(&empty, &plan, None, false);
+        assert!(!unknown_layers.contains_key("gpu_layers"));
+        assert!(notes.iter().any(|text| text.contains("No verified GGUF")));
+
+        let explicit = BTreeMap::from([
+            ("context_size".to_string(), SettingValue::Integer { value: 16_384 }),
+            ("gpu_layers".to_string(), SettingValue::Integer { value: -1 }),
+        ]);
+        let (unchanged, _) = adaptive_llama_settings(&explicit, &plan, Some(40), false);
+        assert_eq!(unchanged, explicit);
+
+        let (replacing, _) = adaptive_llama_settings(&empty, &plan, Some(40), true);
+        assert_eq!(replacing, empty);
+    }
+
+    #[test]
+    fn adaptive_load_does_not_guess_gpu_layers_on_unified_memory() {
+        let plan = OffloadPlan {
+            schema_version: 1,
+            accelerator: AcceleratorKind::Metal,
+            context_tokens: 4_096,
+            requested_context_tokens: 4_096,
+            batch_size: 128,
+            gpu_layers: 1,
+            estimated_total_layers: 40,
+            cpu_spill_layers: 39,
+            projector_placement: crate::runtime_adapter::ProjectorPlacement::NotApplicable,
+            parallel_sequences: 1,
+            available_ram_bytes: 10_000_000_000,
+            available_vram_bytes: 10_000_000_000,
+            device_split: crate::runtime_adapter::DeviceSplit::SingleDevice { index: 0 },
+            rationale: Vec::new(),
+            improvement_suggestions: Vec::new(),
+        };
+        let (settings, _) = adaptive_llama_settings(&BTreeMap::new(), &plan, Some(40), false);
+        assert!(settings.is_empty());
     }
 
     #[test]

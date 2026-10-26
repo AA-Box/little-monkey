@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, FileText, Gauge, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
@@ -33,6 +33,10 @@ import {
   Toggle,
 } from "./RuntimeHubShared";
 import { errorMessage } from "../../../lib/errors";
+
+const RuntimeHubLoadRecoveryHistory = lazy(() =>
+  import("./RuntimeHubLoadRecoveryHistory").then((module) => ({ default: module.RuntimeHubLoadRecoveryHistory })),
+);
 
 function statusState(detail: RuntimeDetail | undefined): string {
   if (!detail?.status) return "unknown";
@@ -686,6 +690,11 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
           )}
           <OffloadPlanPanel plan={offloadPlan} busy={offloadBusy} error={offloadError} />
           <ErrorNotice message={errors[`load:${runtimeId}`]} />
+          {runtime.descriptor.kind === "llama_cpp" && (
+            <Suspense fallback={<p className="mt-2 text-xs text-muted">Loading model-load history…</p>}>
+              <RuntimeHubLoadRecoveryHistory runtimeId={runtimeId} loading={!!busy[`load:${runtimeId}`]} />
+            </Suspense>
+          )}
           <div className="mt-3 flex justify-end">
             <BusyButton type="button" variant="primary" busy={busy[`load:${runtimeId}`]} disabled={!assetId} onClick={handleLoad}>
               <Play size={15} aria-hidden="true" /> Load model

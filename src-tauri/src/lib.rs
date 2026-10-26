@@ -48,6 +48,13 @@ pub mod runtime_adapter;
 // stable-diffusion.cpp runtime. Tauri-free so the CLI can share it.
 pub mod generation;
 pub(crate) mod generation_commands;
+pub(crate) mod studio_wan_preset;
+mod studio_video_jobs;
+mod studio_video_timeline;
+pub(crate) mod studio_model_policy;
+pub(crate) mod studio_minimax_entitlement;
+pub(crate) mod studio_vdn;
+pub(crate) mod studio_vdn_jobs;
 pub mod studio_parity;
 pub mod character_trainer;
 pub mod studio_tools;
@@ -117,6 +124,7 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+pub mod oom_recovery;
 pub mod mlx_ownership;
 // Local Agent Integration Launcher (ROADMAP.md, Phase 8, item 13): generates
 // safe external-tool (Continue.dev/aider/OpenAI-SDK-compatible) config
@@ -1339,6 +1347,13 @@ pub fn run() {
             // commands keep it in sync as the catalog changes.
             knowledge_service::sync_watched_folder_watchers(app.handle());
 
+            // Recover Studio's persistent video journal *after* managed
+            // runtimes were materialized and profile restore was recovered.
+            // No Studio window, tab, or listing IPC is needed to dispatch.
+            studio_video_jobs::start_background_recovery(app.handle().clone());
+            studio_vdn_jobs::start_background_recovery(app.handle().clone());
+            studio_video_timeline::start_background_recovery(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1711,7 +1726,9 @@ pub fn run() {
             m3_commands::m3_cancel_operation,
             m3_commands::m3_runtime_status,
             m3_commands::m3_runtime_inventory,
+            m3_commands::m3_runtime_plan_model_load,
             m3_commands::m3_runtime_load_model,
+            m3_commands::m3_runtime_load_recovery_history,
             m3_commands::m3_runtime_unload_model,
             m3_commands::m3_runtime_logs,
             m3_commands::m3_runtime_metrics,
@@ -2100,8 +2117,22 @@ pub fn run() {
             generation_commands::generation_engine_status,
             generation_commands::generation_models,
             generation_commands::generation_add_model,
+            generation_commands::generation_register_wan22,
             generation_commands::generation_remove_model,
             generation_commands::generation_accept_license,
+            generation_commands::generation_license_region,
+            generation_commands::generation_set_license_region,
+            generation_commands::generation_import_minimax_entitlement,
+            generation_commands::generation_clear_minimax_entitlement,
+            generation_commands::generation_vdn_accept_terms,
+            generation_commands::generation_vdn_license_status,
+            studio_vdn::generation_vdn_run,
+            studio_vdn_jobs::generation_vdn_submit,
+            studio_vdn_jobs::generation_vdn_jobs,
+            studio_vdn_jobs::generation_vdn_resume,
+            studio_vdn_jobs::generation_vdn_cancel_job,
+            studio_vdn::generation_vdn_probe,
+            studio_vdn::generation_vdn_cancel,
             generation_commands::generation_set_hugging_face_token,
             generation_commands::generation_download_model,
             generation_commands::generation_cancel_download,
@@ -2115,6 +2146,15 @@ pub fn run() {
             generation_commands::generation_add_backend,
             generation_commands::generation_remove_backend,
             generation_commands::generation_run,
+            studio_video_jobs::generation_video_submit,
+            studio_video_jobs::generation_video_jobs,
+            studio_video_jobs::generation_video_resume,
+            studio_video_jobs::generation_video_cancel,
+            studio_video_jobs::generation_video_continue,
+            studio_video_timeline::generation_video_timeline_submit,
+            studio_video_timeline::generation_video_timelines,
+            studio_video_timeline::generation_video_timeline_retry,
+            studio_video_timeline::generation_video_timeline_cancel,
             generation_commands::generation_cancel,
             generation_commands::generation_gallery,
             generation_commands::generation_delete_entry,

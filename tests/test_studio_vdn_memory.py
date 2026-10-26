@@ -1,0 +1,85 @@
+"""Native Little Monkey VDN placement tests (no GPU or model downloads)."""
+import importlib.util
+from pathlib import Path
+import unittest
+
+WORKER = Path(__file__).resolve().parents[1] / "scripts" / "studio-vdn-h3-worker.py"
+spec = importlib.util.spec_from_file_location("little_monkey_vdn_memory", WORKER)
+worker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(worker)
+G = 1024 ** 3
+
+
+class NativePlacementTests(unittest.TestCase):
+    def choose(self, vram=20, ram=160, disk=240, **kwargs):
+        return worker.choose_memory_plans(vram * G, ram * G, disk * G,
+                                          capability=8, **kwargs)
+
+    def test_low_vram_starts_cpu_stream_and_allows_disk_fallback(self):
+        tiers = self.choose()
+        self.assertEqual(tiers[0], "stream_cpu")
+        self.assertIn("stream_disk", tiers)
+
+    def test_abundant_vram_starts_resident_and_can_recover(self):
+        self.assertEqual(self.choose(vram=80)[0], "resident")
+
+    def test_forced_cpu_stream_does_not_accidentally_load_gpu_resident(self):
+        self.assertEqual(self.choose(mode="stream_cpu"), ["stream_cpu"])
+
+    def test_forced_disk_without_capacity_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "180 GiB"):
+            self.choose(disk=10, mode="stream_disk")
+
+    def test_no_auto_int8_without_torchao_or_adequate_host_memory(self):
+        self.assertNotIn("int8_cpu", self.choose(torchao_available=False))
+        self.assertNotIn("int8_cpu", self.choose(ram=64, disk=240, mode="auto"))
+
+    def test_fp8_disk_requires_capability_and_quantizer(self):
+        g = 1024**3
+        tiers = worker.choose_memory_plans(
+            16*g, 16*g, 220*g, capability=9,
+            fp8=True, mode="stream_disk", torchao_available=True)
+        self.assertEqual(tiers, ["fp8_disk"])
+        with self.assertRaisesRegex(ValueError, "torchao"):
+            worker.choose_memory_plans(
+                16*g, 16*g, 220*g, capability=9,
+                fp8=True, mode="stream_disk", torchao_available=False)
+
+    def test_fp8_accepts_ada_sm89_and_rejects_earlier_gpu(self):
+        self.assertTrue(worker.native_fp8_capability((8, 9)))
+        self.assertTrue(worker.native_fp8_capability((9, 0)))
+        self.assertTrue(worker.native_fp8_capability((12, 0)))
+        self.assertFalse(worker.native_fp8_capability((8, 6)))
+        with self.assertRaisesRegex(ValueError, "8.9"):
+            self.choose(fp8=True)
+        tier = worker.choose_memory_plans(
+            16*G, 16*G, 220*G, capability=(8, 9),
+            fp8=True, mode="stream_disk", torchao_available=True)
+        self.assertEqual(tier, ["fp8_disk"])
+
+    def test_new_process_oom_classifier_does_not_hide_other_failures(self):
+        self.assertTrue(worker.is_cuda_oom(RuntimeError("CUDA out of memory")))
+        self.assertTrue(worker.is_cuda_oom("torch.OutOfMemoryError: CUDA out of memory"))
+        self.assertFalse(worker.is_cuda_oom(RuntimeError("file out of memory")))
+        self.assertFalse(worker.is_cuda_oom(RuntimeError("CUDA illegal memory access")))
+
+    def test_low_ram_uses_sharded_disk_loader_instead_of_eager_cpu(self):
+        self.assertEqual(self.choose(vram=16, ram=16, disk=1000), ["stream_disk"])
+        with self.assertRaisesRegex(ValueError, "180 GiB"):
+            self.choose(vram=16, ram=16, disk=80, mode="stream_disk")
+        with self.assertRaisesRegex(ValueError, "136 GiB"):
+            self.choose(vram=24, ram=64, mode="stream_cpu")
+        with self.assertRaisesRegex(ValueError, "insufficient"):
+            self.choose(vram=6, ram=16, disk=1000)
+
+    def test_h3_int8_requires_substantial_host_ram(self):
+        self.assertIn("int8_cpu", self.choose(ram=112, disk=240))
+        self.assertNotIn("stream_cpu", self.choose(ram=112, disk=240))
+
+    def test_negative_memory_rejected(self):
+        with self.assertRaises(ValueError):
+            worker.choose_memory_plans(-1, 90 * G, 90 * G, capability=9)
+
+
+if __name__ == "__main__":
+    unittest.main()

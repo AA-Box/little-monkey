@@ -178,6 +178,12 @@ export type GenerationEngineKind =
   | "mlx_video"
   | "mflux_image";
 
+export type VideoMemoryProfile =
+  | "default"
+  | "maximum_speed"
+  | "adaptive_vram"
+  | "minimum_ram";
+
 /** A model exactly as stored in the user's library. */
 export interface GenerationModelSpec {
   id: string;
@@ -195,6 +201,7 @@ export interface GenerationModelSpec {
   /** The diffusion model itself reads per-run reference images (FLUX Kontext,
    *  Qwen-Image-Edit, FLUX.2). Mirrors `reads_ref_images` in generation.rs. */
   readsRefImages: boolean;
+  videoMemoryProfile?: VideoMemoryProfile;
 }
 
 export interface GenerationModel {
@@ -211,15 +218,108 @@ export interface GenerationModel {
   engine: GenerationEngineKind;
   quantizationBits: number | null;
   readsRefImages: boolean;
+  videoMemoryProfile?: VideoMemoryProfile;
   installed: boolean;
   /** Measured on this machine, not declared in the entry. */
   totalBytes: number;
   missingBytes: number;
   licenseAccepted: boolean;
+  /** True only when the backend authorizes use in the declared territory. */
+  licenseEligible?: boolean;
+  licenseBlockReason?: string | null;
   fitsInMemory: boolean;
 }
 
+/** Standalone, authorized CUDA VDN-H3 inference (no FreeVideo/ComfyUI). */
+export type VdnBackend = "diffusers" | "optimized_single" | "optimized_ulysses" | "sglang" | "free_video_adaptive";
+
+export interface VdnGenerationRequest {
+  jobId: string;
+  pythonExecutable: string;
+  prompt: string;
+  steps: number;
+  frames: number;
+  segments: number;
+  seed: number;
+  firstImagePath: string | null;
+  lastImagePath: string | null;
+  sourceGalleryEntryId: string | null;
+  sourceVdnJobId: string | null;
+  continuationMode: "last_frame" | "video_reference" | "latent_context";
+  referenceImagePaths: string[];
+  referenceVideoPath: string | null;
+  loraPaths: string[];
+  referenceAudioPath: string | null;
+  fp8: boolean;
+  offloadDit: boolean;
+  memoryMode: "auto" | "resident" | "stream_cpu" | "stream_disk";
+  lowmem: "auto" | "off" | "force";
+  queryChunk: number;
+  headChunk: number;
+  ffChunk: number;
+  nativeTwoPass: boolean;
+  refineSteps: number;
+  refineFromJobId: string | null;
+  backend: VdnBackend;
+  repoRoot: string | null;
+  checkpointRoot: string | null;
+  gpuClass: "h200" | "b200" | null;
+  serverPort: number | null;
+  acknowledgeThirdPartyCode: boolean;
+}
+
+export interface DurableVdnJob {
+  id: string;
+  request: VdnGenerationRequest;
+  status: "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled";
+  attempts: number;
+  resultEntryId: string | null;
+  error: string | null;
+}
+
+export type VideoJobStatus = "queued" | "running" | "interrupted" | "completed" | "failed" | "cancelled";
+export type VideoJobStage = "waiting_for_dependencies" | "preparing_input" | "rendering" | "published";
+
+export interface VideoJob {
+  id: string;
+  dependsOn: string[];
+  sourceJobId: string | null;
+  sourceGalleryEntryId: string | null;
+  targetGalleryImageEntryId: string | null;
+  targetArtifactId: string | null;
+  sourceArtifactId: string | null;
+  modelId: string;
+  prompt: string;
+  seed: number;
+  status: VideoJobStatus;
+  stage: VideoJobStage;
+  attempts: number;
+  resultEntryIds: string[];
+  error: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface VideoTimelineSegment {
+  jobId: string;
+  trimStartMs: number;
+  trimEndMs: number | null;
+}
+export type VideoTimelineStatus = "queued" | "rendering" | "interrupted" | "completed" | "failed" | "cancelled";
+export interface VideoTimeline {
+  id: string;
+  title: string;
+  segments: VideoTimelineSegment[];
+  soundtrackPath: string | null;
+  status: VideoTimelineStatus;
+  outputEntryId: string | null;
+  error: string | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
 export interface GenerationEntry {
+  videoJobId?: string | null;
   entryId: string;
   artifactId: string;
   modelId: string;
@@ -437,6 +537,8 @@ export interface GenerationRequest {
   /** Speech only: ISO 639-1 code. Null leaves the model's own default. */
   language: string | null;
   initImageBase64: string | null;
+  /** Optional model-native ending frame for video interpolation/conditioning. */
+  endImageBase64?: string | null;
   /** Single-channel mask over the init image: white is repainted, black is
    *  kept. This is inpainting, so it needs an init image to paint over. */
   maskImageBase64: string | null;
@@ -566,10 +668,43 @@ export const studioClient = {
   models: () => invoke<GenerationModel[]>("generation_models"),
   addModel: (spec: GenerationModelSpec) =>
     invoke<GenerationModelSpec[]>("generation_add_model", { spec }),
+  registerWan22: () =>
+    invoke<GenerationModelSpec[]>("generation_register_wan22"),
   removeModel: (modelId: string) =>
     invoke<void>("generation_remove_model", { modelId }),
   acceptLicense: (licenseId: string) =>
     invoke<void>("generation_accept_license", { licenseId }),
+  licenseRegion: () =>
+    invoke<"eu" | "uk" | "us" | "kr" | "other" | null>("generation_license_region"),
+  setLicenseRegion: (region: "eu" | "uk" | "us" | "kr" | "other") =>
+    invoke<void>("generation_set_license_region", { region, acknowledged: true }),
+  importMinimaxEntitlement: (grantJson: string) =>
+    invoke<void>("generation_import_minimax_entitlement", { grantJson }),
+  clearMinimaxEntitlement: () =>
+    invoke<void>("generation_clear_minimax_entitlement"),
+  vdnLicenseStatus: () => invoke<string | null>("generation_vdn_license_status"),
+  vdnAcceptTerms: () => invoke<void>("generation_vdn_accept_terms"),
+  vdnSubmit: (request: VdnGenerationRequest) =>
+    invoke<DurableVdnJob>("generation_vdn_submit", { request }),
+  vdnJobs: () => invoke<DurableVdnJob[]>("generation_vdn_jobs"),
+  vdnResume: (jobId: string) => invoke<DurableVdnJob>("generation_vdn_resume", { jobId }),
+  vdnCancelJob: (jobId: string) =>
+    invoke<DurableVdnJob>("generation_vdn_cancel_job", { jobId }),
+  vdnRun: (request: VdnGenerationRequest) =>
+    invoke<GenerationEntry>("generation_vdn_run", { request }),
+  vdnProbe: (
+    pythonExecutable: string, backend: VdnBackend, repoRoot: string | null,
+    checkpointRoot: string | null, gpuClass: "h200" | "b200" | null,
+    serverPort: number | null,
+  ) => invoke<{status?: string; phase?: string; backend: string; model: string;
+    device?: string; computeCapability?: string; vramBytes?: number;
+    torch?: string; fp8Supported?: boolean; visibleGpuCount?: number; port?: number;
+    freeVramBytes?: number; hostRamAvailableBytes?: number | null; diskFreeBytes?: number;
+    nativeMemoryPlans?: string[]; resourcesReady?: boolean; resourceWarning?: string}>(
+      "generation_vdn_probe",
+      { pythonExecutable, backend, repoRoot, checkpointRoot, gpuClass, serverPort }
+    ),
+  vdnCancel: (jobId: string) => invoke<boolean>("generation_vdn_cancel", { jobId }),
   setHuggingFaceToken: (modelId: string, token: string) =>
     invoke<void>("generation_set_hugging_face_token", { modelId, token }),
   downloadModel: (modelId: string) =>
@@ -589,6 +724,20 @@ export const studioClient = {
     invoke<RemoteBackend[]>("generation_remove_backend", { backendId }),
   /** Resolves to every artifact the run produced: one for a clip or an
    *  utterance, `batchCount` of them for a batch of images. */
+  videoSubmit: (request: GenerationRequest, idempotencyKey: string, dependsOn: string[] = [], sourceJobId: string | null = null, sourceGalleryEntryId: string | null = null, targetGalleryImageEntryId: string | null = null) =>
+    invoke<VideoJob>("generation_video_submit", { request, idempotencyKey, dependsOn, sourceJobId, sourceGalleryEntryId, targetGalleryImageEntryId }),
+  videoContinue: (parentJobId: string, prompt: string, idempotencyKey: string) =>
+    invoke<VideoJob>("generation_video_continue", { parentJobId, prompt, idempotencyKey }),
+  videoJobs: () => invoke<VideoJob[]>("generation_video_jobs"),
+  videoResume: (jobId: string) => invoke<VideoJob>("generation_video_resume", { jobId }),
+  videoCancel: (jobId: string) => invoke<VideoJob>("generation_video_cancel", { jobId }),
+  videoTimelineSubmit: (title: string, segments: VideoTimelineSegment[], soundtrackPath: string | null) =>
+    invoke<VideoTimeline>("generation_video_timeline_submit", { title, segments, soundtrackPath }),
+  videoTimelines: () => invoke<VideoTimeline[]>("generation_video_timelines"),
+  videoTimelineRetry: (timelineId: string) =>
+    invoke<VideoTimeline>("generation_video_timeline_retry", { timelineId }),
+  videoTimelineCancel: (timelineId: string) =>
+    invoke<VideoTimeline>("generation_video_timeline_cancel", { timelineId }),
   run: (request: GenerationRequest) =>
     invoke<GenerationEntry[]>("generation_run", { request }),
   cancel: (jobId: string) => invoke<boolean>("generation_cancel", { jobId }),
@@ -833,5 +982,6 @@ export function emptyModelSpec(): GenerationModelSpec {
     engine: "stable_diffusion_cpp",
     quantizationBits: null,
     readsRefImages: false,
+    videoMemoryProfile: "default",
   };
 }

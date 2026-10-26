@@ -717,6 +717,18 @@ pub struct StudioWorkflowRequest {
     pub values: BTreeMap<String, Value>,
     pub input_image: Option<WorkflowUpload>,
     pub input_video: Option<WorkflowUpload>,
+    pub last_frame_image: Option<WorkflowUpload>,
+    pub input_audio: Option<WorkflowUpload>,
+    /// Gallery media is resolved inside the native backend; the frontend
+    /// never reads a large MP4 back into JS/base64 just to upload it again.
+    #[serde(default)]
+    pub gallery_video_entry_id: Option<String>,
+    #[serde(default)]
+    pub gallery_image_entry_id: Option<String>,
+    #[serde(default)]
+    pub gallery_audio_entry_id: Option<String>,
+    #[serde(default)]
+    pub gallery_last_frame_entry_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -882,6 +894,7 @@ fn gallery_paths(app: &AppHandle) -> Result<(PathBuf, ArtifactStore), String> {
 }
 
 fn append_gallery(app: &AppHandle, new_entries: &[GenerationEntry]) -> Result<(), String> {
+    let _gallery_guard = crate::generation_commands::gallery_write_lock().lock().map_err(|e| e.to_string())?;
     let (gallery_path, _) = gallery_paths(app)?;
     let mut entries: Vec<GenerationEntry> = fs::read(&gallery_path)
         .ok()
@@ -907,6 +920,72 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Always resolve a gallery selection against the currently published index,
+/// verify its media type, and then read the content-addressed artifact bytes.
+/// Entry IDs are opaque, never paths, and an arbitrary artifact digest that
+/// is absent from the gallery cannot be uploaded through this command.
+fn select_gallery_entry<'a>(
+    entries: &'a [GenerationEntry],
+    entry_id: &str,
+    allowed_mimes: &[&str],
+) -> Result<&'a GenerationEntry, String> {
+    if entry_id.len() > 160 || !entry_id.starts_with("studio-") {
+        return Err("Invalid Studio gallery entry ID".into());
+    }
+    let entry = entries.iter().find(|e| e.entry_id == entry_id)
+        .ok_or("Selected Studio gallery media is no longer present")?;
+    if !allowed_mimes.contains(&entry.media_type.as_str()) {
+        return Err(format!("Selected gallery media has unsupported type: {}", entry.media_type));
+    }
+    Ok(entry)
+}
+
+fn gallery_upload(
+    app: &AppHandle,
+    entry_id: &str,
+    allowed_mimes: &[&str],
+) -> Result<(WorkflowUpload, Vec<u8>, String), String> {
+    let entries = crate::generation_commands::generation_gallery(app.clone())?;
+    let entry = select_gallery_entry(&entries, entry_id, allowed_mimes)?;
+    let (_, store) = gallery_paths(app)?;
+    let bytes = store.read(&entry.artifact_id).map_err(|e| e.to_string())?;
+    if bytes.is_empty() || bytes.len() > MAX_WORKFLOW_MEDIA_BYTES {
+        return Err("Selected gallery media exceeds the workflow limit".into());
+    }
+    let ext = match entry.media_type.as_str() {
+        "video/mp4" => "mp4", "video/webm" => "webm",
+        "image/png" => "png", "image/jpeg" => "jpg",
+        "image/webp" => "webp", "audio/wav" => "wav",
+        "audio/mpeg" => "mp3", "audio/flac" => "flac",
+        "audio/ogg" => "ogg", _ => "bin"
+    };
+    let upload = WorkflowUpload {
+        name: format!("studio-{}.{}", &entry.artifact_id[..entry.artifact_id.len().min(20)], ext),
+        data_base64: STANDARD.encode(&bytes),
+    };
+    Ok((upload, bytes, entry.media_type.clone()))
+}
+
+/// Reject a missing *media* reference up front instead of handing ComfyUI a
+/// literal {{input_video}} filename and reporting an unrelated loader failure.
+fn workflow_uses_binding(value: &Value, name: &str) -> bool {
+    let marker = format!("{{{{{name}}}}}");
+    match value {
+        Value::String(text) => text.contains(&marker),
+        Value::Array(items) => items.iter().any(|item| workflow_uses_binding(item, name)),
+        Value::Object(items) => items.values().any(|item| workflow_uses_binding(item, name)),
+        _ => false,
+    }
+}
+
+/// Report missing media in a stable, actionable priority order. JSON objects
+/// are maps, and their key iteration order must never change which required
+/// user-facing input is requested first.
+fn unresolved_media_binding(value: &Value) -> Option<&'static str> {
+    const NAMES: [&str; 4] = ["input_image", "input_video", "last_frame_image", "input_audio"];
+    NAMES.into_iter().find(|name| workflow_uses_binding(value, name))
+}
+
 #[tauri::command]
 pub async fn studio_workflow_run(
     app: AppHandle,
@@ -925,9 +1004,54 @@ pub async fn studio_workflow_run(
     {
         return Err("Workflow JSON exceeds 4 MiB".into());
     }
+    if request.gallery_video_entry_id.is_some() && request.input_video.is_some() {
+        return Err("Choose either a Studio gallery video or an uploaded video".into());
+    }
+    if request.gallery_image_entry_id.is_some() && request.input_image.is_some() {
+        return Err("Choose either a Studio gallery image or an uploaded image".into());
+    }
+    if request.gallery_audio_entry_id.is_some() && request.input_audio.is_some() {
+        return Err("Choose either Studio gallery audio or an uploaded audio file".into());
+    }
+    if request.gallery_last_frame_entry_id.is_some() && request.last_frame_image.is_some() {
+        return Err("Choose either a Studio end-frame image or an uploaded end frame".into());
+    }
     let base = validate_comfy_base(&request.base_url)?;
     let client = workflow_client()?;
     let mut values = request.values.clone();
+
+    // The *last frame of the previous clip* is the *first frame of
+    // the next clip*. Do not feed it to "last_frame_image", which is
+    // the *target* end frame in compatible external workflows. Operators
+    // may supply that target end frame independently.
+    if let Some(entry_id) = &request.gallery_video_entry_id {
+        let (upload, bytes, mime) = gallery_upload(&app, entry_id, &["video/mp4", "video/webm"])?;
+        let needs_start = workflow_uses_binding(&request.workflow, "input_image")
+            && request.input_image.is_none()
+            && request.gallery_image_entry_id.is_none();
+        let starting_png = if needs_start {
+            Some(crate::studio_video_jobs::extract_final_frame(&app, &bytes, &mime).await?)
+        } else { None };
+        values.insert("input_video".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
+        if let Some(data_base64) = starting_png {
+            let frame = WorkflowUpload {
+                name: format!("next-scene-start-{}.png", Uuid::new_v4()), data_base64,
+            };
+            values.insert("input_image".into(), Value::String(upload_comfy(&client, &base, &frame).await?));
+        }
+    }
+    if let Some(entry_id) = &request.gallery_image_entry_id {
+        let (upload, _, _) = gallery_upload(&app, entry_id, &["image/png", "image/jpeg", "image/webp"])?;
+        values.insert("input_image".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
+    }
+    if let Some(entry_id) = &request.gallery_audio_entry_id {
+        let (upload, _, _) = gallery_upload(&app, entry_id, &["audio/wav", "audio/mpeg", "audio/flac", "audio/ogg"])?;
+        values.insert("input_audio".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
+    }
+    if let Some(entry_id) = &request.gallery_last_frame_entry_id {
+        let (upload, _, _) = gallery_upload(&app, entry_id, &["image/png", "image/jpeg", "image/webp"])?;
+        values.insert("last_frame_image".into(), Value::String(upload_comfy(&client, &base, &upload).await?));
+    }
     if let Some(image) = &request.input_image {
         values.insert(
             "input_image".into(),
@@ -940,8 +1064,18 @@ pub async fn studio_workflow_run(
             Value::String(upload_comfy(&client, &base, video).await?),
         );
     }
+
+    if let Some(last) = &request.last_frame_image {
+        values.insert("last_frame_image".into(), Value::String(upload_comfy(&client, &base, last).await?));
+    }
+    if let Some(audio) = &request.input_audio {
+        values.insert("input_audio".into(), Value::String(upload_comfy(&client, &base, audio).await?));
+    }
     let mut workflow = request.workflow.clone();
     replace_workflow(&mut workflow, &values);
+    if let Some(name) = unresolved_media_binding(&workflow) {
+        return Err(format!("Workflow requires {name}, but no input is selected"));
+    }
     let response = crate::egress::send(
         client
             .post(base.join("prompt").map_err(|e| e.to_string())?)
@@ -1021,6 +1155,7 @@ pub async fn studio_workflow_run(
         entries.push(GenerationEntry {
             entry_id: format!("studio-{}", Uuid::new_v4()),
             artifact_id: blob.id,
+            video_job_id: None,
             model_id: format!("comfy-workflow:{}", request.kind),
             task,
             prompt: prompt.clone(),
@@ -1057,8 +1192,74 @@ mod tests {
         assert_eq!(value["b"], "prefix hello");
     }
     #[test]
+    fn missing_media_priority_ignores_json_field_order() {
+        let left = json!({"z":{"first":"{{input_audio}}"},"a":[{"start":"{{input_image}}"}],"m":"{{input_video}}"});
+        let right = json!({"m":"{{input_video}}","a":[{"start":"{{input_image}}"}],"z":{"first":"{{input_audio}}"}}); 
+        assert_eq!(unresolved_media_binding(&left), Some("input_image"));
+        assert_eq!(unresolved_media_binding(&right), Some("input_image"));
+    }
+
+    #[test]
+    fn generic_workflow_references_are_bound_as_typed_values() {
+        let mut workflow = json!({"first":"{{input_image}}","last":"{{last_frame_image}}",
+                                  "video":"{{input_video}}","audio":"{{input_audio}}",
+                                  "seed":"{{seed}}"});
+        let vars = BTreeMap::from([
+            ("input_image".into(), json!("first.png")),
+            ("last_frame_image".into(), json!("last.png")),
+            ("input_video".into(), json!("reference.mp4")),
+            ("input_audio".into(), json!("audio.wav")),
+            ("seed".into(), json!(42)),
+        ]);
+        replace_workflow(&mut workflow, &vars);
+        assert_eq!(workflow["first"], "first.png");
+        assert_eq!(workflow["last"], "last.png");
+        assert_eq!(workflow["video"], "reference.mp4");
+        assert_eq!(workflow["audio"], "audio.wav");
+        assert_eq!(workflow["seed"], 42);
+    }
+    #[test]
     fn sha_requires_exact_hex() {
         assert!(normalize_sha(&"a".repeat(64)).is_some());
         assert!(normalize_sha("nope").is_none());
+    }
+}
+
+#[cfg(test)]
+mod gallery_binding_tests {
+    #[test]
+    fn gallery_media_selection_rejects_mismatched_type_and_unknown_id() {
+        use super::*;
+        let entry = GenerationEntry {
+            entry_id: "studio-known".into(),
+            artifact_id: "a".repeat(64),
+            video_job_id: None,
+            model_id: "test".into(),
+            task: GenerationTask::TextToVideo,
+            prompt: String::new(), negative_prompt: String::new(),
+            media_type: "video/mp4".into(), size_bytes: 10,
+            width: 64, height: 64, steps: 1, cfg_scale: 1.0,
+            seed: 1, frame_count: 1, fps: 1, duration_ms: 1000,
+            created_at_ms: 1,
+        };
+        let entries = [entry];
+        assert!(select_gallery_entry(&entries, "studio-known", &["video/mp4"]).is_ok());
+        assert!(select_gallery_entry(&entries, "studio-known", &["image/png"]).is_err());
+        assert!(select_gallery_entry(&entries, "studio-missing", &["video/mp4"]).is_err());
+        assert!(select_gallery_entry(&entries, "../outside", &["video/mp4"]).is_err());
+    }
+
+    #[test]
+    fn required_media_workflow_placeholders_must_be_bound() {
+        let mut workflow = serde_json::json!({"inputs":{"video":"{{input_video}}","other": ["{{last_frame_image}}"]}});
+        assert_eq!(super::unresolved_media_binding(&workflow), Some("input_video"));
+        assert!(super::workflow_uses_binding(&workflow, "last_frame_image"));
+        assert!(!super::workflow_uses_binding(&workflow, "input_audio"));
+        assert!(super::workflow_uses_binding(&workflow, "input_video"));
+        let mut data = std::collections::BTreeMap::new();
+        data.insert("input_video".to_string(), serde_json::json!("source.mp4"));
+        data.insert("last_frame_image".to_string(), serde_json::json!("last.png"));
+        super::replace_workflow(&mut workflow, &data);
+        assert_eq!(super::unresolved_media_binding(&workflow), None);
     }
 }

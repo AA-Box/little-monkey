@@ -228,6 +228,9 @@ export function resolveEdgeRuntimeProfile(
  *
  * - only entries whose `freshness` is `thisMachine` count, so a report carried
  *   over from other hardware can never be shown as this machine's;
+ * - only entries with runtime-side evidence and at least two complete measured
+ *   samples qualify; legacy runs remain visible in history but not as a
+ *   verified machine-speed headline;
  * - only entries that actually produced a decode rate count — a run whose rate
  *   was unavailable has nothing to say here;
  * - the prose is *appended*, not replaced. The profile's own caveat about
@@ -239,7 +242,12 @@ function withMeasuredSpeed(
   benchmarks: BenchmarkHistoryEntry[],
 ): EdgeRuntimeProfile {
   const measured = benchmarks.filter(
-    (entry) => entry.freshness.state === "thisMachine" && entry.report.decodeTokensPerSecond !== null,
+    (entry) =>
+      entry.freshness.state === "thisMachine" &&
+      entry.evidence !== null &&
+      entry.evidence.completedMeasuredRepeats >= 2 &&
+      entry.report.decodeTokensPerSecond !== null &&
+      entry.report.decodeTokensPerSecond.n >= 2,
   );
   if (!measured.length) return profile;
 
