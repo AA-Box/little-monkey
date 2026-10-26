@@ -28,6 +28,10 @@ if "save_context" not in globals():
         load_context, save_context, preview_fallback, preview_identity,
         preview_path, load_preview, save_preview,
     )
+if "save_segment" not in globals():
+    from studio_vdn_segment_cache import (
+        save_segment, load_segment, discard_segment,
+    )
 
 
 def audio_origin(frame):
@@ -97,6 +101,20 @@ def capture_context(video, audio, source_start_frame, delivered_frame_count):
     if not 1 <= result["audio"].shape[2] <= 64:
         raise ValueError("H3 audio context is not a bounded overlap")
     return result
+
+
+def native_context_hash(high, low):
+    """Bind cached window bytes to the precise two-resolution AV predecessor."""
+    digest = hashlib.sha256()
+    for context in (high, low):
+        if context is None:
+            digest.update(b"none")
+            continue
+        for key in ("video", "audio"):
+            digest.update(context[key].detach().float().cpu().contiguous().numpy().tobytes())
+        digest.update(str(context["frame_origin"]).encode("ascii"))
+        digest.update(str(context["audio_origin"]).encode("ascii"))
+    return digest.hexdigest()
 
 
 class NativeTemporalPrefix:
@@ -208,13 +226,56 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
     low_context = stored["low"] if stored else None
     continuation_anchor = keyframes.get("image") if stored else None
     audio_chunks = []
+    cache_root = getattr(args, "temporal_segment_root", "")
     with tempfile.TemporaryDirectory(prefix=".vdn-temporal-", dir=output.parent) as work:
         workdir = Path(work)
         for part in range(args.segments):
             source_frame = 0 if context is None else source_frames + cursor - OVERLAP_FRAMES
-            prefix = NativeTemporalPrefix(denoiser, context, device) if context else None
             stage = "temporal_%d" % part
             was_continuing = context is not None
+            old_cursor = cursor
+            overlap = OVERLAP_FRAMES if was_continuing else 0
+            new_count = args.frames - overlap
+            predecessor_hash = native_context_hash(context, low_context)
+            stage_hash = hashlib.sha256(
+                ("%s:%d:%d" % (request_identity, args.refine_steps, part)).encode()
+            ).hexdigest()
+            if cache_root:
+                try:
+                    cached = load_segment(
+                        cache_root, part, model=checkpoint, request_hash=stage_hash,
+                        predecessor_hash=predecessor_hash,
+                        expected_frames=new_count,
+                        expected_total_frames=source_frames + cursor + new_count)
+                except (OSError, ValueError, KeyError):
+                    # A partial or altered cache is not usable; sample this
+                    # segment again rather than trusting uncommitted bytes.
+                    discard_segment(cache_root, part)
+                    cached = None
+                if cached is not None:
+                    if video_memory is None:
+                        shape = cached["video"].shape[1:]
+                        video_memory = np.memmap(
+                            str(workdir / "frames.raw"), dtype=np.uint8, mode="w+",
+                            shape=(frames_total, *shape))
+                    if cached["video"].shape[1:] != video_memory.shape[1:]:
+                        raise ValueError("Cached native temporal canvas changed")
+                    expected_audio = (emitted_audio_samples(cursor + new_count) -
+                                      emitted_audio_samples(cursor))
+                    if cached["audio"].shape[1] != expected_audio:
+                        raise ValueError("Cached native segment changed its audio clock")
+                    video_memory[cursor:cursor+new_count] = cached["video"]
+                    audio_chunks.append(np.array(cached["audio"], copy=True))
+                    audio_cursor += expected_audio
+                    cursor += new_count
+                    context, low_context = cached["high"], cached["low"]
+                    continuation_anchor = cached["video"][-OVERLAP_FRAMES].copy()
+                    print(json.dumps({"phase": "temporal_part_recovered",
+                                      "part": part + 1,
+                                      "framesDelivered": cursor}), flush=True)
+                    del cached
+                    continue
+            prefix = NativeTemporalPrefix(denoiser, context, device) if context else None
             print(json.dumps({"phase": "temporal_sampling", "part": part + 1,
                               "parts": args.segments, "overlapFrames": 22 if was_continuing else 0}),
                   flush=True)
@@ -348,6 +409,13 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             else:
                 low_context = preview_fallback(context)
             continuation_anchor = video_frames[-OVERLAP_FRAMES]
+            if cache_root:
+                save_segment(
+                    cache_root, part,
+                    video_memory[old_cursor:cursor], audio_slice,
+                    context, low_context, model=checkpoint,
+                    request_hash=stage_hash, predecessor_hash=predecessor_hash,
+                    total_frames=source_frames + cursor)
             clear_native_sampler_stage(args, stage + "_refine" if args.two_pass else stage)
             print(json.dumps({"phase": "temporal_part_completed", "part": part + 1,
                               "framesDelivered": cursor, "audioSamples": audio_cursor}),
