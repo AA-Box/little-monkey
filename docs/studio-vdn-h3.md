@@ -114,25 +114,29 @@ matches. Temporary frames are removed on success or failure.
 Boundaries: this is an independent Little Monkey native implementation,
 **not a FreeVideo runtime dependency**. A physical licensed CUDA/H3 model
 test is still needed to certify visual and voice quality, sample
-compatibility across released Diffusers versions, and performance. native implementation requires the installed H3 transformer interfaces;
+compatibility across released Diffusers versions, and performance. This native
+implementation requires the installed H3 transformer interfaces;
 model territory restrictions and upstream-code consent remain unchanged.
 
 ### Two-pass rolling windows
 
-For a 2–8-segment generation, choose **Native latent two-pass**. Each segment
+For a 2–8-segment generation, choose **Native learned 3D two-pass (8+3)**. Each segment
 now executes *two model sampling passes*, not a preview job followed by
 independent outputs: the half-resolution pass receives the exact prior
 half-resolution video/audio latent tail; the full-resolution refinement pass
 receives the matching full-resolution tail. The preview's video latents
-are interpolated and re-noised for the second pass, while its generated
-audio latents are passed to refinement. Each pass has a distinct
+are passed through the independently implemented, SHA-256-pinned,
+trained 3D H3 latent upscaler from LBH-123-AI, then initialized on the
+native three-step calibrated H3 video/audio sigma schedule. No interpolation
+fallback is accepted by native two-pass. Each pass has a distinct
 completed-denoising-step checkpoint and a content-bound Safetensors
 preview checkpoint. A restart can reuse a matching preview; an outdated or
-corrupt local preview is regenerated. Different refinement step counts do
-not invalidate a compatible first pass.
-
-This reuses the existing native interpolation+refinement implementation; it
-does **not** claim the independently trained upscaler from FreeVideo.
+corrupt local preview is regenerated. The trained checkpoint requires exactly
+**eight preview and three refinement evaluations**. It is downloaded only
+after licensed/territorial runtime gating and verified against the publisher's
+SHA-256, original revision and byte count. Independent code and license:
+`scripts/studio_vdn_learned_upscaler.py` and
+`licenses/h3-latent-upscaler-MIT.txt`.
 
 ### Continue from a prior native video
 
@@ -155,13 +159,27 @@ sources fail explicitly instead of silently degrading to frame-only
 conditioning.
 
 The first continued window consumes 22 old frames as protected context,
-so only `frames - 22` new frames/audio are exported for that window.
-Later windows reuse the preceding window's actual AV latent tails.
-The original MP4 remains a separate Gallery artifact, and the new MP4
-contains **only newly generated material**. Studio Timeline can order
-these clips; this path does not secretly reencode or duplicate the parent
-video. Each new MP4 has a 32-kHz stereo soundtrack with bounded
-audio-latent rounding at the seam.
+so it samples only `frames - 22` *new* frames. Later windows reuse the
+preceding window's actual AV latent tails. The worker now decodes the
+**entire original Gallery chain** plus newly sampled material and emits
+**one full MP4** with no duplicated overlap; the parent remains independently
+available in Gallery. A native streaming PyAV mux assembles the continuous
+24-fps video and 32-kHz stereo PCM with 10-ms seam conditioning before
+encoding AAC once. The joined artifact's exact bytes are pinned in the
+next AV latent snapshot; the durable Gallery frame count is read from
+the actual worker's verified completion record.
+
+To avoid losing progress after a crash, each completed segment atomically
+commits its full RGB8 frame bytes, float32 stereo PCM and matching *high/low*
+AV-latent context. A separate Safetensors commit marker records source
+fingerprints, absolute timeline and SHA-256 of the finished bytes. On retry,
+unchanged windows are read as disk-backed arrays and are never re-sampled
+on CUDA; mismatched/tampered/incomplete segments are discarded. The job
+owns a bounded cache directory and the disk preflight runs before writing.
+Preview checkpoint recovery and sampler-step recovery still work for
+unfinished windows. The durable resolver also follows the authorized job
+ancestry to reuse unchanged original Ref2VA visual/audio references
+along the chain; missing or changed reference files are rejected.
 
 ### Acceptance boundary
 
