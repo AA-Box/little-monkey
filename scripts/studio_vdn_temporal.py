@@ -209,7 +209,9 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
     import numpy as np
     stored = (load_context(args.temporal_context_in,
                            args.temporal_source_video_sha256, checkpoint,
-                           args.temporal_source_job_id)
+                           args.temporal_source_job_id,
+                           identity_sha256=(args.temporal_source_identity_sha256
+                                            if getattr(args, "temporal_identity_in", "") else None))
               if args.temporal_context_in else None)
     source_frames = stored["total_frames"] if stored else 0
     frames_total = temporal_frame_plan(args.frames, args.segments)
@@ -290,8 +292,11 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             # FL2VA still requires its explicit first-image input on every
             # call. For subsequent windows it must agree with the protected
             # latent prefix, never reset to the original opening image.
-            window_keyframes = (keyframes if not was_continuing else
-                                {"image": continuation_anchor} if keyframes and continuation_anchor is not None else {})
+            # Qwen3-VL's FL2VA text encoder sees the *original* film image
+            # on every part. NativeTemporalPrefix separately protects the
+            # preceding 22-frame AV history in the actual H3 sampler. Replacing
+            # this image with the latest frame destroys long-range identity.
+            window_keyframes = keyframes
             if args.two_pass:
                 low_prefix = (NativeTemporalPrefix(denoiser, low_context, device)
                               if low_context else None)
@@ -477,9 +482,16 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                 os.replace(merged, output)
             finally:
                 merged.unlink(missing_ok=True)
+        identity_sha = ""
+        if getattr(args, "temporal_identity_out", ""):
+            identity_sha = save_first_identity(
+                args.temporal_identity_out, first_video=output,
+                inherited=getattr(args, "temporal_identity_in", "") or None,
+                expected_sha=getattr(args, "temporal_source_identity_sha256", "") or None)
         if args.temporal_context_out:
             save_context(args.temporal_context_out, context, low_context,
-                         output, checkpoint, args.job_id, source_frames + frames_total)
+                         output, checkpoint, args.job_id, source_frames + frames_total,
+                         identity_sha256=identity_sha)
         del video_memory
     total_frames = source_frames + frames_total
     return {"videos": total_frames,
