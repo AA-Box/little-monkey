@@ -438,12 +438,17 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                 low_context = preview_fallback(context)
             continuation_anchor = video_frames[-OVERLAP_FRAMES]
             if cache_root:
-                save_segment(
+                cached_ok = save_segment(
                     cache_root, part,
                     video_memory[old_cursor:cursor], cache_pcm,
                     context, low_context, model=checkpoint,
                     request_hash=stage_hash, predecessor_hash=predecessor_hash,
                     total_frames=source_frames + cursor)
+                if not cached_ok:
+                    print(json.dumps({"phase": "temporal_cache_bypassed",
+                                      "part": part + 1,
+                                      "reason": "disk-reserve-or-job-budget"}),
+                          flush=True)
             clear_native_sampler_stage(args, stage + "_refine" if args.two_pass else stage)
             print(json.dumps({"phase": "temporal_part_completed", "part": part + 1,
                               "framesDelivered": cursor, "audioSamples": audio_cursor}),
