@@ -181,6 +181,44 @@ unfinished windows. The durable resolver also follows the authorized job
 ancestry to reuse unchanged original Ref2VA visual/audio references
 along the chain; missing or changed reference files are rejected.
 
+### Original identity, streaming chain joining, and bounded recovery
+
+On the first successful native Gallery film, Little Monkey extracts an
+immutable, profile-owned PNG from the **original opening frame**. The pixel
+data is SHA256-pinned into each job's final AV-latent Safetensors record,
+including descendant jobs. A continuation verifies that the predecessor's
+identity PNG matches its stored fingerprint, and passes the same picture to
+the FL2VA workflow's Qwen3-VL visual text conditioning **on each window**.
+Unlike a replacement keyframe, this is compatible with the real 22-frame
+protected predecessor latent prefix: the original is the fixed visual
+reference; the existing AV tail remains the temporal start. Native Ref2VA
+continuations also retain their original immutable and verified image/audio
+references from the durable job ancestry. A legacy parent without this
+identity record fails explicitly rather than pretending character identity
+has been preserved. Semantic/perceptual identity quality still needs actual
+model evaluation; this mechanism does not guarantee unchanging faces.
+
+Native chained MP4 output now uses **bounded streaming** decoding and
+32-kHz stereo AAC encoding. The edge repair holds at most 320 samples of
+the previous soundtrack (plus one decoder chunk). It does not allocate
+the entire original chain soundtrack in RAM. H.264 clips with identical
+codec headers, canvas and frame rates take a packet-copy path with rebased
+PTS/DTS and a post-mux decoded-frame count check, avoiding reencoding
+earlier film segments. Any unsupported packet timing, mismatch or invalid
+copy is discarded, and a native x264 rebuild is used instead. The
+original parent Gallery artifact is never overwritten.
+
+Crash recovery retains only verified completed window RGB8 bytes,
+independently decoded PCM, and high/low audiovisual latent tails.
+The cache is limited to **12 GiB per job** and leaves at least **1 GiB**
+free for final assembly. Optional caching is bypassed (with a progress
+event) when the budget or disk reserve is insufficient, so an otherwise
+valid inference does not fail solely because of its extra checkpoint.
+A native job lifecycle cleanup removes completed/cancelled/exhausted
+retry caches and prunes stale or orphaned scratch directories on startup.
+Resumable jobs retain committed windows and sampler/preview recovery data.
+No claim of live, mid-GPU-kernel state migration is made.
+
 ### Acceptance boundary
 
 The CPU contracts validate deterministic frame/audio planning, source
