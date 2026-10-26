@@ -679,7 +679,11 @@ pub async fn generation_vdn_run(
                             VdnBackend::FreeVideoAdaptive => "vdn-h3-freevideo-adaptive",
                         },
                         &request.prompt, request.steps, request.seed,
-                        completed_frame_count(&stdout_path)?,
+                        if request.backend == VdnBackend::Diffusers {
+                            completed_frame_count(&stdout_path)?
+                        } else {
+                            request.frames
+                        },
                         first.is_some() || !request.reference_image_paths.is_empty()
                             || request.reference_video_path.is_some(), &bytes
                     )
