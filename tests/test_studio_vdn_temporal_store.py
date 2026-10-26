@@ -124,7 +124,8 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 if "videos" in kwargs["output"]:
                     result["videos"] = [[np.zeros((32, 32, 3), dtype=np.uint8)
                                          for _ in range(frames)]]
-                    result["audio"] = torch.zeros((1, 2, 207 * 800))
+                    result["audio"] = torch.full((1, 2, 207 * 800),
+                        0.65 if len(self.calls) > 2 else -0.35)
                     result["sampling_rate"] = 32000
                 return result
 
@@ -146,6 +147,7 @@ class RealTensorAndWindowContracts(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temp:
                 base = Path(temp)
+                encoded_pcm = []
                 def run(job_id, source_path="", source_sha="", source_id="", segments=2,
                         refine_from="", expect_cached=False):
                     args = SimpleNamespace(
@@ -166,6 +168,8 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                         self.assertEqual(fps, 24)
                         self.assertEqual(audio_sample_rate, 32000)
                         self.assertEqual(audio.shape[1], temporal.emitted_audio_samples(_video.shape[0]))
+                        encoded_pcm.append(hashlib.sha256(
+                            audio.detach().cpu().contiguous().numpy().tobytes()).hexdigest())
                         Path(output_path).write_bytes(b"\x00\x00\x00\x18ftypisom" + b"x"*128)
                     report = temporal.render_temporal_video(
                         pipe, args, torch, "cpu", {}, [], "vdn-h3", object(),
@@ -184,6 +188,8 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 self.assertTrue(Path(store.preview_path(args.checkpoint, 1)).is_file())
                 _, cached_report = run(parent, expect_cached=True)
                 self.assertEqual(cached_report["videos"], 226)
+                self.assertEqual(encoded_pcm[0], encoded_pcm[1],
+                                 "Crash resume must reconstruct exactly the same stereo PCM seams")
                 refined_job = str(uuid.uuid4())
                 copied, again = run(refined_job, segments=2, refine_from=args.checkpoint)
                 self.assertEqual(again["videos"], 226)
