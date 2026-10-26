@@ -257,6 +257,11 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                     source_video.height != newer_video.height or
                     source_video.width % 2 or source_video.height % 2):
                 raise ValueError("The continuation changes native chain canvas")
+            # MP4 writes its header on the first mux. Register BOTH
+            # tracks before writing even one video packet.
+            target_audio = output.add_stream("aac", rate=RATE)
+            target_audio.layout = "stereo"
+            target_audio.bit_rate = 192000
             if copy_video:
                 if not _can_copy_h264(source_video, newer_video):
                     raise ValueError("H264 source parameters differ")
@@ -294,9 +299,6 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                 for packet in target_video.encode(None):
                     output.mux(packet)
 
-            target_audio = output.add_stream("aac", rate=RATE)
-            target_audio.layout = "stereo"
-            target_audio.bit_rate = 192000
             # Video packet iterators consume the input containers. Rewind
             # before decoding each original soundtrack independently.
             one.seek(0)
