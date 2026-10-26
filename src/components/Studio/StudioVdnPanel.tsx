@@ -44,7 +44,8 @@ export function StudioVdnPanel({
   const [fp8, setFp8] = useState(false);
   const [offload, setOffload] = useState(true);
   const [memoryMode, setMemoryMode] = useState<"auto" | "resident" | "stream_cpu" | "stream_disk">("auto");
-  const [refineSteps, setRefineSteps] = useState(3);
+  // Pinned learned H3 resizer uses the published 8+3 sampling schedule.
+  const refineSteps = 3;
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [licenseReason, setLicenseReason] = useState<string | null | undefined>(undefined);
   const [region, setRegion] = useState<Region>(null);
@@ -165,7 +166,7 @@ export function StudioVdnPanel({
 
   async function queueAfter(parent: DurableVdnJob) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
-        backend !== "diffusers" || !trustRemoteCode) return;
+        backend !== "diffusers" || !trustRemoteCode || (queueNativeTwoPass && steps !== 8)) return;
     setError(null);
     try {
       const jobId = crypto.randomUUID();
@@ -211,7 +212,8 @@ export function StudioVdnPanel({
 
   async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
-        !trustRemoteCode || running || (segments > 1 && Boolean(last))) return;
+        !trustRemoteCode || running || (segments > 1 && Boolean(last)) ||
+        (twoPass && steps !== 8)) return;
     const id = crypto.randomUUID();
     job.current = id;
     setRunning(true);
@@ -590,7 +592,7 @@ export function StudioVdnPanel({
         {backend === "diffusers" && <label className="flex items-center gap-2 text-muted">
           <input type="checkbox" checked={queueNativeTwoPass} disabled={running}
             onChange={(event) => setQueueNativeTwoPass(event.target.checked)} />
-          Use native two-pass for queued latent continuations
+          Use native learned 3D two-pass (8+3) for queued latent continuations
         </label>}
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
@@ -608,21 +610,20 @@ export function StudioVdnPanel({
           </Button>
           <Button size="sm" variant="secondary"
             disabled={running || backend !== "diffusers" || (segments > 1 && Boolean(last)) || !python || !probeInfo || !prompt.trim() ||
-              licenseReason !== null || !trustRemoteCode}
+              licenseReason !== null || !trustRemoteCode || steps !== 8}
             onClick={() => void run(true)}>
-            <Play size={13} /> Native latent two-pass (reuses pass one)
+            <Play size={13} /> Native learned 3D two-pass (8+3)
           </Button>
           {running && <Button size="sm" variant="secondary" onClick={() => void cancel()}>
             <Square size={13} /> Cancel VDN job
           </Button>}
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
-        {backend === "diffusers" && <label className="grid gap-1 text-muted">
-          Native latent refinement evaluations
-          <input type="number" min={1} max={12} disabled={running} value={refineSteps}
-            className="rounded border border-border bg-background p-1 text-foreground"
-            onChange={(event) => setRefineSteps(Math.max(1, Math.min(12, Number(event.target.value) || 3)))} />
-        </label>}
+        {backend === "diffusers" && <p className="text-muted">
+          Verified 3D learned H3 latent upscaler, 8 preview steps and 3 calibrated
+          refinement steps. The pinned trained model downloads on first use;
+          no interpolation fallback is used in native two-pass mode.
+        </p>}
         {durableJobs.length > 0 && <div className="grid gap-1">
           <strong>Persisted VDN jobs</strong>
           {durableJobs.slice(-8).map((item) =>
