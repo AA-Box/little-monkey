@@ -342,6 +342,26 @@ def attach_native_lora(model, files, *, scale=1.0):
 
 
 
+def report_native_execution_device(model, device):
+    """Teach meta-backed HF model device-dependent helpers the real device."""
+    import torch
+    current_type = type(model)
+    cuda_device = torch.device(device)
+    if not isinstance(cuda_device, torch.device) or cuda_device.type != "cuda":
+        raise ValueError("Native H3 original shards currently require CUDA")
+    if getattr(model, "_little_monkey_device_override", False):
+        return model
+
+    class NativeMetaExecutionModel(current_type):
+        @property
+        def device(self):
+            return cuda_device
+
+    model.__class__ = NativeMetaExecutionModel
+    model._little_monkey_device_override = True
+    return model
+
+
 def load_native_h3_components(pipe, denoiser_partition, *, device, fp8=False,
                               lora_files=(), video_vram_bytes=0):
     """Instantiate all four generation models on meta, then register direct hooks.
@@ -399,13 +419,7 @@ def load_native_h3_components(pipe, denoiser_partition, *, device, fp8=False,
     # Report the actual execution device without materializing weights.
     cuda_device = torch.device(device)
     for name in ("text_encoder", denoiser_partition, "vae", "audio_vae"):
-        model = getattr(pipe, name)
-        model_type = type(model)
-        class NativeDeviceModel(model_type):
-            @property
-            def device(self):
-                return cuda_device
-        model.__class__ = NativeDeviceModel
+        report_native_execution_device(getattr(pipe, name), cuda_device)
 
     # ModularPipeline.device normally reads the first parameter, which is
     # meta when no layer is executing. Keep pipeline state CUDA while each
