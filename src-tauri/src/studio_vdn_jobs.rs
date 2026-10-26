@@ -100,6 +100,73 @@ fn active() -> &'static Mutex<HashSet<String>> {
     static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
 }
+/// Remove only native generated scratch windows, never the published MP4,
+/// original film identity, or content-addressed AV latent tail.
+fn remove_segment_cache(app: &AppHandle, id: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(id).map_err(|_| "Invalid native recovery cache job ID")?;
+    let root = app.profile_data_dir().map_err(|e| e.to_string())?
+        .join("studio-vdn-h3").join("temporal-segments");
+    let root_meta = match fs::symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err("Unsafe native recovery cache root".into());
+    }
+    let folder = root.join(id);
+    let folder_meta = match fs::symlink_metadata(&folder) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if folder_meta.file_type().is_symlink() || !folder_meta.is_dir() {
+        return Err("Unsafe native recovery cache directory".into());
+    }
+    fs::remove_dir_all(folder).map_err(|e| e.to_string())
+}
+
+/// Startup/lifecycle GC, never touches jobs that can be resumed or running.
+/// For orphan directories without a journal we retain seven days for manual
+/// recovery, then remove them if they are not registered in this process.
+fn prune_native_cache(app: &AppHandle, jobs: &[VdnJob]) {
+    let keep: HashSet<&str> = jobs.iter()
+        .filter(|job| matches!(job.status, VdnJobStatus::Queued
+            | VdnJobStatus::Running | VdnJobStatus::Interrupted)
+            || (matches!(job.status, VdnJobStatus::Failed)
+                && job.attempts < MAX_ATTEMPTS
+                && now_ms().saturating_sub(job.updated_at_ms) < 7 * 86_400_000))
+        .map(|job| job.id.as_str()).collect();
+    let root = match app.profile_data_dir() {
+        Ok(folder) => folder.join("studio-vdn-h3").join("temporal-segments"),
+        Err(_) => return,
+    };
+    if !fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if uuid::Uuid::parse_str(&name).is_err() || keep.contains(name.as_str()) {
+                continue;
+            }
+            if active().lock().is_ok_and(|live| live.contains(&name)) {
+                continue;
+            }
+            let found = jobs.iter().find(|j| j.id == name);
+            let expired_orphan = found.is_none()
+                && entry.metadata().ok()
+                    .and_then(|m| m.modified().ok())
+                    .is_some_and(|when| std::time::SystemTime::now()
+                        .duration_since(when).is_ok_and(|age|
+                            age.as_secs() >= 7 * 24 * 3600));
+            if found.is_some() || expired_orphan {
+                let _ = remove_segment_cache(app, &name);
+            }
+        }
+    }
+}
+
 fn directory(app: &AppHandle) -> Result<PathBuf, String> {
     let p = app.profile_data_dir().map_err(|e| e.to_string())?
         .join("studio-v1").join("vdn-jobs");
@@ -489,15 +556,13 @@ fn dispatch(app: AppHandle, id: String) {
             });
             if result.is_ok() {
                 crate::studio_video_timeline::notify_video_published(&app);
-                // Completed RGB8 windows can consume gigabytes. Their
-                // published content-addressed MP4 and AV tail survive;
-                // recovery files are needed only until Gallery commit.
-                if let Ok(root) = app.profile_data_dir() {
-                    let cache = root.join("studio-vdn-h3").join("temporal-segments").join(&id);
-                    if let Ok(meta) = fs::symlink_metadata(&cache) {
-                        if meta.is_dir() && !meta.file_type().is_symlink() {
-                            let _ = fs::remove_dir_all(&cache);
-                        }
+            }
+            if let Ok(jobs) = list(&app) {
+                if let Some(finished) = jobs.iter().find(|row| row.id == id) {
+                    if matches!(finished.status, VdnJobStatus::Completed | VdnJobStatus::Cancelled)
+                        || (matches!(finished.status, VdnJobStatus::Failed)
+                            && finished.attempts >= MAX_ATTEMPTS) {
+                        let _ = remove_segment_cache(&app, &id);
                     }
                 }
             }
@@ -577,6 +642,7 @@ pub fn generation_vdn_cancel_job(app: AppHandle, job_id: String) -> Result<VdnJo
 pub fn start_background_recovery(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let Ok(jobs) = list(&app) else { return; };
+        prune_native_cache(&app, &jobs);
         for j in jobs {
             if let Ok(Some(entry_id)) = published_entry(&app, &j.id) {
                 let _ = modify(&app, &j.id, |record| {
@@ -593,7 +659,7 @@ pub fn start_background_recovery(app: AppHandle) {
                         j.status = if j.attempts < MAX_ATTEMPTS {
                             VdnJobStatus::Queued
                         } else { VdnJobStatus::Interrupted };
-                        j.error = Some("Recovered after app exit; restarting from seed".into());
+                        j.error = Some("Recovered after app exit; resuming verified native segment/checkpoint".into());
                         Ok(())
                     }) {
                         if matches!(updated.status, VdnJobStatus::Queued) { dispatch(app.clone(), j.id); }
