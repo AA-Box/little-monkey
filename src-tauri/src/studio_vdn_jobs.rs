@@ -473,6 +473,17 @@ fn dispatch(app: AppHandle, id: String) {
             });
             if result.is_ok() {
                 crate::studio_video_timeline::notify_video_published(&app);
+                // Completed RGB8 windows can consume gigabytes. Their
+                // published content-addressed MP4 and AV tail survive;
+                // recovery files are needed only until Gallery commit.
+                if let Ok(root) = app.profile_data_dir() {
+                    let cache = root.join("studio-vdn-h3").join("temporal-segments").join(&id);
+                    if let Ok(meta) = fs::symlink_metadata(&cache) {
+                        if meta.is_dir() && !meta.file_type().is_symlink() {
+                            let _ = fs::remove_dir_all(&cache);
+                        }
+                    }
+                }
             }
         }
         if let Ok(mut running) = active().lock() { running.remove(&id); }
