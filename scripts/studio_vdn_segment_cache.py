@@ -16,6 +16,13 @@ MAX_CANVAS_PIXELS = 1344 * 768
 MAX_AUDIO_SAMPLES = 600000
 SCHEMA = "little-monkey-vdn-segment-cache-v1"
 
+# During native execution all sources are embedded into one standalone worker;
+# only direct CPU unit-test imports require an on-disk module lookup.
+if "validate_context" not in globals() or "_save" not in globals() or "_read" not in globals():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from studio_vdn_temporal_store import validate_context, _save, _read
+
 
 def _sha(path):
     value = hashlib.sha256()
@@ -52,7 +59,6 @@ def _write_atomic(destination, raw):
 
 def save_segment(root, part, frames, audio, high, low, *, model, request_hash,
                  predecessor_hash, total_frames):
-    from studio_vdn_temporal_store import validate_context, _save
     import numpy as np
     video_path, audio_path, state_path = _paths(root, part)
     if any(path.is_symlink() for path in (video_path, audio_path, state_path)):
@@ -77,7 +83,6 @@ def save_segment(root, part, frames, audio, high, low, *, model, request_hash,
     state_path.unlink(missing_ok=True)
     _write_atomic(video_path, rgb)
     _write_atomic(audio_path, pcm)
-    from studio_vdn_temporal_store import _save
     _save(state_path, {
         "high_video": high["video"], "high_audio": high["audio"],
         "low_video": low["video"], "low_audio": low["audio"],
@@ -100,7 +105,6 @@ def load_segment(root, part, *, model, request_hash, predecessor_hash,
                  expected_frames, expected_total_frames):
     """Return disk-backed RGB and bounded PCM only on a complete match."""
     import numpy as np
-    from studio_vdn_temporal_store import _read, validate_context
     rgb_path, pcm_path, state_path = _paths(root, part)
     if any(path.is_symlink() for path in (rgb_path, pcm_path, state_path)):
         raise ValueError("Symlink in native segment cache")
