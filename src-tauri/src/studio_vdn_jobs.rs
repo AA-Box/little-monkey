@@ -12,6 +12,17 @@ use std::{fs, path::{Path, PathBuf}, sync::{Mutex, OnceLock}, collections::HashS
 use tauri::AppHandle;
 
 const MAX_ATTEMPTS: u32 = 3;
+
+/// A native CUDA out-of-memory condition can be transient (GPU contention)
+/// even after the worker has exhausted its progressive placement tiers.
+fn recoverable_native_oom(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    message.contains("cuda out of memory")
+        || message.contains("all native cuda placement tiers exhausted")
+        || message.contains("cublas_status_alloc_failed")
+        || message.contains("cuda error: out of memory")
+}
+
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all="snake_case")]
@@ -537,7 +548,7 @@ fn dispatch(app: AppHandle, id: String) {
                 Err(error) => Err(error),
                 },
             };
-            let _ = modify(&app, &id, |j| {
+            let updated = modify(&app, &id, |j| {
                 if matches!(j.status, VdnJobStatus::Cancelled) && result.is_err() {
                     return Ok(());
                 }
@@ -548,7 +559,16 @@ fn dispatch(app: AppHandle, id: String) {
                         j.error = None;
                     }
                     Err(error) => {
-                        j.status = VdnJobStatus::Failed;
+                        // Bounded autonomous recovery after every native
+                        // placement tier has OOMed; retain finished segments
+                        // and sampler checkpoints. Other failures stay failed.
+                        j.status = if j.attempts < MAX_ATTEMPTS
+                            && j.request.backend == crate::studio_vdn::VdnBackend::Diffusers
+                            && recoverable_native_oom(error) {
+                            VdnJobStatus::Queued
+                        } else {
+                            VdnJobStatus::Failed
+                        };
                         j.error = Some(error.chars().take(500).collect());
                     }
                 }
@@ -568,6 +588,15 @@ fn dispatch(app: AppHandle, id: String) {
             }
         }
         if let Ok(mut running) = active().lock() { running.remove(&id); }
+        if let Ok(ref job) = updated {
+            if matches!(job.status, VdnJobStatus::Queued) {
+                // Release GPU reservation and allow another process to free
+                // memory before another full tiered attempt. The journal
+                // survives a process exit even during this delay.
+                let delay = (job.attempts as u64).saturating_mul(10).min(30);
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+        }
         dispatch_waiting(&app);
     });
 }
