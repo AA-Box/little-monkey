@@ -25,6 +25,7 @@ const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py")
 const TEMPORAL_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal.py");
 const TEMPORAL_STORE_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal_store.py");
 const TEMPORAL_CHAIN_SOURCE: &str = include_str!("../../scripts/studio_vdn_chain.py");
+const TEMPORAL_SEGMENT_CACHE_SOURCE: &str = include_str!("../../scripts/studio_vdn_segment_cache.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -53,7 +54,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_CHAIN_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_CHAIN_SOURCE}\n{TEMPORAL_SEGMENT_CACHE_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
