@@ -219,8 +219,16 @@ async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
         request.resolved_temporal_source_sha256 =
             Some(format!("{:x}", Sha256::digest(&bytes)));
         request.resolved_temporal_source_job_id = Some(original_job_id.into());
-        // The decoded previous final frame is also an optional FL2VA anchor;
-        // the source's verified AV latent tail, not this image, supplies context.
+        // The previous Gallery clip contains the entire published chain.
+        // A profile-owned scratch copy is handed to the native re-muxer;
+        // the pinned SHA is checked again by the worker before joining.
+        if entry.media_type != "video/mp4" {
+            return Err("Native AV continuation requires an MP4 Gallery source".into());
+        }
+        let scratch = directory(app)?.join(format!("{}.temporal-parent.mp4", job.id));
+        fs::write(&scratch, &bytes).map_err(|e| e.to_string())?;
+        request.resolved_temporal_parent_path = Some(scratch.to_string_lossy().into_owned());
+        return Ok((request, Some(scratch)));
     }
     if request.continuation_mode == "video_reference" {
         // Retain temporal motion *and* the original soundtrack by supplying the
