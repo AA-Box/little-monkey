@@ -130,6 +130,11 @@ class RealTensorAndWindowContracts(unittest.TestCase):
 
         original = temporal.NativeTemporalPrefix
         old_join = getattr(temporal, "join_native_chain", None)
+        old_upscaler = getattr(temporal, "native_learned_upscale", None)
+        old_schedule = getattr(temporal, "native_h3_refine_schedule", None)
+        temporal.native_learned_upscale = lambda video, cache, target: torch.nn.functional.interpolate(
+            video, size=(video.shape[2], *target), mode="trilinear", align_corners=False)
+        temporal.native_h3_refine_schedule = lambda pipe, torch: contextlib.nullcontext()
         temporal.NativeTemporalPrefix = FakePrefix
         def fake_join(parent, child, target, *, parent_frames, child_frames, expected_parent_sha256):
             self.assertEqual(hashlib.sha256(Path(parent).read_bytes()).hexdigest(), expected_parent_sha256)
@@ -148,6 +153,7 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                         seed=42, frames=124, segments=segments, steps=8, refine_steps=3,
                         two_pass=True, checkpoint=str(base / (job_id + ".preview")),
                         refine_from=refine_from, step_checkpoint_root=str(base / "step"),
+                        upscaler_cache_dir=str(base / "model-cache"),
                         temporal_context_in=source_path,
                         temporal_parent=str(base / (source_id + ".mp4")) if source_id else "",
                         temporal_segment_root=str(base / (job_id + ".parts")),
@@ -201,6 +207,14 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 del temporal.join_native_chain
             else:
                 temporal.join_native_chain = old_join
+            if old_upscaler is None:
+                del temporal.native_learned_upscale
+            else:
+                temporal.native_learned_upscale = old_upscaler
+            if old_schedule is None:
+                del temporal.native_h3_refine_schedule
+            else:
+                temporal.native_h3_refine_schedule = old_schedule
 
 
 if __name__ == "__main__":
