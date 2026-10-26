@@ -183,6 +183,14 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity,
     if temporal_context is not None:
         digest.update(temporal_context.digest.encode("ascii"))
     digest.update(str(args.internal_attempt).encode("ascii"))
+    # The native tiling configuration affects floating-point roundoff.
+    # A prior sampler snapshot cannot be reused across changed tile shapes.
+    for value in (getattr(args, "lowmem", "auto"),
+                  getattr(args, "query_chunk", 0),
+                  getattr(args, "head_chunk", 0),
+                  getattr(args, "ff_chunk", 256)):
+        digest.update(str(value).encode("ascii"))
+        digest.update(b"\0")
     digest.update(str(diffusers.__version__).encode("ascii"))
     digest.update(str(torch.__version__).encode("ascii"))
     if stage == "refine":

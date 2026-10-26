@@ -45,6 +45,10 @@ export function StudioVdnPanel({
   const [offload, setOffload] = useState(true);
   const [memoryMode, setMemoryMode] = useState<"auto" | "resident" | "stream_cpu" | "stream_disk">("auto");
   // Pinned learned H3 resizer uses the published 8+3 sampling schedule.
+  const [lowmem, setLowmem] = useState<"auto" | "off" | "force">("auto");
+  const [queryChunk, setQueryChunk] = useState(0);
+  const [headChunk, setHeadChunk] = useState(0);
+  const [ffChunk, setFfChunk] = useState(256);
   const refineSteps = 3;
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [licenseReason, setLicenseReason] = useState<string | null | undefined>(undefined);
@@ -155,7 +159,7 @@ export function StudioVdnPanel({
       referenceAudioPath: referenceAudio,
       loraPaths, steps, frames, segments: backend === "diffusers" ? segments : 1,
       seed: Number(seed) || 0,
-      fp8, offloadDit: offload, memoryMode, backend,
+      fp8, offloadDit: offload, memoryMode, lowmem, queryChunk, headChunk, ffChunk, backend,
       nativeTwoPass: twoPass, refineSteps, refineFromJobId: null,
       repoRoot: repoRoot || null, checkpointRoot: checkpointRoot || null,
       gpuClass: backend === "optimized_ulysses" ? gpuClass : null,
@@ -322,9 +326,39 @@ export function StudioVdnPanel({
             <option value="auto">Adaptive GPU / streamed CPU / quantization / disk</option>
             <option value="resident">GPU resident only</option>
             <option value="stream_cpu">Stream blocks from CPU (136 GiB available RAM)</option>
-            <option value="stream_disk">Disk-backed block streaming (160 GiB storage + 40 GiB RAM)</option>
+            <option value="stream_disk">Sharded H3 + Qwen disk loading (180 GiB scratch + 12 GiB free RAM + 8 GiB VRAM)</option>
           </select>
         </label>
+        {backend === "diffusers" && <div className="grid gap-2 text-muted">
+          <label className="grid gap-1">
+            Native chunked attention and feed-forward execution
+            <select value={lowmem} disabled={running}
+              className="rounded border border-border bg-background p-1 text-foreground"
+              onChange={(event) => setLowmem(event.target.value as typeof lowmem)}>
+              <option value="auto">Auto: chunk for streamed/offloaded model weights</option>
+              <option value="force">On for all native CUDA plans</option>
+              <option value="off">Off: reference Diffusers attention path</option>
+            </select>
+          </label>
+          <div className="grid grid-cols-3 gap-2">
+            <label className="grid gap-1">Query tokens
+              <input type="number" min={0} max={8192} value={queryChunk}
+                disabled={running || lowmem === "off"} className="rounded border border-border bg-background p-1 text-foreground"
+                onChange={(event) => setQueryChunk(Math.max(0, Math.min(8192, Number(event.target.value) || 0)))} />
+            </label>
+            <label className="grid gap-1">Attention heads
+              <input type="number" min={0} max={128} value={headChunk}
+                disabled={running || lowmem === "off"} className="rounded border border-border bg-background p-1 text-foreground"
+                onChange={(event) => setHeadChunk(Math.max(0, Math.min(128, Number(event.target.value) || 0)))} />
+            </label>
+            <label className="grid gap-1">FFN tokens
+              <input type="number" min={0} max={4096} value={ffChunk}
+                disabled={running || lowmem === "off"} className="rounded border border-border bg-background p-1 text-foreground"
+                onChange={(event) => setFfChunk(Math.max(0, Math.min(4096, Number(event.target.value) || 0)))} />
+            </label>
+          </div>
+          <p>Zero means adaptive for attention. Every query still attends to all video, audio and text keys. These controls reduce activation peaks but do not bypass model weight-loading RAM requirements.</p>
+        </div>}
         <label className="grid gap-1 text-muted">
           VDN execution backend
           <select aria-label="VDN execution backend" disabled={running}
