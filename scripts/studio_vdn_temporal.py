@@ -265,8 +265,16 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                     if cached["audio"].shape[1] != expected_audio:
                         raise ValueError("Cached native segment changed its audio clock")
                     video_memory[cursor:cursor+new_count] = cached["video"]
-                    audio_chunks.append(np.array(cached["audio"], copy=True))
-                    audio_cursor += expected_audio
+                    # Persist only independently decoded PCM. A seam repair
+                    # modifies the previous segment's tail in-place; replay it
+                    # in original order after a crash, never double-apply a
+                    # fade to an already smoothed cached segment.
+                    recovered_audio = temporal_audio_window(
+                        audio_chunks[-1] if audio_chunks else None,
+                        np.array(cached["audio"], copy=True),
+                        expected_audio)
+                    audio_chunks.append(recovered_audio)
+                    audio_cursor += recovered_audio.shape[1]
                     cursor += new_count
                     context, low_context = cached["high"], cached["low"]
                     continuation_anchor = cached["video"][-OVERLAP_FRAMES].copy()
@@ -404,9 +412,15 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                           if was_continuing else 0)
             next_cursor = cursor + length
             wanted = emitted_audio_samples(next_cursor, AUDIO_SAMPLE_RATE) - audio_cursor
-            audio_slice = decoded_audio[:, audio_trim:]
+            # Normalize this window independently for persistent recovery,
+            # then apply the *cross-window* repair only when assembling the
+            # current chain. Caching the already-smoothed PCM would replay
+            # the seam twice on restart and alter the soundtrack.
+            cache_pcm = temporal_audio_window(
+                None, decoded_audio[:, audio_trim:], wanted)
             audio_slice = temporal_audio_window(
-                audio_chunks[-1] if audio_chunks else None, audio_slice, wanted)
+                audio_chunks[-1] if audio_chunks else None,
+                cache_pcm.copy(), wanted)
             audio_chunks.append(audio_slice)
             audio_cursor += audio_slice.shape[1]
             cursor = next_cursor
@@ -421,7 +435,7 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             if cache_root:
                 save_segment(
                     cache_root, part,
-                    video_memory[old_cursor:cursor], audio_slice,
+                    video_memory[old_cursor:cursor], cache_pcm,
                     context, low_context, model=checkpoint,
                     request_hash=stage_hash, predecessor_hash=predecessor_hash,
                     total_frames=source_frames + cursor)
