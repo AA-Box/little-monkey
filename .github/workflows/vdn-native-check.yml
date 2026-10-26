@@ -11,6 +11,7 @@ on:
       - "scripts/studio_vdn_sampler.py"
       - "scripts/studio_vdn_temporal.py"
       - "scripts/studio_vdn_temporal_store.py"
+      - "scripts/studio_vdn_chain.py"
       - "scripts/studio-vdn-fast-worker.py"
       - "src-tauri/src/studio_vdn.rs"
       - "src-tauri/src/studio_vdn_jobs.rs"
@@ -27,11 +28,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Syntax-check owned Python workers
         run: |
-          python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py scripts/studio_vdn_sampler.py scripts/studio_vdn_temporal.py scripts/studio_vdn_temporal_store.py
+          python3 -m py_compile scripts/studio-vdn-h3-worker.py scripts/studio-vdn-fast-worker.py scripts/studio_vdn_sampler.py scripts/studio_vdn_temporal.py scripts/studio_vdn_temporal_store.py scripts/studio_vdn_chain.py
           python3 - <<'PY'
           from pathlib import Path
           scripts = ("studio_vdn_sampler.py", "studio_vdn_temporal_store.py",
-                     "studio_vdn_temporal.py", "studio-vdn-h3-worker.py")
+                     "studio_vdn_chain.py", "studio_vdn_temporal.py", "studio-vdn-h3-worker.py")
           sources = [Path("scripts", p).read_text() for p in scripts]
           compile("\n".join(sources), "staged-vdn-worker.py", "exec")
           PY
@@ -55,8 +56,9 @@ jobs:
           python-version: "3.11"
       - name: Install bounded CPU tensor dependencies (no GPU / model weights)
         run: |
-          python -m pip install "numpy>=1.24,<3" "safetensors>=0.5,<1"
+          python -m pip install "numpy>=1.24,<3" "safetensors>=0.5,<1" "av>=12,<18"
           python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.5.1+cpu"
       - name: Run real CPU AV snapshot and mocked full two-pass/continuation contracts
         run: |
           python -m unittest discover -s tests -p "test_studio_vdn_temporal_store.py" -v
+          python -m unittest discover -s tests -p "test_studio_vdn_chain.py" -v
