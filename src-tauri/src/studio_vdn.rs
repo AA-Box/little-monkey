@@ -279,8 +279,8 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
             && request.resolved_temporal_context_path.is_none() {
             return Err("AV latent continuation must resolve a pinned Gallery source".into());
         }
-        if request.reference_video_path.is_some() || request.last_image_path.is_some() {
-            return Err("Native AV latent continuation cannot mix motion video or final-frame anchors".into());
+        if request.last_image_path.is_some() {
+            return Err("Native AV latent continuation cannot mix a fixed final-frame anchor".into());
         }
     }
     if request.continuation_mode == "video_reference" {
