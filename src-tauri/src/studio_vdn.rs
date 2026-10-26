@@ -24,6 +24,7 @@ const WORKER: &str = include_str!("../../scripts/studio-vdn-h3-worker.py");
 const SAMPLER_SOURCE: &str = include_str!("../../scripts/studio_vdn_sampler.py");
 const TEMPORAL_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal.py");
 const TEMPORAL_STORE_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal_store.py");
+const TEMPORAL_CHAIN_SOURCE: &str = include_str!("../../scripts/studio_vdn_chain.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -52,7 +53,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_CHAIN_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
@@ -138,6 +139,8 @@ pub struct VdnRunRequest {
     pub resolved_temporal_source_sha256: Option<String>,
     #[serde(skip)]
     pub resolved_temporal_source_job_id: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_parent_path: Option<String>,
     #[serde(default)]
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
@@ -504,6 +507,9 @@ pub async fn generation_vdn_run(
         }
         process.arg("--temporal-context-out")
             .arg(continuation_root.join(format!("{}.safetensors", request.job_id)));
+        if let Some(parent_path) = &request.resolved_temporal_parent_path {
+            process.arg("--temporal-parent").arg(parent_path);
+        }
         if let Some(source) = &request.resolved_temporal_context_path {
             let digest = request.resolved_temporal_source_sha256.as_ref()
                 .ok_or("Unpinned native temporal source SHA-256")?;
@@ -825,6 +831,7 @@ mod tests {
             resolved_temporal_context_path: None,
             resolved_temporal_source_sha256: None,
             resolved_temporal_source_job_id: None,
+            resolved_temporal_parent_path: None,
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],
