@@ -72,7 +72,7 @@ jobs:
       - name: Install PyTorch CPU kernel without downloading model weights
         run: |
           python -m pip install --disable-pip-version-check "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --disable-pip-version-check "accelerate>=1.8,<2" safetensors
+          python -m pip install --disable-pip-version-check "accelerate>=1.8,<2" safetensors "av>=15,<17" numpy
       - name: Real full-context attention projection and FFN parity
         run: |
           python -m unittest discover -s tests -p "test_studio_vdn_lowmem_torch.py" -v
@@ -80,3 +80,4 @@ jobs:
           python -m unittest discover -s tests -p "test_studio_vdn_native_shards.py" -v
           python -m unittest discover -s tests -p "test_studio_vdn_decoder.py" -v
           python -m unittest discover -s tests -p "test_studio_vdn_stream_encode.py" -v
+          python -m unittest discover -s tests -p "test_studio_vdn_mp4_probe.py" -v
