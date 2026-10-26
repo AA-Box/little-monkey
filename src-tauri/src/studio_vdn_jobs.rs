@@ -709,6 +709,16 @@ pub fn start_background_recovery(app: AppHandle) {
 mod tests {
     use super::*;
     #[test]
+    fn native_cuda_oom_retries_only_actual_memory_errors() {
+        assert!(recoverable_native_oom("CUDA out of memory, failed to allocate 3 GiB"));
+        assert!(recoverable_native_oom("All native CUDA placement tiers exhausted their memory budget"));
+        assert!(recoverable_native_oom("CUBLAS_STATUS_ALLOC_FAILED"));
+        assert!(!recoverable_native_oom("Model license denied in Europe"));
+        assert!(!recoverable_native_oom("Native video source hash mismatch"));
+        assert!(!recoverable_native_oom("No CUDA GPU"));
+        assert!(!recoverable_native_oom("Insufficient disk space"));
+    }
+    #[test]
     fn journal_reloads_exact_seed_and_source_identity() {
         let root = std::env::temp_dir().join(format!("vdn-durable-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
