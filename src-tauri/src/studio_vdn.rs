@@ -415,6 +415,29 @@ fn read_last_phase(log: &Path) -> Option<(String, String)> {
     })
 }
 
+/// Accept only a final completed event from our own sandboxed worker. The
+/// worker validates decoded frame totals before it reports a composed chain.
+fn completed_frame_count(log: &Path) -> Result<u32, String> {
+    let data = std::fs::read(log).map_err(|e| e.to_string())?;
+    if data.len() as u64 > MAX_LOG_BYTES {
+        return Err("Native VDN worker completion log exceeds safe bound".into());
+    }
+    let lines = String::from_utf8(data).map_err(|e| e.to_string())?;
+    for line in lines.lines().rev() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if value.get("phase").and_then(|v| v.as_str()) == Some("completed") {
+                let count = value.get("frames").and_then(|v| v.as_u64())
+                    .ok_or("Native VDN completion report has no frame count")?;
+                if !(120..=10000).contains(&count) {
+                    return Err("Native VDN frame count is out of safe bounds".into());
+                }
+                return Ok(count as u32);
+            }
+        }
+    }
+    Err("Native VDN worker finished without a verified frame count".into())
+}
+
 fn brief_error(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let compact = text.lines().rev().find(|line| line.contains("reason"))
@@ -630,11 +653,8 @@ pub async fn generation_vdn_run(
                             VdnBackend::FreeVideoAdaptive => "vdn-h3-freevideo-adaptive",
                         },
                         &request.prompt, request.steps, request.seed,
-                        (if request.resolved_temporal_context_path.is_some() {
-                            request.segments * (request.frames - 22)
-                        } else {
-                            request.frames + (request.segments - 1) * (request.frames - 22)
-                        }), first.is_some() || !request.reference_image_paths.is_empty()
+                        completed_frame_count(&stdout_path)?,
+                        first.is_some() || !request.reference_image_paths.is_empty()
                             || request.reference_video_path.is_some(), &bytes
                     )
                 }
