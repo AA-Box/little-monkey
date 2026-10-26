@@ -266,6 +266,8 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                     count = sum(1 for _ in clip.decode(video=0))
                     if count != expected:
                         raise ValueError("Native H264 source count differs from Gallery journal")
+                one.seek(0)
+                two.seek(0)
                 _mux_h264_copy(output, one, two, parent_frames)
             else:
                 target_video = output.add_stream("libx264", rate=FPS)
@@ -295,6 +297,10 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
             target_audio = output.add_stream("aac", rate=RATE)
             target_audio.layout = "stereo"
             target_audio.bit_rate = 192000
+            # Video packet iterators consume the input containers. Rewind
+            # before decoding each original soundtrack independently.
+            one.seek(0)
+            two.seek(0)
             cursor = 0
             for values in _fixed_audio_blocks(
                     _stream_joined_audio(one, two, expected_parent, expected_child)):
