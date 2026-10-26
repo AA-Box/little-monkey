@@ -36,6 +36,23 @@ if "native_sampler_recovery" not in globals():
         native_sampler_recovery, clear_native_sampler_stage,
     )
 
+if "install_native_h3_tiles" not in globals():
+    from studio_vdn_lowmem import install_native_h3_tiles, weight_stream_policy
+
+if "load_native_h3_components" not in globals():
+    from studio_vdn_native_shards import load_native_h3_components
+if "encode_h3_latent_video" not in globals():
+    from studio_vdn_stream_encode import encode_h3_latent_video, verify_h3_mp4
+
+if "install_lowmem_decoders" not in globals():
+    from studio_vdn_decoder import install_lowmem_decoders
+
+if "low_ram_disk_budget" not in globals():
+    from studio_vdn_disk_loader import (
+        low_ram_disk_budget, disk_component_kwargs, verify_model_indexes,
+        assert_disk_mapped_components,
+    )
+
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
 REF_MODEL_REPOSITORY = "MiniMaxAI/MiniMax-H3"
@@ -60,6 +77,11 @@ def parse_args(argv=None):
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--offload-dit", action="store_true")
     parser.add_argument("--memory-mode", choices=("auto", "resident", "stream_cpu", "stream_disk"), default="auto")
+    parser.add_argument("--lowmem", choices=("auto", "off", "force"), default="auto")
+    parser.add_argument("--weight-loader", choices=("native_original", "accelerate"), default="native_original")
+    parser.add_argument("--query-chunk", type=int, default=0)
+    parser.add_argument("--head-chunk", type=int, default=0)
+    parser.add_argument("--ff-chunk", type=int, default=256)
     parser.add_argument("--two-pass", action="store_true")
     parser.add_argument("--refine-from", default="")
     parser.add_argument("--checkpoint", default="")
@@ -69,6 +91,8 @@ def parse_args(argv=None):
     parser.add_argument("--internal-attempt", choices=("resident", "resident_fp8", "stream_cpu", "stream_disk", "fp8_disk", "int8_cpu", "fp8_cpu"), default="")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
+    if not 0 <= args.query_chunk <= 8192 or not 0 <= args.head_chunk <= 128 or not 0 <= args.ff_chunk <= 4096:
+        parser.error("Native H3 tile sizes exceed bounded limits")
     if args.self_test:
         print(json.dumps({
             "status": "ready_for_dependency_probe",
@@ -97,14 +121,14 @@ def parse_args(argv=None):
             "computeCapability": f"{cap[0]}.{cap[1]}",
             "vramBytes": torch.cuda.get_device_properties(0).total_memory,
             "torch": torch.__version__,
-            "fp8Supported": cap[0] >= 9,
+            "fp8Supported": native_fp8_capability(cap),
         }
         free_vram, _ = torch.cuda.mem_get_info()
         host_ram = available_host_ram()
         disk_free = shutil.disk_usage(Path.cwd()).free
         try:
             report["nativeMemoryPlans"] = choose_memory_plans(
-                free_vram, host_ram, disk_free, capability=cap[0],
+                free_vram, host_ram, disk_free, capability=cap,
                 torchao_available=importlib.util.find_spec("torchao") is not None,
             )
             report["resourcesReady"] = True
@@ -196,6 +220,16 @@ def is_cuda_oom(error):
     ))
 
 
+def native_fp8_capability(capability):
+    """TorchAO supports FP8 weight-only on Ada SM89 and newer NVIDIA GPUs."""
+    if isinstance(capability, (tuple, list)):
+        if len(capability) != 2:
+            raise ValueError("Expected CUDA (major,minor) capability")
+        return tuple(capability) >= (8, 9)
+    # Integers retain the legacy major-only admission; prefer (major,minor).
+    return float(capability) >= 8.9
+
+
 def choose_memory_plans(free_vram, host_ram, disk_free, *,
                         capability, offload=False, fp8=False, mode="auto",
                         torchao_available=True):
@@ -208,15 +242,16 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
         raise ValueError("Negative memory capacity")
     if mode not in ("auto", "resident", "stream_cpu", "stream_disk"):
         raise ValueError("Unsupported memory policy")
-    if fp8 and capability < 9:
-        raise ValueError("FP8 requires compute capability 9.0+")
+    fp8_gpu = native_fp8_capability(capability)
+    if fp8 and not fp8_gpu:
+        raise ValueError("FP8 weight-only needs NVIDIA CUDA compute capability 8.9+")
     # Official H3 BF16 weights are ~61.7 GB (denoiser) and ~62.1 GB
     # (Qwen3-VL). An offload switch does not make those host requirements
     # disappear. The INT8 documented recipe needs about 75 GB host memory.
     cpu_ok = host_ram is not None and host_ram >= 136 * GiB
     quant_cpu_ok = host_ram is not None and host_ram >= 80 * GiB
-    disk_ok = (host_ram is not None and host_ram >= 40 * GiB
-               and disk_free >= 160 * GiB)
+    disk_ok = (host_ram is not None and host_ram >= 12 * GiB
+               and disk_free >= 180 * GiB and free_vram >= 8 * GiB)
     resident_ok = (host_ram is not None and host_ram >= 68 * GiB
                    and free_vram >= (48 if fp8 else 78) * GiB)
     plans = []
@@ -232,19 +267,21 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
             raise ValueError("CPU streaming needs 136 GiB available host RAM (80 GiB FP8)")
         add("fp8_cpu" if fp8 else "stream_cpu")
     elif mode == "stream_disk":
+        if fp8 and (not fp8_gpu or not torchao_available):
+            raise ValueError("FP8 direct streaming requires CUDA 8.9+ and torchao")
         if not disk_ok:
-            raise ValueError("Disk streaming needs 160 GiB free storage and 40 GiB available host RAM")
+            raise ValueError("Disk streaming requires 8 GiB free VRAM, 12 GiB available RAM and 180 GiB free storage")
         add("fp8_disk" if fp8 else "stream_disk")
     else:
         if not offload and resident_ok:
             add("resident_fp8" if fp8 else "resident")
-        if fp8 and quant_cpu_ok and capability >= 9:
+        if fp8 and quant_cpu_ok and fp8_gpu:
             add("fp8_cpu")
         if not fp8 and cpu_ok:
             add("stream_cpu")
         if not fp8 and torchao_available and quant_cpu_ok:
             add("int8_cpu")
-        if disk_ok:
+        if disk_ok and (not fp8 or (fp8_gpu and torchao_available)):
             add("fp8_disk" if fp8 else "stream_disk")
     if not plans:
         raise ValueError("Native H3 requires substantial host RAM or disk-backed model streaming; available resources are insufficient")
@@ -268,7 +305,7 @@ def run(args):
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("VDN-H3 requires CUDA; no CPU-only inference claim")
-    major, _ = torch.cuda.get_device_capability()
+    capability = torch.cuda.get_device_capability()
     if args.internal_attempt:
         args.offload_dit = not args.internal_attempt.startswith("resident")
         args.disk_offload = args.internal_attempt.endswith("_disk") or args.internal_attempt == "stream_disk"
@@ -282,7 +319,7 @@ def run(args):
     host = available_host_ram()
     disk = shutil.disk_usage(Path(args.output).parent).free
     plans = choose_memory_plans(
-        free, host, disk, capability=major, offload=args.offload_dit,
+        free, host, disk, capability=capability, offload=args.offload_dit,
         fp8=args.fp8, mode=args.memory_mode,
         torchao_available=importlib.util.find_spec("torchao") is not None,
     )
@@ -294,7 +331,11 @@ def run(args):
     original = [str(Path(__file__).resolve()), "--prompt", args.prompt,
                 "--output", args.output, "--frames", str(args.frames),
                 "--steps", str(args.steps), "--seed", str(args.seed),
-                "--device", args.device]
+                "--device", args.device,
+                "--lowmem", args.lowmem, "--weight-loader", args.weight_loader,
+                "--query-chunk", str(args.query_chunk),
+                "--head-chunk", str(args.head_chunk),
+                "--ff-chunk", str(args.ff_chunk)]
     for flag, value in (("--first", args.first), ("--last", args.last),
                         ("--reference-video", args.reference_video),
                         ("--reference-audio", args.reference_audio),
@@ -311,32 +352,52 @@ def run(args):
     if args.two_pass:
         original.extend(["--two-pass", "--refine-steps", str(args.refine_steps)])
     for tier in plans:
-        argv = [sys.executable, "-u", *original, "--internal-attempt", tier]
-        if tier.startswith("fp8") or tier == "resident_fp8":
-            argv.append("--fp8")
-        print(json.dumps({"phase": "attempt", "tier": tier}), flush=True)
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                 text=True, bufsize=1,
-                                 start_new_session=(os.name == "posix"))
-        _forward_signal.child = child
-        errors = []
-        try:
-            for line in child.stdout:
-                print(line, end="", flush=True)
-                errors.append(line)
-                if len(errors) > 100:
-                    errors.pop(0)
-            code = child.wait()
-        finally:
-            _forward_signal.child = None
-        if code == 0:
-            return
-        reason = "".join(errors)[-8000:]
-        if not is_cuda_oom(reason):
-            raise RuntimeError("VDN native inference failed outside memory recovery: " + reason[-1400:])
-        print(json.dumps({"phase": "oom_recovery", "tier": tier,
-                          "next": "fresh_process", "exitCode": code}), flush=True)
+        # Only CUDA OOM causes an additional more-constrained try. Every
+        # retry is a new isolated process; a poisoned CUDA context is never
+        # reused and sampler snapshots carry the effective tiling settings.
+        attempts = [(args.lowmem, args.query_chunk, args.head_chunk, args.ff_chunk)]
+        if args.lowmem != "off":
+            emergency = ("force",
+                         min(args.query_chunk or 128, 128),
+                         min(args.head_chunk or 2, 2),
+                         min(args.ff_chunk or 128, 128))
+            if emergency != attempts[0]:
+                attempts.append(emergency)
+        for attempt_index, (lowmem, query, heads, ff) in enumerate(attempts):
+            argv = [sys.executable, "-u", *original, "--internal-attempt", tier]
+            if tier.startswith("fp8") or tier == "resident_fp8":
+                argv.append("--fp8")
+            # argparse uses the last occurrence for scalar flags, so an
+            # emergency attempt can override the request's original knobs.
+            argv += ["--lowmem", lowmem, "--query-chunk", str(query),
+                     "--head-chunk", str(heads), "--ff-chunk", str(ff)]
+            print(json.dumps({"phase": "attempt", "tier": tier,
+                              "lowmem": lowmem, "retry": attempt_index,
+                              "queryChunk": query, "headChunk": heads,
+                              "ffChunk": ff}), flush=True)
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1,
+                                     start_new_session=(os.name == "posix"))
+            _forward_signal.child = child
+            errors = []
+            try:
+                for line in child.stdout:
+                    print(line, end="", flush=True)
+                    errors.append(line)
+                    if len(errors) > 100:
+                        errors.pop(0)
+                code = child.wait()
+            finally:
+                _forward_signal.child = None
+            if code == 0:
+                return
+            reason = "".join(errors)[-8000:]
+            if not is_cuda_oom(reason):
+                raise RuntimeError("VDN native inference failed outside memory recovery: " + reason[-1400:])
+            print(json.dumps({"phase": "oom_recovery", "tier": tier,
+                              "next": "smaller_tiles_or_next_tier_in_fresh_process",
+                              "retry": attempt_index, "exitCode": code}), flush=True)
     raise RuntimeError("All native CUDA placement tiers exhausted their memory budget")
 
 
@@ -444,7 +505,7 @@ def native_h3_refine_schedule(pipe, torch):
     return active()
 
 
-def native_two_pass(pipe, args, torch, device, keyframes, references):
+def native_two_pass(pipe, args, torch, device, keyframes, references, *, latent_output=False):
     """Native latent-space two-pass using Diffusers' actual MiniMax-H3 state I/O.
 
     Pass one samples at half the target height/width. The separate Little
@@ -544,7 +605,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
             num_inference_steps=4,
             generator=torch.Generator(device).manual_seed(args.seed + 2),
             latents=upscaled, audio_latents=audio_latents,
-            output=["videos", "audio", "sampling_rate"],
+            output=["latents", "audio_latents"] if latent_output else ["videos", "audio", "sampling_rate"],
             **({"references": references} if references else keyframes),
             )
 
@@ -561,6 +622,7 @@ def _run_once(args):
 
     if not torch.cuda.is_available():
         raise RuntimeError("VDN-H3 requires a CUDA GPU. Choose Wan on this machine.")
+    torch.cuda.reset_peak_memory_stats()
     keyframes = {}
     references = []
     if args.refs or args.reference_video or args.reference_audio:
@@ -593,6 +655,19 @@ def _run_once(args):
                       "hybridVDN": not references}), flush=True)
     pipe = ModularPipeline.from_pretrained(checkpoint, workflow=mode)
     denoiser_partition = "transformer_ref" if references else "transformer"
+    native_direct = args.disk_offload and args.weight_loader == "native_original"
+    if args.disk_offload and args.fp8 and not native_direct:
+        # The native disk-dispatch path requires exact pre-sharded SafeTensors
+        # representations, not a silent unvalidated FP8 conversion.
+        raise RuntimeError("Native FP8 disk-dispatched loading is not validated; use BF16 stream_disk or FP8 CPU tier")
+    if args.disk_offload and not native_direct:
+        # These are the actual MiniMax-H3 and Qwen component sources selected
+        # by ModularPipeline, not guessed paths inside the VDN model repo.
+        verified = verify_model_indexes(pipe, denoiser_partition)
+        print(json.dumps({"phase": "native_shard_indexes_verified",
+                          "components": {k: {"tensors": v["tensors"],
+                                            "shards": v["shards"]}
+                                         for k, v in verified.items()}}), flush=True)
     if args.int8:
         # The documented H3 consumer-GPU recipe quantizes BOTH large models
         # during loading. Quantizing just the transformer after loading all
@@ -625,20 +700,51 @@ def _run_once(args):
                 ),
             ),
         })
+    if native_direct:
+        load_native_h3_components(
+            pipe, denoiser_partition, device=args.device, fp8=args.fp8,
+            lora_files=args.lora, video_vram_bytes=torch.cuda.mem_get_info()[0])
     kwargs = {"trust_remote_code": True, "dtype": torch.bfloat16}
+    if args.disk_offload and not native_direct:
+        budget = low_ram_disk_budget(
+            torch.cuda.mem_get_info()[0], available_host_ram(),
+            shutil.disk_usage(args.disk_offload_path).free)
+        kwargs.update(disk_component_kwargs(
+            denoiser_partition, args.disk_offload_path, budget))
+        print(json.dumps({"phase": "native_disk_weight_loading",
+                          "weightLoader": "sharded_safetensors_accelerate_dispatch",
+                          "cudaPerComponentBytes": budget["cuda_model_bytes"],
+                          "cpuPerComponentBytes": budget["cpu_model_bytes"]}),
+              flush=True)
     if args.fp8:
         kwargs["fp8"] = {denoiser_partition: True}
-    pipe.load_components(**kwargs)
+    if not native_direct:
+        pipe.load_components(**kwargs)
+    if args.disk_offload and not native_direct:
+        # No continuation into sampling unless both original components
+        # REALLY have disk-dispatched layers. Avoid false-positive support.
+        report = assert_disk_mapped_components(pipe, denoiser_partition)
+        print(json.dumps({"phase": "native_disk_weight_loaded",
+                          "components": report}), flush=True)
     denoiser = getattr(pipe, denoiser_partition, None)
     if denoiser is None:
         raise RuntimeError("Selected VDN weights do not contain the required "
                            "Ref2VA transformer partition; refusing unconditioned fallback")
-    for lora in args.lora:
+    if args.disk_offload and args.lora and not native_direct:
+        raise RuntimeError("LoRA with Accelerate disk dispatch is unsupported; select native_original")
+    for lora in ([] if native_direct else args.lora):
         if not lora.endswith(".safetensors"):
             raise RuntimeError("LoRA must be a safetensors file")
         if not hasattr(pipe, "load_lora_weights"):
             raise RuntimeError("Installed Diffusers lacks native H3 LoRA loading")
         pipe.load_lora_weights(lora)
+    # Tile the actual H3 transformer after LoRA loading but before placing
+    # layers/offload hooks. The processor retains full cross-modal context;
+    # unlike spatial windows it changes no attention connectivity.
+    if args.lowmem == "force" or (args.lowmem == "auto" and (args.offload_dit or native_direct)):
+        install_native_h3_tiles(
+            denoiser, query_chunk=args.query_chunk,
+            head_chunk=args.head_chunk, ff_chunk=args.ff_chunk)
     if args.int8:
         denoiser.requires_grad_(False)
         pipe.text_encoder.requires_grad_(False)
@@ -650,69 +756,116 @@ def _run_once(args):
         raise RuntimeError("An OpenVDN component did not load successfully.")
 
     device = torch.device(args.device)
+    stream_policy = weight_stream_policy(
+        torch.cuda.mem_get_info(device)[0], available_host_ram(),
+        disk_spill=args.disk_offload)
+    print(json.dumps({"phase": "native_stream_plan", **stream_policy}), flush=True)
     text_stream_kwargs = {
         "onload_device": device, "offload_device": "cpu",
-        "offload_type": "leaf_level", "use_stream": True,
+        "offload_type": "leaf_level",
+        "use_stream": stream_policy["text_async_prefetch"],
     }
     if args.disk_offload:
         text_path = Path(args.disk_offload_path) / "text_encoder"
         text_path.mkdir(parents=True, exist_ok=True)
         text_stream_kwargs["offload_to_disk_path"] = str(text_path)
+    if not native_direct:
+        install_lowmem_decoders(pipe.vae, pipe.audio_vae,
+                                free_vram=torch.cuda.mem_get_info()[0])
     # Stream the language-model layers; Qwen's visual encoder is invoked by
     # the same real Diffusers text-encoding block.
-    apply_group_offloading(pipe.text_encoder.model, **text_stream_kwargs)
-    _, vae = cpu_offload_with_hook(pipe.vae, execution_device=device)
-    cpu_offload_with_hook(pipe.audio_vae, execution_device=device,
-                          prev_module_hook=vae)
-
-    def decoder_back(module, inputs):
-        vae.offload()
-    denoiser.register_forward_pre_hook(decoder_back)
-    if args.offload_dit:
+    if not args.disk_offload and not native_direct:
+        # Accelerate's disk-dispatched modules already carry execution
+        # hooks. Installing an additional Diffusers group hook here would
+        # conflict and can load all weights again.
+        apply_group_offloading(pipe.text_encoder.model, **text_stream_kwargs)
+    if not native_direct:
+        _, vae = cpu_offload_with_hook(pipe.vae, execution_device=device)
+        cpu_offload_with_hook(pipe.audio_vae, execution_device=device,
+                              prev_module_hook=vae)
+        def decoder_back(module, inputs):
+            vae.offload()
+        denoiser.register_forward_pre_hook(decoder_back)
+    if args.offload_dit and not args.disk_offload and not native_direct:
         stream_kwargs = {
             "onload_device": device, "offload_device": "cpu",
             "offload_type": "block_level",
-            "num_blocks_per_group": 1, "use_stream": True,
+            "num_blocks_per_group": stream_policy["denoiser_blocks_per_group"],
+            "use_stream": stream_policy["denoiser_async_prefetch"],
         }
         if args.disk_offload_path:
             dit_path = Path(args.disk_offload_path) / "denoiser"
             dit_path.mkdir(parents=True, exist_ok=True)
             stream_kwargs["offload_to_disk_path"] = str(dit_path)
         apply_group_offloading(denoiser, **stream_kwargs)
-    else:
+    elif not args.disk_offload and not native_direct:
         denoiser.to(device)
 
     print(json.dumps({"phase": "sampling", "steps": args.steps,
                       "frames": args.frames}), flush=True)
     if args.two_pass:
-        sample = native_two_pass(pipe, args, torch, device, keyframes, references)
+        sample = native_two_pass(pipe, args, torch, device, keyframes, references,
+                                 latent_output=native_direct)
     else:
         with native_sampler_recovery(args, "single", pipe, model_identity=checkpoint):
             sample = pipe(
             prompt=args.prompt, num_frames=args.frames,
             num_inference_steps=args.steps + 1,
             generator=torch.Generator(device).manual_seed(args.seed),
-            output=["videos", "audio", "sampling_rate"],
+            output=["latents", "audio_latents"] if native_direct else ["videos", "audio", "sampling_rate"],
             **({"references": references} if references else keyframes),
             )
-    videos, audio, sample_rate = (sample["videos"], sample["audio"],
-                                 sample["sampling_rate"])
-
-    frames = torch.from_numpy(np.stack([np.asarray(frame) for frame in videos[0]]))
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(".partial.mp4")
-    if temporary.exists():
-        temporary.unlink()
-    print(json.dumps({"phase": "encoding"}), flush=True)
-    encode_video(frames, fps=FPS, output_path=str(temporary),
-                 audio=audio[0].float().cpu(), audio_sample_rate=sample_rate)
-    if not temporary.is_file() or temporary.stat().st_size < 32:
-        raise RuntimeError("OpenVDN produced no video bytes")
-    os.replace(temporary, output)
+    print(json.dumps({"phase": "encoding", "mode":
+                      "native_incremental_video" if native_direct else "pipeline_frames"}), flush=True)
+    if native_direct:
+        encoded_count = encode_h3_latent_video(
+            pipe, sample["latents"], sample["audio_latents"],
+            output_path=args.output, frames=args.frames, fps=FPS)
+    else:
+        videos, audio, sample_rate = (sample["videos"], sample["audio"],
+                                     sample["sampling_rate"])
+        frames = torch.from_numpy(np.stack([np.asarray(frame) for frame in videos[0]]))
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_suffix(".partial.mp4")
+        if temporary.exists():
+            temporary.unlink()
+        encode_video(frames, fps=FPS, output_path=str(temporary),
+                     audio=audio[0].float().cpu(), audio_sample_rate=sample_rate)
+        if not temporary.is_file() or temporary.stat().st_size < 32:
+            raise RuntimeError("OpenVDN produced no video bytes")
+        os.replace(temporary, output)
+        encoded_count = len(videos[0])
+    # Real playable-output verification for the whole generated video/audio.
+    # Checking a 32-byte file-size minimum alone can accept corrupt renders.
+    # Validation iterates decoder frames without holding them in RAM.
+    try:
+        media_result = verify_h3_mp4(
+            args.output, expected_frames=args.frames, expected_fps=FPS,
+            require_audio=True)
+    except Exception:
+        Path(args.output).unlink(missing_ok=True)
+        raise
+    print(json.dumps({"phase": "native_media_verified", **media_result}),
+          flush=True)
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
+    host_peak = None
+    if os.path.isfile("/proc/self/status"):
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmHWM:"):
+                    host_peak = int(line.split()[1]) * 1024
+                    break
+    print(json.dumps({"phase": "native_memory_metrics",
+                      "peakCudaAllocatedBytes": torch.cuda.max_memory_allocated(),
+                      "peakCudaReservedBytes": torch.cuda.max_memory_reserved(),
+                      "peakProcessRssBytes": host_peak,
+                      "streamedFromDisk": bool(args.disk_offload),
+                      "int8Weights": bool(args.int8),
+                      "nativeAttentionTiling": args.lowmem == "force" or
+                          (args.lowmem == "auto" and args.offload_dit)}), flush=True)
     print(json.dumps({"phase": "completed", "path": str(output),
-                      "frames": len(videos[0]), "fps": FPS}), flush=True)
+                      "frames": encoded_count, "fps": FPS}), flush=True)
 
 
 if __name__ == "__main__":
