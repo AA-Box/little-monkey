@@ -463,7 +463,7 @@ def validate_preview_layout(video_shape, audio_shape):
     """Prevent malformed/corrupt checkpoints from allocating arbitrary GPU shapes."""
     if len(video_shape) != 5 or video_shape[0] != 1 or video_shape[1] != 24:
         raise ValueError("Native preview must hold 1 x 24-channel video latents")
-    if not 1 <= video_shape[2] <= 32 or tuple(video_shape[3:]) != (24, 42):
+    if not 1 <= video_shape[2] <= 102 or tuple(video_shape[3:]) != (24, 42):
         raise ValueError("Native preview geometry must be half-canvas video latents")
     if len(audio_shape) != 3 or audio_shape[0:2] != (2, 32):
         raise ValueError("Native preview must hold stereo-channel H3 audio latents")
