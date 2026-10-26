@@ -44,16 +44,20 @@ class OriginalShardStore:
                 raise ValueError("Missing original SafeTensors shard: " + name)
 
     @classmethod
-    def from_hub(cls, repo, folder, revision=None, *, fetch=None):
+    def from_hub(cls, repo, folder, revision=None, *, component=None, fetch=None):
         """Download only named original shards; no copies/transcodes."""
         from huggingface_hub import hf_hub_download
         fetch = fetch or hf_hub_download
         if folder and (Path(folder).is_absolute() or ".." in Path(folder).parts):
             raise ValueError("Unsafe model subfolder")
         # Diffusers uses diffusion_pytorch_model.*, Transformers uses model.*.
+        if component is not None and component not in (
+                "transformer", "transformer_ref", "text_encoder", "vae", "audio_vae"):
+            raise ValueError("Unknown native original-shard component")
         filename = ("model.safetensors.index.json" if
-                    folder.split("/")[-1] == "text_encoder" else
-                    "diffusion_pytorch_model.safetensors.index.json")
+                    component == "text_encoder" or (
+                        component is None and folder.split("/")[-1] == "text_encoder")
+                    else "diffusion_pytorch_model.safetensors.index.json")
         params = dict(subfolder=folder or None, revision=revision)
         try:
             index_path = Path(fetch(repo, filename=filename, **params))
@@ -369,7 +373,8 @@ def load_native_h3_components(pipe, denoiser_partition, *, device, fp8=False,
     info = {}
     for name, (cls, transformers_model, precision) in registry.items():
         repo, folder, revision = component_spec_source(pipe, name)
-        store = OriginalShardStore.from_hub(repo, folder, revision)
+        store = OriginalShardStore.from_hub(
+            repo, folder, revision, component=name)
         model = instantiate_meta_component(
             cls, repo, folder, revision, transformers_model=transformers_model,
             dtype=precision)
@@ -388,10 +393,23 @@ def load_native_h3_components(pipe, denoiser_partition, *, device, fp8=False,
             getattr(pipe, denoiser_partition), lora_files)
     install_lowmem_decoders(
         pipe.vae, pipe.audio_vae, free_vram=video_vram_bytes)
+    # A meta-initialized Transformers model normally reports model.device
+    # as "meta", although its parameters execute through native CUDA hooks.
+    # HF generation/vision helpers use this property to allocate inputs.
+    # Report the actual execution device without materializing weights.
+    cuda_device = torch.device(device)
+    for name in ("text_encoder", denoiser_partition, "vae", "audio_vae"):
+        model = getattr(pipe, name)
+        model_type = type(model)
+        class NativeDeviceModel(model_type):
+            @property
+            def device(self):
+                return cuda_device
+        model.__class__ = NativeDeviceModel
+
     # ModularPipeline.device normally reads the first parameter, which is
     # meta when no layer is executing. Keep pipeline state CUDA while each
     # individual parameter is directly sourced at its forward hook.
-    cuda_device = torch.device(device)
     base = type(pipe)
     class NativeOriginalShardPipeline(base):
         @property
