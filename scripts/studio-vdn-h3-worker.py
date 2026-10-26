@@ -121,14 +121,14 @@ def parse_args(argv=None):
             "computeCapability": f"{cap[0]}.{cap[1]}",
             "vramBytes": torch.cuda.get_device_properties(0).total_memory,
             "torch": torch.__version__,
-            "fp8Supported": cap[0] >= 9,
+            "fp8Supported": native_fp8_capability(cap),
         }
         free_vram, _ = torch.cuda.mem_get_info()
         host_ram = available_host_ram()
         disk_free = shutil.disk_usage(Path.cwd()).free
         try:
             report["nativeMemoryPlans"] = choose_memory_plans(
-                free_vram, host_ram, disk_free, capability=cap[0],
+                free_vram, host_ram, disk_free, capability=cap,
                 torchao_available=importlib.util.find_spec("torchao") is not None,
             )
             report["resourcesReady"] = True
@@ -220,6 +220,16 @@ def is_cuda_oom(error):
     ))
 
 
+def native_fp8_capability(capability):
+    """TorchAO supports FP8 weight-only on Ada SM89 and newer NVIDIA GPUs."""
+    if isinstance(capability, (tuple, list)):
+        if len(capability) != 2:
+            raise ValueError("Expected CUDA (major,minor) capability")
+        return tuple(capability) >= (8, 9)
+    # Integers retain the legacy major-only admission; prefer (major,minor).
+    return float(capability) >= 8.9
+
+
 def choose_memory_plans(free_vram, host_ram, disk_free, *,
                         capability, offload=False, fp8=False, mode="auto",
                         torchao_available=True):
@@ -232,8 +242,9 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
         raise ValueError("Negative memory capacity")
     if mode not in ("auto", "resident", "stream_cpu", "stream_disk"):
         raise ValueError("Unsupported memory policy")
-    if fp8 and capability < 9:
-        raise ValueError("FP8 requires compute capability 9.0+")
+    fp8_gpu = native_fp8_capability(capability)
+    if fp8 and not fp8_gpu:
+        raise ValueError("FP8 weight-only needs NVIDIA CUDA compute capability 8.9+")
     # Official H3 BF16 weights are ~61.7 GB (denoiser) and ~62.1 GB
     # (Qwen3-VL). An offload switch does not make those host requirements
     # disappear. The INT8 documented recipe needs about 75 GB host memory.
@@ -256,21 +267,21 @@ def choose_memory_plans(free_vram, host_ram, disk_free, *,
             raise ValueError("CPU streaming needs 136 GiB available host RAM (80 GiB FP8)")
         add("fp8_cpu" if fp8 else "stream_cpu")
     elif mode == "stream_disk":
-        if fp8 and (capability < 9 or not torchao_available):
-            raise ValueError("FP8 direct streaming requires CUDA 9.0+ and torchao")
+        if fp8 and (not fp8_gpu or not torchao_available):
+            raise ValueError("FP8 direct streaming requires CUDA 8.9+ and torchao")
         if not disk_ok:
             raise ValueError("Disk streaming requires 8 GiB free VRAM, 12 GiB available RAM and 180 GiB free storage")
         add("fp8_disk" if fp8 else "stream_disk")
     else:
         if not offload and resident_ok:
             add("resident_fp8" if fp8 else "resident")
-        if fp8 and quant_cpu_ok and capability >= 9:
+        if fp8 and quant_cpu_ok and fp8_gpu:
             add("fp8_cpu")
         if not fp8 and cpu_ok:
             add("stream_cpu")
         if not fp8 and torchao_available and quant_cpu_ok:
             add("int8_cpu")
-        if disk_ok and (not fp8 or (capability >= 9 and torchao_available)):
+        if disk_ok and (not fp8 or (fp8_gpu and torchao_available)):
             add("fp8_disk" if fp8 else "stream_disk")
     if not plans:
         raise ValueError("Native H3 requires substantial host RAM or disk-backed model streaming; available resources are insufficient")
@@ -294,7 +305,7 @@ def run(args):
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("VDN-H3 requires CUDA; no CPU-only inference claim")
-    major, _ = torch.cuda.get_device_capability()
+    capability = torch.cuda.get_device_capability()
     if args.internal_attempt:
         args.offload_dit = not args.internal_attempt.startswith("resident")
         args.disk_offload = args.internal_attempt.endswith("_disk") or args.internal_attempt == "stream_disk"
@@ -308,7 +319,7 @@ def run(args):
     host = available_host_ram()
     disk = shutil.disk_usage(Path(args.output).parent).free
     plans = choose_memory_plans(
-        free, host, disk, capability=major, offload=args.offload_dit,
+        free, host, disk, capability=capability, offload=args.offload_dit,
         fp8=args.fp8, mode=args.memory_mode,
         torchao_available=importlib.util.find_spec("torchao") is not None,
     )
