@@ -42,7 +42,7 @@ if "install_native_h3_tiles" not in globals():
 if "load_native_h3_components" not in globals():
     from studio_vdn_native_shards import load_native_h3_components
 if "encode_h3_latent_video" not in globals():
-    from studio_vdn_stream_encode import encode_h3_latent_video
+    from studio_vdn_stream_encode import encode_h3_latent_video, verify_h3_mp4
 
 if "install_lowmem_decoders" not in globals():
     from studio_vdn_decoder import install_lowmem_decoders
@@ -836,6 +836,18 @@ def _run_once(args):
             raise RuntimeError("OpenVDN produced no video bytes")
         os.replace(temporary, output)
         encoded_count = len(videos[0])
+    # Real playable-output verification for the whole generated video/audio.
+    # Checking a 32-byte file-size minimum alone can accept corrupt renders.
+    # Validation iterates decoder frames without holding them in RAM.
+    try:
+        media_result = verify_h3_mp4(
+            args.output, expected_frames=args.frames, expected_fps=FPS,
+            require_audio=True)
+    except Exception:
+        Path(args.output).unlink(missing_ok=True)
+        raise
+    print(json.dumps({"phase": "native_media_verified", **media_result}),
+          flush=True)
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
     host_peak = None
     if os.path.isfile("/proc/self/status"):
