@@ -5,6 +5,7 @@ high/low H3 AV latent tails. No pickle or training cache formats; each resume
 validates every byte, predecessor digest, model identity and frame timeline.
 The state Safetensors file is the atomic commit marker, written LAST.
 """
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -14,6 +15,8 @@ MAX_SEGMENTS = 8
 MAX_FRAMES = 360
 MAX_CANVAS_PIXELS = 1344 * 768
 MAX_AUDIO_SAMPLES = 600000
+MAX_JOB_CACHE_BYTES = 12 * 1024**3
+MIN_DISK_RESERVE_BYTES = 1024**3
 SCHEMA = "little-monkey-vdn-segment-cache-v1"
 
 # During native execution all sources are embedded into one standalone worker;
@@ -77,13 +80,26 @@ def save_segment(root, part, frames, audio, high, low, *, model, request_hash,
     pcm = np.ascontiguousarray(audio, dtype=np.float32)
     required = rgb.nbytes + pcm.nbytes
     import shutil
-    if shutil.disk_usage(video_path.parent).free < required + 128 * 1024 * 1024:
-        raise ValueError("Insufficient disk for a recoverable native segment")
+    # Recovery is optional, publication is not. Never fail an otherwise
+    # successfully sampled video because its *redundant* cache cannot fit.
+    # Reserve 1 GiB for mux and Gallery. A large film may finish with fewer
+    # resumable segments, but never fills the user's disk with checkpoints.
+    used = 0
+    for entry in video_path.parent.iterdir():
+        if entry.is_symlink():
+            raise ValueError("Symlink in native completed-segment cache")
+        if entry.is_file():
+            used += entry.stat().st_size
+    if (used + required + 64 * 1024 * 1024 > MAX_JOB_CACHE_BYTES
+            or shutil.disk_usage(video_path.parent).free <
+               required + MIN_DISK_RESERVE_BYTES):
+        return False
     # Invalidate a stale commit marker before touching either data file.
     state_path.unlink(missing_ok=True)
-    _write_atomic(video_path, rgb)
-    _write_atomic(audio_path, pcm)
-    _save(state_path, {
+    try:
+        _write_atomic(video_path, rgb)
+        _write_atomic(audio_path, pcm)
+        _save(state_path, {
         "high_video": high["video"], "high_audio": high["audio"],
         "low_video": low["video"], "low_audio": low["audio"],
     }, {
@@ -98,7 +114,13 @@ def save_segment(root, part, frames, audio, high, low, *, model, request_hash,
         "audio_samples": str(pcm.shape[1]),
         "video_sha256": _sha(video_path),
         "audio_sha256": _sha(audio_path),
-    })
+        })
+    except OSError as error:
+        if error.errno not in (errno.ENOSPC, errno.EDQUOT):
+            raise
+        discard_segment(root, part)
+        return False
+    return True
 
 
 def load_segment(root, part, *, model, request_hash, predecessor_hash,
