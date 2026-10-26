@@ -285,7 +285,6 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
             window_keyframes = (keyframes if not was_continuing else
                                 {"image": continuation_anchor} if keyframes and continuation_anchor is not None else {})
             if args.two_pass:
-                import torch.nn.functional as functional
                 low_prefix = (NativeTemporalPrefix(denoiser, low_context, device)
                               if low_context else None)
                 preview_fingerprint = preview_identity(
@@ -331,22 +330,32 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
                 original_low_audio = preview_audio.detach().float().cpu().contiguous().clone()
                 preview_latents = preview_latents.to(device=device, dtype=torch.float32)
                 preview_audio = preview_audio.to(device=device, dtype=torch.float32)
-                upscaled = functional.interpolate(
-                    preview_latents, size=(preview_latents.shape[2], 48, 84),
-                    mode="trilinear", align_corners=False)
+                # The same SHA256-pinned trained 3D native model/sigma tail
+                # used by single-clip two-pass must also refine EACH window.
+                upscaled = native_learned_upscale(
+                    preview_latents, args.upscaler_cache_dir, (48, 84))
+                video_sigma = 0.9035
+                raw_sigma = video_sigma / (12.0 + (1.0 - 12.0) * video_sigma)
+                audio_sigma = 3.0 * raw_sigma / (1.0 + 2.0 * raw_sigma)
                 generator = torch.Generator(device).manual_seed(args.seed + 3 * part + 1)
-                # Reintroduce noise for the new frames while preserving the
-                # protected AV prefix throughout H3 denoising.
-                upscaled = .90 * upscaled + .10 * torch.randn(
-                    upscaled.shape, device=device, dtype=upscaled.dtype, generator=generator)
-                with native_sampler_recovery(
+                upscaled = ((1.0 - video_sigma) * upscaled +
+                            video_sigma * torch.randn(upscaled.shape, generator=generator,
+                                                       device=device, dtype=upscaled.dtype))
+                refine_audio = ((1.0 - audio_sigma) * preview_audio +
+                                audio_sigma * torch.randn(preview_audio.shape,
+                                                           generator=generator,
+                                                           device=device, dtype=preview_audio.dtype))
+                print(json.dumps({"phase": "native_learned_upscaler",
+                                  "segment": part + 1, "learnedUpscale": True,
+                                  "schedule": "h3-calibrated-three-step"}), flush=True)
+                with native_h3_refine_schedule(pipe, torch), native_sampler_recovery(
                         args, stage + "_refine", pipe, model_identity=checkpoint,
                         temporal_context=prefix, temporal_transformer=denoiser):
                     sample = pipe(
                         prompt=args.prompt, num_frames=args.frames,
                         height=768, width=1344, num_inference_steps=args.refine_steps + 1,
                         generator=torch.Generator(device).manual_seed(args.seed + 3 * part + 2),
-                        latents=upscaled, audio_latents=preview_audio,
+                        latents=upscaled, audio_latents=refine_audio,
                         output=["videos", "audio", "sampling_rate", "latents", "audio_latents"],
                         **({"references": references} if references else window_keyframes))
             else:
