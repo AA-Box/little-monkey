@@ -126,7 +126,7 @@ class StreamingVideoTests(unittest.TestCase):
                 captures.append(tuple(chunk.shape))
             self.assertEqual(audio.shape[0],2)
             self.assertEqual(audio_sample_rate,32000)
-            Path(output_path).write_bytes(b"native-streamed-mp4-fixture")
+            Path(output_path).write_bytes(b"native-streamed-mp4-fixture" * 4)
         exporter.encode_video=encode_video
         original={n:sys.modules.get(n) for n in (
             "diffusers","diffusers.utils","diffusers.utils.export_utils")}
