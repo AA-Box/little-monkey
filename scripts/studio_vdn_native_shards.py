@@ -150,11 +150,11 @@ class NativeOriginalShardHooks:
             if self.device.type != "cuda" or torch.cuda.get_device_capability(self.device)[0] < 9:
                 raise ValueError("FP8 original-shard stream requires NVIDIA Hopper or later")
             try:
-                from torchao.quantization import Float8WeightOnlyConfig, quantize_
+                from torchao.quantization import Float8WeightOnlyConfig, Float8Tensor
             except ImportError as exc:
-                raise RuntimeError("FP8 requires torchao Float8WeightOnlyConfig") from exc
-            self.fp8_config = Float8WeightOnlyConfig
-            self.fp8_quantize = quantize_
+                raise RuntimeError("FP8 requires torchao Float8WeightOnlyConfig and Float8Tensor") from exc
+            self.fp8_config = Float8WeightOnlyConfig(version=2, set_inductor_config=False)
+            self.fp8_tensor_type = Float8Tensor
         registered = []
         fp32_protected = tuple(getattr(model, "_keep_in_fp32_modules", ()) or ())
         for prefix, module in model.named_modules():
@@ -233,9 +233,17 @@ class NativeOriginalShardHooks:
                                 module._buffers[name] = materialized
                         hydrated.append((name, parameter, shape, dtype))
                     if self.fp8 and isinstance(module, torch.nn.Linear) and module._little_monkey_fp8_allowed:
-                        # An explicitly installed TorchAO FP8 weight-only
-                        # operator; no unsafe BF16 fallback when FP8 requested.
-                        self.fp8_quantize(module, self.fp8_config())
+                        # Quantize the currently hydrated weight tensor only.
+                        # Calling quantize_(module) on each forward permanently
+                        # wraps module.extra_repr and accumulates module state.
+                        # Direct Float8Tensor assignment is reversible: the
+                        # post-forward hook evicts it back to its meta parameter.
+                        weight = module.weight.detach()
+                        quantized = self.fp8_tensor_type.from_hp(
+                            weight, float8_dtype=self.fp8_config.weight_dtype,
+                            granularity=self.fp8_config.granularity)
+                        module._parameters["weight"] = torch.nn.Parameter(
+                            quantized, requires_grad=False)
                     self.loaded.add(module)
                 except BaseException:
                     self._evict(module, hydrated)
@@ -302,11 +310,26 @@ def attach_native_lora(model, files, *, scale=1.0):
             if set(pair) != {"A", "B"}:
                 raise ValueError("Incomplete LoRA pair for " + prefix)
             # Common adapters add a wrapper prefix to module names.
-            match = [name for name in model_modules if
-                     prefix == name or prefix.endswith("." + name)]
-            if len(match) != 1 or not match[0]:
-                raise ValueError("Ambiguous or unknown LoRA target: " + prefix)
-            module = model_modules[match[0]]
+            # First prefer exact layer names. A full H3 LoRA target also
+            # ends with many ancestor names; treating all suffixes as hits
+            # makes valid multi-block adapters falsely ambiguous.
+            target = prefix
+            for wrapper in ("base_model.model.", "transformer.", "model."):
+                if target not in model_modules and target.startswith(wrapper):
+                    target = target[len(wrapper):]
+            if target not in model_modules:
+                matches = [name for name in model_modules
+                           if name and prefix.endswith("." + name)]
+                if not matches:
+                    raise ValueError("Unknown LoRA target: " + prefix)
+                longest = max(map(len, matches))
+                matches = [name for name in matches if len(name) == longest]
+                if len(matches) != 1:
+                    raise ValueError("Ambiguous LoRA target: " + prefix)
+                target = matches[0]
+            if not target:
+                raise ValueError("Invalid root LoRA target")
+            module = model_modules[target]
             if not isinstance(module, torch.nn.Linear):
                 raise ValueError("Native LoRA target must be Linear: " + match[0])
             with safe_open(str(path), framework="pt", device="cpu") as src:
