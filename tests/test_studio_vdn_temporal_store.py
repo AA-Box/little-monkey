@@ -72,9 +72,15 @@ class RealTensorAndWindowContracts(unittest.TestCase):
             mp4.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 1024)
             h, l = self.make_context(141)
             destination = root / "context.safetensors"
-            store.save_context(destination, h, l, mp4, "vdn-h3", job, 141)
+            store.save_context(destination, h, l, mp4, "vdn-h3", job, 141,
+                               identity_sha256="a"*64)
             expected = hashlib.sha256(mp4.read_bytes()).hexdigest()
-            loaded = store.load_context(destination, expected, "vdn-h3", job)
+            loaded = store.load_context(destination, expected, "vdn-h3", job,
+                                        identity_sha256="a"*64)
+            self.assertEqual(loaded["identity_sha256"], "a"*64)
+            with self.assertRaises(ValueError):
+                store.load_context(destination, expected, "vdn-h3", job,
+                                   identity_sha256="b"*64)
             self.assertEqual(loaded["total_frames"], 141)
             self.assertTrue(torch.equal(loaded["high"]["video"], h["video"]))
             self.assertTrue(torch.equal(loaded["low"]["video"], l["video"]))
@@ -149,7 +155,7 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 base = Path(temp)
                 encoded_pcm = []
                 def run(job_id, source_path="", source_sha="", source_id="", segments=2,
-                        refine_from="", expect_cached=False):
+                        refine_from="", expect_cached=False, original_image=None):
                     args = SimpleNamespace(
                         prompt="moving characters", output=str(base / (job_id + ".mp4")),
                         seed=42, frames=124, segments=segments, steps=8, refine_steps=3,
@@ -171,27 +177,35 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                         encoded_pcm.append(hashlib.sha256(
                             audio.detach().cpu().contiguous().numpy().tobytes()).hexdigest())
                         Path(output_path).write_bytes(b"\x00\x00\x00\x18ftypisom" + b"x"*128)
+                    keyframes = {"image": original_image} if original_image is not None else {}
                     report = temporal.render_temporal_video(
-                        pipe, args, torch, "cpu", {}, [], "vdn-h3", object(),
+                        pipe, args, torch, "cpu", keyframes, [], "vdn-h3", object(),
                         encoder, lambda *a, **kw: contextlib.nullcontext(),
                         lambda *a: None, "request-identity",
                     )
                     self.assertEqual(len(pipe.calls), 0 if expect_cached else
                                      segments if refine_from else 2 * segments)
                     self.assertTrue(all("latents" in call["output"] for call in pipe.calls))
+                    if original_image is not None:
+                        self.assertTrue(all(call.get("image") is original_image
+                                            for call in pipe.calls),
+                                        "All FL2VA windows must see identical first-film image")
                     return args, report
                 parent = str(uuid.uuid4())
-                args, report = run(parent)
+                film_anchor = object()
+                args, report = run(parent, original_image=film_anchor)
                 self.assertEqual(report["videos"], 226)
                 self.assertEqual(report["audioSamples"], temporal.emitted_audio_samples(226))
                 self.assertTrue(Path(store.preview_path(args.checkpoint, 0)).is_file())
                 self.assertTrue(Path(store.preview_path(args.checkpoint, 1)).is_file())
-                _, cached_report = run(parent, expect_cached=True)
+                _, cached_report = run(parent, expect_cached=True,
+                                       original_image=film_anchor)
                 self.assertEqual(cached_report["videos"], 226)
                 self.assertEqual(encoded_pcm[0], encoded_pcm[1],
                                  "Crash resume must reconstruct exactly the same stereo PCM seams")
                 refined_job = str(uuid.uuid4())
-                copied, again = run(refined_job, segments=2, refine_from=args.checkpoint)
+                copied, again = run(refined_job, segments=2, refine_from=args.checkpoint,
+                                    original_image=film_anchor)
                 self.assertEqual(again["videos"], 226)
                 self.assertTrue(Path(copied.output).is_file())
                 digest = hashlib.sha256(Path(args.output).read_bytes()).hexdigest()
@@ -199,7 +213,8 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 self.assertEqual(previous["total_frames"], 226)
                 child = str(uuid.uuid4())
                 next_args, next_report = run(
-                    child, args.temporal_context_out, digest, parent, segments=1)
+                    child, args.temporal_context_out, digest, parent, segments=1,
+                    original_image=film_anchor)
                 self.assertEqual(next_report["videos"], 226 + 124 - 22)
                 self.assertEqual(next_report["audioSamples"],
                                  temporal.emitted_audio_samples(226 + 124 - 22))
