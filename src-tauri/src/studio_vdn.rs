@@ -27,6 +27,7 @@ const TEMPORAL_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal.py
 const TEMPORAL_STORE_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal_store.py");
 const TEMPORAL_CHAIN_SOURCE: &str = include_str!("../../scripts/studio_vdn_chain.py");
 const TEMPORAL_SEGMENT_CACHE_SOURCE: &str = include_str!("../../scripts/studio_vdn_segment_cache.py");
+const TEMPORAL_IDENTITY_SOURCE: &str = include_str!("../../scripts/studio_vdn_identity.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -55,7 +56,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_CHAIN_SOURCE}\n{TEMPORAL_SEGMENT_CACHE_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_CHAIN_SOURCE}\n{TEMPORAL_SEGMENT_CACHE_SOURCE}\n{TEMPORAL_IDENTITY_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
@@ -143,6 +144,10 @@ pub struct VdnRunRequest {
     pub resolved_temporal_source_job_id: Option<String>,
     #[serde(skip)]
     pub resolved_temporal_parent_path: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_identity_path: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_identity_sha256: Option<String>,
     #[serde(default)]
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
@@ -535,6 +540,14 @@ pub async fn generation_vdn_run(
         }
         process.arg("--temporal-context-out")
             .arg(continuation_root.join(format!("{}.safetensors", request.job_id)));
+        process.arg("--temporal-identity-out")
+            .arg(continuation_root.join(format!("{}.identity.png", request.job_id)));
+        if let Some(source) = &request.resolved_temporal_identity_path {
+            let digest = request.resolved_temporal_identity_sha256.as_ref()
+                .ok_or("Original first-frame image has no pinned identity hash")?;
+            process.arg("--temporal-identity-in").arg(source)
+                .arg("--temporal-source-identity-sha256").arg(digest);
+        }
         let segment_home = directory.join("temporal-segments");
         std::fs::create_dir_all(&segment_home).map_err(|e| e.to_string())?;
         let root_meta = std::fs::symlink_metadata(&segment_home).map_err(|e| e.to_string())?;
@@ -882,6 +895,8 @@ mod tests {
             resolved_temporal_source_sha256: None,
             resolved_temporal_source_job_id: None,
             resolved_temporal_parent_path: None,
+            resolved_temporal_identity_path: None,
+            resolved_temporal_identity_sha256: None,
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],
