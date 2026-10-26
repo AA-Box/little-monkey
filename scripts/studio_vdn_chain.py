@@ -41,37 +41,99 @@ def _validate(source, hash_sha256=None):
     return p
 
 
-def _get_audio(container, expected):
-    """Resample AAC to actual 32-kHz stereo PCM, accounting for codec delay."""
+def _iter_audio(container, expected):
+    """Bounded resampling, exact presentation duration; never hold whole PCM."""
     import av
     import numpy as np
     if not container.streams.audio:
-        raise ValueError("A native temporal chain source lost its soundtrack")
+        raise ValueError("Native temporal source has no soundtrack")
+    if not 0 <= expected <= samples_for_frames(MAX_FRAMES):
+        raise ValueError("Unsafe target soundtrack duration")
     resampler = av.AudioResampler(format="fltp", layout="stereo", rate=RATE)
-    parts = []
+    produced = 0
+    last = None
+
+    def emit(frame):
+        nonlocal produced, last
+        audio = np.asarray(frame.to_ndarray(), dtype=np.float32)
+        if audio.ndim != 2 or audio.shape[0] != 2 or not np.isfinite(audio).all():
+            raise ValueError("Native chain lost valid stereo audio")
+        size = audio.shape[1]
+        until = max(0, min(size, expected - produced))
+        produced += size
+        if until:
+            part = np.ascontiguousarray(audio[:, :until])
+            last = part[:, -1:].copy()
+            return part
+        return None
+
     for decoded in container.decode(audio=0):
         for frame in resampler.resample(decoded):
-            data = frame.to_ndarray()
-            if data.shape[0] != 2:
-                raise ValueError("Native temporal source must decode to stereo")
-            parts.append(np.asarray(data, dtype=np.float32))
+            chunk = emit(frame)
+            if chunk is not None:
+                yield chunk
     for frame in resampler.resample(None):
-        data = frame.to_ndarray()
-        if data.shape[0] != 2:
-            raise ValueError("Native temporal source lost stereo during resampling")
-        parts.append(np.asarray(data, dtype=np.float32))
-    samples = np.concatenate(parts, axis=1) if parts else np.empty((2, 0), dtype=np.float32)
-    # AAC encoders commonly pad at the end. Accept at most one AAC packet of
-    # rounding per clip; anything larger indicates a desynchronized source.
-    if abs(samples.shape[1] - expected) > 2048:
-        raise ValueError("Native source audio/video clock drift exceeds one AAC packet")
-    if samples.shape[1] > expected:
-        samples = samples[:, :expected]
-    elif samples.shape[1] < expected:
-        if samples.shape[1] == 0:
+        chunk = emit(frame)
+        if chunk is not None:
+            yield chunk
+    # Reject genuine desynchronization; only limited encoder priming or final
+    # AAC padding may be trimmed/padded to frame-perfect clock.
+    if abs(produced - expected) > 2048:
+        raise ValueError("Native source audio/video clock drift exceeds AAC padding")
+    if produced < expected:
+        if last is None:
             raise ValueError("Native chain source has no audio")
-        samples = np.pad(samples, ((0, 0), (0, expected - samples.shape[1])), mode="edge")
-    return np.ascontiguousarray(samples)
+        yield np.repeat(last, expected - produced, axis=1)
+
+
+def _get_audio(container, expected):
+    """Small-file compatibility helper for tests; production uses _iter_audio."""
+    import numpy as np
+    return np.concatenate(list(_iter_audio(container, expected)), axis=1)
+
+
+def _stream_joined_audio(parent, child, expected_parent, expected_child):
+    """Length-preserving seam shaping with at most 320 retained samples.
+
+    Emits the entire parent then child timeline without allocating a full
+    parent soundtrack. Context near the cut is the only withheld PCM.
+    """
+    import numpy as np
+    tail = np.empty((2, 0), dtype=np.float32)
+    for block in _iter_audio(parent, expected_parent):
+        pending = np.concatenate((tail, block), axis=1)
+        if pending.shape[1] > EDGE_FADE:
+            yield np.ascontiguousarray(pending[:, :-EDGE_FADE])
+            tail = np.ascontiguousarray(pending[:, -EDGE_FADE:])
+        else:
+            tail = pending
+    opening = []
+    first_count = 0
+    ahead = None
+    source = iter(_iter_audio(child, expected_child))
+    for block in source:
+        need = EDGE_FADE - first_count
+        if need > 0:
+            first = np.ascontiguousarray(block[:, :need])
+            opening.append(first)
+            first_count += first.shape[1]
+            if first_count < EDGE_FADE:
+                continue
+            ahead = np.ascontiguousarray(block[:, need:])
+        else:
+            ahead = block
+        break
+    if not opening:
+        raise ValueError("Native chain child has no audio")
+    head = np.ascontiguousarray(np.concatenate(opening, axis=1))
+    left, right = _smooth_seam(tail, head)
+    if left.shape[1]:
+        yield left
+    if right.shape[1]:
+        yield right
+    if ahead is not None and ahead.shape[1]:
+        yield ahead
+    yield from source
 
 
 def _smooth_seam(left, right):
@@ -90,8 +152,9 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                       child_frames, expected_parent_sha256=None):
     """Create an atomically published, continuously muxed parent+child video.
 
-    The child MP4 contains ONLY the newly generated frames; the parent is
-    already the whole prior chain. Only one extra encode occurs at this boundary.
+    The child MP4 contains ONLY newly generated frames. The previous full
+    chain is recomposed with constant-memory PCM streaming and exact frame
+    ordering, without adding duplicated overlap frames.
     """
     import av
     import numpy as np
@@ -111,14 +174,6 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
     expected_parent = samples_for_frames(parent_frames)
     expected_total = samples_for_frames(parent_frames + child_frames)
     expected_child = expected_total - expected_parent
-    with av.open(str(parent), "r") as container:
-        parent_pcm = _get_audio(container, expected_parent)
-    with av.open(str(child), "r") as container:
-        child_pcm = _get_audio(container, expected_child)
-    parent_pcm, child_pcm = _smooth_seam(parent_pcm, child_pcm)
-    combined = np.concatenate((parent_pcm, child_pcm), axis=1)
-    if combined.shape != (2, expected_total):
-        raise RuntimeError("Native joined soundtrack duration is not frame-exact")
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     temporary = dest.parent / ("." + dest.name + "." + uuid.uuid4().hex + ".mp4")
@@ -161,15 +216,21 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                 output.mux(packet)
 
             cursor = 0
-            for start in range(0, combined.shape[1], 1024):
-                values = np.ascontiguousarray(combined[:, start:start + 1024])
-                frame = av.AudioFrame.from_ndarray(values, format="fltp", layout="stereo")
+            # Bounded streaming resampler + 10-ms edge only: peak audio
+            # memory no longer scales with the size of the parent film.
+            for values in _stream_joined_audio(one, two, expected_parent, expected_child):
+                if not values.shape[1]:
+                    continue
+                frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(values),
+                                                 format="fltp", layout="stereo")
                 frame.sample_rate = RATE
                 frame.pts = cursor
                 frame.time_base = Fraction(1, RATE)
                 for packet in target_audio.encode(frame):
                     output.mux(packet)
                 cursor += values.shape[1]
+            if cursor != expected_total:
+                raise ValueError("Streaming native chain produced an incorrect PCM length")
             for packet in target_audio.encode(None):
                 output.mux(packet)
         if not temporary.is_file() or temporary.stat().st_size < 64:
