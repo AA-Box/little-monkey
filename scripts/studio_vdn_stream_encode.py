@@ -65,6 +65,46 @@ def iter_h3_video_rgb_chunks(vae, latents, pixel_mean, pixel_std, *,
                            (delivered, expected_frames))
 
 
+def verify_h3_mp4(path, *, expected_frames, expected_fps, require_audio=True):
+    """Decode the actual published media to reject silently corrupt outputs.
+
+    Uses PyAV's real decoder rather than trusting model output tensor shapes,
+    container header frame counts or file size. No video frames accumulate.
+    """
+    import av
+    if expected_frames < 1 or expected_fps < 1:
+        raise ValueError("Invalid expected H3 media geometry")
+    with av.open(str(path), mode="r") as container:
+        video_streams = [stream for stream in container.streams if stream.type == "video"]
+        audio_streams = [stream for stream in container.streams if stream.type == "audio"]
+        if len(video_streams) != 1 or (require_audio and len(audio_streams) != 1):
+            raise RuntimeError("H3 MP4 must contain exactly one video and a stereo audio stream")
+        video_stream = video_streams[0]
+        rate = video_stream.average_rate
+        if rate is None or abs(float(rate) - float(expected_fps)) > .01:
+            raise RuntimeError("H3 MP4 video frame rate does not match request")
+        actual_frames = 0
+        for decoded in container.decode(video=0):
+            if decoded.width < 1 or decoded.height < 1:
+                raise RuntimeError("H3 MP4 contains invalid video frame geometry")
+            actual_frames += 1
+            if actual_frames > expected_frames:
+                raise RuntimeError("H3 MP4 contains extra video frames")
+        if actual_frames != expected_frames:
+            raise RuntimeError("H3 MP4 decoded %d frames; expected %d" %
+                               (actual_frames, expected_frames))
+    audio_samples = 0
+    if require_audio:
+        with av.open(str(path), mode="r") as container:
+            audio_stream = next(x for x in container.streams if x.type == "audio")
+            for decoded in container.decode(audio=0):
+                audio_samples += int(decoded.samples)
+            if audio_samples == 0:
+                raise RuntimeError("H3 MP4 contains no decodable audio")
+    return {"decodedFrames": actual_frames, "decodedAudioSamples": audio_samples,
+            "fps": expected_fps, "audioPresent": bool(audio_samples)}
+
+
 def encode_h3_latent_video(pipe, video_latents, audio_latents, *,
                            output_path, frames, fps):
     """Decode original H3 latents and stream original soundtrack + RGB chunks."""
