@@ -163,6 +163,57 @@ def _smooth_seam(left, right):
     return left, right
 
 
+def _can_copy_h264(left, right):
+    """Only stream-copy native H264 when decoder configurations are identical."""
+    return (
+        left.codec_context.name == right.codec_context.name == "h264"
+        and left.width == right.width and left.height == right.height
+        and left.codec_context.extradata == right.codec_context.extradata
+        and bool(left.codec_context.extradata)
+        and left.average_rate == right.average_rate == Fraction(FPS, 1)
+        and left.time_base is not None and right.time_base is not None
+    )
+
+
+def _mux_h264_copy(out, first, second, total_frames):
+    """Packet-level remux with shifted PTS/DTS, preserving B-frame ordering."""
+    a, b = first.streams.video[0], second.streams.video[0]
+    video = out.add_stream_from_template(a)
+    dest_tb = video.time_base or a.time_base
+    for clip, stream, origin in (
+        (first, a, Fraction(0)), (second, b, Fraction(total_frames, FPS))
+    ):
+        for packet in clip.demux(stream):
+            if packet.dts is None:
+                continue
+            source_tb = packet.time_base or stream.time_base
+            if source_tb is None or dest_tb is None:
+                raise ValueError("H264 packet has no decode clock")
+            if packet.pts is not None:
+                packet.pts = round((packet.pts * source_tb + origin) / dest_tb)
+            packet.dts = round((packet.dts * source_tb + origin) / dest_tb)
+            if packet.duration:
+                packet.duration = max(1, round(packet.duration * source_tb / dest_tb))
+            packet.time_base = dest_tb
+            packet.stream = video
+            out.mux(packet)
+    return video
+
+
+def _validate_video_count(path, expected):
+    import av
+    with av.open(str(path)) as result:
+        if not result.streams.video:
+            raise ValueError("Native chain joined output lacks a picture track")
+        count = 0
+        for _ in result.decode(video=0):
+            count += 1
+            if count > expected:
+                raise ValueError("Native joined video duplicates frames")
+        if count != expected:
+            raise ValueError("Native joined video is missing frames")
+
+
 def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                       child_frames, expected_parent_sha256=None):
     """Create an atomically published, continuously muxed parent+child video.
@@ -192,7 +243,10 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     temporary = dest.parent / ("." + dest.name + "." + uuid.uuid4().hex + ".mp4")
-    try:
+
+    def compose(copy_video):
+        import av
+        import numpy as np
         with av.open(str(parent), "r") as one, av.open(str(child), "r") as two, \
                 av.open(str(temporary), "w", format="mp4") as output:
             source_video = one.streams.video[0] if one.streams.video else None
@@ -203,40 +257,47 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                     source_video.height != newer_video.height or
                     source_video.width % 2 or source_video.height % 2):
                 raise ValueError("The continuation changes native chain canvas")
-            target_video = output.add_stream("libx264", rate=FPS)
-            target_video.width = source_video.width
-            target_video.height = source_video.height
-            target_video.pix_fmt = "yuv420p"
-            target_video.options = {"preset": "veryfast", "crf": "19"}
+            if copy_video:
+                if not _can_copy_h264(source_video, newer_video):
+                    raise ValueError("H264 source parameters differ")
+                # Decode/validate inputs before remux. No video encoder is
+                # initialized on the stream-copy path.
+                for clip, expected in ((one, parent_frames), (two, child_frames)):
+                    count = sum(1 for _ in clip.decode(video=0))
+                    if count != expected:
+                        raise ValueError("Native H264 source count differs from Gallery journal")
+                _mux_h264_copy(output, one, two, parent_frames)
+            else:
+                target_video = output.add_stream("libx264", rate=FPS)
+                target_video.width = source_video.width
+                target_video.height = source_video.height
+                target_video.pix_fmt = "yuv420p"
+                target_video.options = {"preset": "veryfast", "crf": "19"}
+                index = 0
+                for clip, expected in ((one, parent_frames), (two, child_frames)):
+                    count = 0
+                    for frame in clip.decode(video=0):
+                        rgb = frame.to_ndarray(format="rgb24")
+                        encoded = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                        encoded.pts = index
+                        encoded.time_base = Fraction(1, FPS)
+                        for packet in target_video.encode(encoded):
+                            output.mux(packet)
+                        index += 1
+                        count += 1
+                        if count > expected:
+                            raise ValueError("Native chain contains extra decoded video frames")
+                    if count != expected:
+                        raise ValueError("Native chain video is incomplete")
+                for packet in target_video.encode(None):
+                    output.mux(packet)
+
             target_audio = output.add_stream("aac", rate=RATE)
             target_audio.layout = "stereo"
             target_audio.bit_rate = 192000
-            index = 0
-            for container, expected in ((one, parent_frames), (two, child_frames)):
-                count = 0
-                for frame in container.decode(video=0):
-                    rgb = frame.to_ndarray(format="rgb24")
-                    encoded = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-                    encoded.pts = index
-                    encoded.time_base = Fraction(1, FPS)
-                    for packet in target_video.encode(encoded):
-                        output.mux(packet)
-                    index += 1
-                    count += 1
-                    if count > expected:
-                        raise ValueError("Native chain contains extra decoded video frames")
-                if count != expected:
-                    raise ValueError("Native chain video is incomplete")
-            for packet in target_video.encode(None):
-                output.mux(packet)
-
             cursor = 0
-            # Bounded streaming resampler + 10-ms edge only: peak audio
-            # memory no longer scales with the size of the parent film.
             for values in _fixed_audio_blocks(
                     _stream_joined_audio(one, two, expected_parent, expected_child)):
-                if not values.shape[1]:
-                    continue
                 frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(values),
                                                  format="fltp", layout="stereo")
                 frame.sample_rate = RATE
@@ -249,12 +310,27 @@ def join_native_chain(parent, newly_generated, destination, *, parent_frames,
                 raise ValueError("Streaming native chain produced an incorrect PCM length")
             for packet in target_audio.encode(None):
                 output.mux(packet)
-        if not temporary.is_file() or temporary.stat().st_size < 64:
+        if temporary.stat().st_size < 64:
             raise RuntimeError("Native joined MP4 is empty")
+        _validate_video_count(temporary, parent_frames + child_frames)
+
+    try:
+        copied = False
+        # Packet remux is O(file size) but avoids H264 re-encoding every
+        # historical frame when the two streams have identical codec headers.
+        # If a container cannot mux compatible B-frames, rebuild the scratch
+        # file with native x264 instead of publishing a corrupt timeline.
+        try:
+            compose(True)
+            copied = True
+        except (OSError, RuntimeError, ValueError, av.error.FFmpegError):
+            temporary.unlink(missing_ok=True)
+            compose(False)
         with temporary.open("rb") as written:
             os.fsync(written.fileno())
         os.replace(temporary, dest)
-        return {"frames": parent_frames + child_frames, "audioSamples": expected_total,
-                "seamsRepaired": 1}
+        return {"frames": parent_frames + child_frames,
+                "audioSamples": expected_total,
+                "seamsRepaired": 1, "videoStreamCopy": copied}
     finally:
         temporary.unlink(missing_ok=True)
