@@ -27,6 +27,7 @@ const LOWMEM_SOURCE: &str = include_str!("../../scripts/studio_vdn_lowmem.py");
 const DISK_LOADER_SOURCE: &str = include_str!("../../scripts/studio_vdn_disk_loader.py");
 const NATIVE_SHARDS_SOURCE: &str = include_str!("../../scripts/studio_vdn_native_shards.py");
 const DECODER_SOURCE: &str = include_str!("../../scripts/studio_vdn_decoder.py");
+const STREAM_ENCODER_SOURCE: &str = include_str!("../../scripts/studio_vdn_stream_encode.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -55,7 +56,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{LOWMEM_SOURCE}\n{DISK_LOADER_SOURCE}\n{NATIVE_SHARDS_SOURCE}\n{DECODER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{LOWMEM_SOURCE}\n{DISK_LOADER_SOURCE}\n{NATIVE_SHARDS_SOURCE}\n{DECODER_SOURCE}\n{STREAM_ENCODER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
