@@ -523,6 +523,7 @@ fn dispatch(app: AppHandle, id: String) {
             j.attempts += 1;
             Ok(())
         });
+        let mut requeue_delay = None;
         if let Ok(j) = job {
             // Gallery publication is the durable commit point. Recover a crash
             // between writing the gallery and updating this journal idempotently.
@@ -577,6 +578,11 @@ fn dispatch(app: AppHandle, id: String) {
             if result.is_ok() {
                 crate::studio_video_timeline::notify_video_published(&app);
             }
+            if let Ok(ref retry) = updated {
+                if matches!(retry.status, VdnJobStatus::Queued) {
+                    requeue_delay = Some((retry.attempts as u64).saturating_mul(10).min(30));
+                }
+            }
             if let Ok(jobs) = list(&app) {
                 if let Some(finished) = jobs.iter().find(|row| row.id == id) {
                     if matches!(finished.status, VdnJobStatus::Completed | VdnJobStatus::Cancelled)
@@ -588,14 +594,10 @@ fn dispatch(app: AppHandle, id: String) {
             }
         }
         if let Ok(mut running) = active().lock() { running.remove(&id); }
-        if let Ok(ref job) = updated {
-            if matches!(job.status, VdnJobStatus::Queued) {
-                // Release GPU reservation and allow another process to free
-                // memory before another full tiered attempt. The journal
-                // survives a process exit even during this delay.
-                let delay = (job.attempts as u64).saturating_mul(10).min(30);
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            }
+        if let Some(delay) = requeue_delay {
+            // Another process may release VRAM before the next tiered attempt.
+            // The persisted journal remains resumable if the app closes here.
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         }
         dispatch_waiting(&app);
     });
