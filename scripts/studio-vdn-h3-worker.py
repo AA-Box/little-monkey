@@ -64,6 +64,7 @@ def parse_args(argv=None):
     parser.add_argument("--job-id", default="")
     parser.add_argument("--temporal-context-out", default="")
     parser.add_argument("--temporal-context-in", default="")
+    parser.add_argument("--temporal-parent", default="")
     parser.add_argument("--temporal-source-video-sha256", default="")
     parser.add_argument("--temporal-source-job-id", default="")
     parser.add_argument("--seed", type=int, default=0)
@@ -166,6 +167,12 @@ def parse_args(argv=None):
             parser.error("Invalid native source job ID")
     elif args.temporal_source_video_sha256 or args.temporal_source_job_id:
         parser.error("Unexpected temporal source metadata without a snapshot")
+    if bool(args.temporal_parent) != bool(args.temporal_context_in):
+        parser.error("Native saved-context continuation requires the pinned parent MP4")
+    if args.temporal_parent:
+        parent = Path(args.temporal_parent)
+        if not parent.is_absolute() or parent.is_symlink() or not parent.is_file():
+            parser.error("Missing/unsafe Gallery parent MP4 for native chain")
     if args.step_checkpoint_root and not Path(args.step_checkpoint_root).is_absolute():
         parser.error("Native step checkpoint location must be absolute and app-owned")
     if args.refine_from and not args.two_pass:
@@ -339,6 +346,7 @@ def run(args):
                         ("--refine-from", args.refine_from),
                         ("--temporal-context-out", args.temporal_context_out),
                         ("--temporal-context-in", args.temporal_context_in),
+                        ("--temporal-parent", args.temporal_parent),
                         ("--temporal-source-video-sha256", args.temporal_source_video_sha256),
                         ("--temporal-source-job-id", args.temporal_source_job_id)):
         if value:
