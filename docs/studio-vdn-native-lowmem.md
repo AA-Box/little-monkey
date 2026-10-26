@@ -90,14 +90,43 @@ requirements must be measured on the complete model.
   stereo-audio operations. No synthetic `from_pretrained` eager-load
   shortcut is involved in the streaming fixture.
 - End-to-end licensed 60+ GB Qwen/H3 inference and multi-frame GPU encoding
-  have **not** been performed here. In particular FP8 TorchAO kernel support,
-  VRAM peaks and LoRA on the original giant H3 layers remain to be proven
+  have **not** been performed here: the current CI environment has no NVIDIA
+  GPU. Actual TorchAO CUDA FP8 kernels, VRAM peaks, playback/mux fidelity,
+  and LoRA on the original giant H3 layers remain to be proven
   on an eligible NVIDIA device; the existence of a functional CPU toy test
   does not establish 8 GiB VRAM / 16 GiB total system RAM production support.
 - Direct hook coverage is intentionally strict. Missing, renamed or tied
   checkpoint weights, model-code paths that access a leaf parameter outside
   that leaf's `forward`, and unsupported LoRA formats fail rather than
   silently running a different model.
+
+## Incremental output and adapter safety
+
+- The native-original disk tier requests **latent outputs** from the actual H3
+  single-pass and trained 8+3 two-pass samplers. The native
+  `studio_vdn_stream_encode.py` reproduces upstream H3 VAE temporal
+  clip/chunk blending, including dropped tokens and tail-frame trim, and
+  yields RGB `uint8` CPU frame chunks directly into Diffusers' existing
+  PyAV `encode_video(Iterator[Tensor])`. The entire decoded movie is never
+  concatenated, stacked, or retained; soundtrack is decoded once using the
+  original FP32 BigVGAN path and muxed with the video. MP4 publication is
+  atomic and partial output is deleted on encoder failure.
+- The native TorchAO FP8 path uses reversible `Float8Tensor.from_hp`
+  assignment when a Linear module's original SafeTensors parameter has
+  just been hydrated. This avoids repeatedly calling `quantize_(module)`,
+  which permanently modifies module metadata on every forward; the weight
+  is evicted back to `meta` in the exception-safe post-forward hook. SM89
+  Ada as well as SM90+ GPUs are eligible when the actual installed TorchAO
+  supports them.
+- LoRA module matching prioritizes exact nested module paths before
+  wrapper stripping or longest-unique suffix lookup. Compatible A/B
+  adapters are validated at load time, alpha/rank is preserved, and a
+  streamed overlay runs during that module's forward without merging base
+  weights. Unsupported adapter tensor layouts are rejected rather than
+  silently ignored.
+- The baseline `encode_video` and pipeline PIL frame-list path remain only
+  for non-native placements; native-original no longer allocates all
+  rendered frames in memory.
 
 ## How this is validated
 
