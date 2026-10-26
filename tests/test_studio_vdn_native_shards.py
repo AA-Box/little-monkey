@@ -8,6 +8,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import types
 
 import torch
 from torch import nn
@@ -235,6 +236,68 @@ model(torch.ones(2, 8))
         self.assertIs(native.report_native_execution_device(model, "cuda:0"), model)
         with self.assertRaisesRegex(ValueError, "CUDA"):
             native.report_native_execution_device(nn.Linear(3, 3), "cpu")
+
+    def test_fp8_leaf_quantization_is_repeatable_without_persistent_module_changes(self):
+        model = nn.Linear(8, 8)
+        x = torch.randn(3, 8)
+        expected = model(x)
+        with tempfile.TemporaryDirectory() as d:
+            store = make_original_shards(model, d)
+            with torch.device("meta"):
+                loaded = nn.Linear(8, 8)
+            manager = native.NativeOriginalShardHooks(
+                loaded, store, device="cpu", component="transformer")
+            # Replace only the CUDA-specific quantization primitive with
+            # deterministic CPU passthrough; exercise the real onload/release
+            # and exact Linear.forward hook sequence without CUDA.
+            class StubFloat8Tensor:
+                count = 0
+                @staticmethod
+                def from_hp(weight, **kwargs):
+                    StubFloat8Tensor.count += 1
+                    return weight.clone()
+            manager.fp8 = True
+            manager.fp8_tensor_type = StubFloat8Tensor
+            manager.fp8_config = types.SimpleNamespace(weight_dtype=torch.float16,
+                                                      granularity="per_row")
+            original_repr = loaded.extra_repr
+            torch.testing.assert_close(loaded(x), expected)
+            torch.testing.assert_close(loaded(x), expected)
+            self.assertEqual(StubFloat8Tensor.count, 2)
+            self.assertEqual(loaded.extra_repr, original_repr)
+            self.assertTrue(loaded.weight.is_meta)
+            self.assertFalse(manager.loaded)
+
+    def test_h3_lora_exact_nested_module_prefers_full_path(self):
+        class AttentionBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.to_q = nn.Linear(8, 8, bias=False)
+            def forward(self, value):
+                return self.to_q(value)
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.Sequential(AttentionBlock(), AttentionBlock())
+            def forward(self, value):
+                return self.blocks(value)
+        torch.manual_seed(43)
+        model = Model()
+        x = torch.randn(2, 8)
+        a = torch.randn(2, 8)
+        b = torch.randn(8, 2)
+        expected = model.blocks[1](
+            model.blocks[0].to_q(x) + torch.nn.functional.linear(
+                torch.nn.functional.linear(x, a), b))
+        with tempfile.TemporaryDirectory() as d:
+            file = Path(d) / "nested.safetensors"
+            save_file({
+                "base_model.model.transformer.blocks.0.to_q.lora_A.weight": a,
+                "base_model.model.transformer.blocks.0.to_q.lora_B.weight": b,
+                "base_model.model.transformer.blocks.0.to_q.alpha": torch.tensor(2.)},
+                str(file))
+            self.assertEqual(native.attach_native_lora(model, [file]), 1)
+            torch.testing.assert_close(model(x), expected, rtol=1e-5, atol=1e-5)
 
     def test_shard_map_rejects_traversal_and_missing_weights(self):
         with self.assertRaises(ValueError):
