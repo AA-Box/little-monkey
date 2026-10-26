@@ -45,9 +45,17 @@ class NativePlacementTests(unittest.TestCase):
                 16*g, 16*g, 220*g, capability=9,
                 fp8=True, mode="stream_disk", torchao_available=False)
 
-    def test_fp8_is_rejected_on_non_hopper(self):
-        with self.assertRaisesRegex(ValueError, "9.0"):
+    def test_fp8_accepts_ada_sm89_and_rejects_earlier_gpu(self):
+        self.assertTrue(worker.native_fp8_capability((8, 9)))
+        self.assertTrue(worker.native_fp8_capability((9, 0)))
+        self.assertTrue(worker.native_fp8_capability((12, 0)))
+        self.assertFalse(worker.native_fp8_capability((8, 6)))
+        with self.assertRaisesRegex(ValueError, "8.9"):
             self.choose(fp8=True)
+        tier = worker.choose_memory_plans(
+            16*G, 16*G, 220*G, capability=(8, 9),
+            fp8=True, mode="stream_disk", torchao_available=True)
+        self.assertEqual(tier, ["fp8_disk"])
 
     def test_new_process_oom_classifier_does_not_hide_other_failures(self):
         self.assertTrue(worker.is_cuda_oom(RuntimeError("CUDA out of memory")))
