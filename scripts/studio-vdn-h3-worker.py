@@ -41,6 +41,9 @@ if "install_native_h3_tiles" not in globals():
 
 if "load_native_h3_components" not in globals():
     from studio_vdn_native_shards import load_native_h3_components
+if "encode_h3_latent_video" not in globals():
+    from studio_vdn_stream_encode import encode_h3_latent_video
+
 if "install_lowmem_decoders" not in globals():
     from studio_vdn_decoder import install_lowmem_decoders
 
@@ -491,7 +494,7 @@ def native_h3_refine_schedule(pipe, torch):
     return active()
 
 
-def native_two_pass(pipe, args, torch, device, keyframes, references):
+def native_two_pass(pipe, args, torch, device, keyframes, references, *, latent_output=False):
     """Native latent-space two-pass using Diffusers' actual MiniMax-H3 state I/O.
 
     Pass one samples at half the target height/width. The separate Little
@@ -591,7 +594,7 @@ def native_two_pass(pipe, args, torch, device, keyframes, references):
             num_inference_steps=4,
             generator=torch.Generator(device).manual_seed(args.seed + 2),
             latents=upscaled, audio_latents=audio_latents,
-            output=["videos", "audio", "sampling_rate"],
+            output=["latents", "audio_latents"] if latent_output else ["videos", "audio", "sampling_rate"],
             **({"references": references} if references else keyframes),
             )
 
@@ -790,31 +793,38 @@ def _run_once(args):
     print(json.dumps({"phase": "sampling", "steps": args.steps,
                       "frames": args.frames}), flush=True)
     if args.two_pass:
-        sample = native_two_pass(pipe, args, torch, device, keyframes, references)
+        sample = native_two_pass(pipe, args, torch, device, keyframes, references,
+                                 latent_output=native_direct)
     else:
         with native_sampler_recovery(args, "single", pipe, model_identity=checkpoint):
             sample = pipe(
             prompt=args.prompt, num_frames=args.frames,
             num_inference_steps=args.steps + 1,
             generator=torch.Generator(device).manual_seed(args.seed),
-            output=["videos", "audio", "sampling_rate"],
+            output=["latents", "audio_latents"] if native_direct else ["videos", "audio", "sampling_rate"],
             **({"references": references} if references else keyframes),
             )
-    videos, audio, sample_rate = (sample["videos"], sample["audio"],
-                                 sample["sampling_rate"])
-
-    frames = torch.from_numpy(np.stack([np.asarray(frame) for frame in videos[0]]))
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(".partial.mp4")
-    if temporary.exists():
-        temporary.unlink()
-    print(json.dumps({"phase": "encoding"}), flush=True)
-    encode_video(frames, fps=FPS, output_path=str(temporary),
-                 audio=audio[0].float().cpu(), audio_sample_rate=sample_rate)
-    if not temporary.is_file() or temporary.stat().st_size < 32:
-        raise RuntimeError("OpenVDN produced no video bytes")
-    os.replace(temporary, output)
+    print(json.dumps({"phase": "encoding", "mode":
+                      "native_incremental_video" if native_direct else "pipeline_frames"}), flush=True)
+    if native_direct:
+        encoded_count = encode_h3_latent_video(
+            pipe, sample["latents"], sample["audio_latents"],
+            output_path=args.output, frames=args.frames, fps=FPS)
+    else:
+        videos, audio, sample_rate = (sample["videos"], sample["audio"],
+                                     sample["sampling_rate"])
+        frames = torch.from_numpy(np.stack([np.asarray(frame) for frame in videos[0]]))
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_suffix(".partial.mp4")
+        if temporary.exists():
+            temporary.unlink()
+        encode_video(frames, fps=FPS, output_path=str(temporary),
+                     audio=audio[0].float().cpu(), audio_sample_rate=sample_rate)
+        if not temporary.is_file() or temporary.stat().st_size < 32:
+            raise RuntimeError("OpenVDN produced no video bytes")
+        os.replace(temporary, output)
+        encoded_count = len(videos[0])
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
     host_peak = None
     if os.path.isfile("/proc/self/status"):
@@ -832,7 +842,7 @@ def _run_once(args):
                       "nativeAttentionTiling": args.lowmem == "force" or
                           (args.lowmem == "auto" and args.offload_dit)}), flush=True)
     print(json.dumps({"phase": "completed", "path": str(output),
-                      "frames": len(videos[0]), "fps": FPS}), flush=True)
+                      "frames": encoded_count, "fps": FPS}), flush=True)
 
 
 if __name__ == "__main__":
