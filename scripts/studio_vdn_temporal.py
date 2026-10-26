@@ -366,8 +366,30 @@ def render_temporal_video(pipe, args, torch, device, keyframes, references,
         if not target.is_file() or target.stat().st_size < 32:
             raise RuntimeError("Native temporal encoder produced no video")
         os.replace(target, output)
+        if stored is not None:
+            # Publish a complete chain, not a second clip that merely depends
+            # on an unpublished predecessor. Decode/re-mux from PCM; never
+            # concatenate AAC bitstreams or duplicate 22 overlapped frames.
+            from_path = Path(args.temporal_parent)
+            merged = output.with_name("." + output.stem + ".joined.mp4")
+            merged.unlink(missing_ok=True)
+            try:
+                print(json.dumps({"phase": "temporal_chain_join",
+                                  "parentFrames": source_frames,
+                                  "newFrames": frames_total}), flush=True)
+                result = join_native_chain(
+                    str(from_path), str(output), str(merged),
+                    parent_frames=source_frames, child_frames=frames_total,
+                    expected_parent_sha256=args.temporal_source_video_sha256)
+                if result["frames"] != source_frames + frames_total:
+                    raise RuntimeError("Native full chain frame total does not match context")
+                os.replace(merged, output)
+            finally:
+                merged.unlink(missing_ok=True)
         if args.temporal_context_out:
             save_context(args.temporal_context_out, context, low_context,
                          output, checkpoint, args.job_id, source_frames + frames_total)
         del video_memory
-    return {"videos": frames_total, "audioSamples": audio_cursor}
+    total_frames = source_frames + frames_total
+    return {"videos": total_frames,
+            "audioSamples": emitted_audio_samples(total_frames), "newFrames": frames_total}
