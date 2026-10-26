@@ -1,5 +1,6 @@
 """Native H3 original-frame provenance, inheritance and tamper acceptance."""
 import importlib.util
+from fractions import Fraction
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,9 +27,10 @@ class IdentityLineage(unittest.TestCase):
             stream.width = 32
             stream.height = 32
             stream.pix_fmt = "yuv420p"
-            for _ in range(3):
+            for i in range(3):
                 frame = av.VideoFrame.from_ndarray(
                     np.full((32, 32, 3), value, dtype=np.uint8), format="rgb24")
+                frame.pts, frame.time_base = i, Fraction(1, 24)
                 for packet in stream.encode(frame):
                     media.mux(packet)
             for packet in stream.encode(None):
