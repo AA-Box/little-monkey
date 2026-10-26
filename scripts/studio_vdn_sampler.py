@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import uuid
 
@@ -45,7 +46,8 @@ class NativeStepStore:
     def __init__(self, root, stage, identity, total, schedule_digest,
                  video_shape, audio_shape):
         self.root = Path(root)
-        if not self.root.is_absolute() or stage not in ("single", "preview", "refine"):
+        if not self.root.is_absolute() or not (stage in ("single", "preview", "refine")
+                or re.fullmatch(r"temporal_[0-7](?:_(?:preview|refine))?", stage)):
             raise ValueError("Unsafe native H3 step checkpoint root or stage")
         self.stage = stage
         self.identity = identity
@@ -154,7 +156,8 @@ class NativeStepStore:
 
 
 @contextlib.contextmanager
-def native_sampler_recovery(args, stage, pipeline, *, model_identity):
+def native_sampler_recovery(args, stage, pipeline, *, model_identity,
+                            temporal_context=None, temporal_transformer=None):
     """Own the real Diffusers H3 loop for this worker call only.
 
     On restart, reconstruct the *original* deterministic text/keyframe/reference
@@ -163,6 +166,8 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity):
     never claimed as completed.
     """
     if not args.step_checkpoint_root:
+        if temporal_context is not None:
+            raise ValueError("Temporal context requires native completed-step recovery")
         yield
         return
     import torch
@@ -175,10 +180,15 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity):
     digest.update(checkpoint_identity(args).encode("ascii"))
     digest.update(stage.encode("ascii"))
     digest.update(model_identity.encode("utf-8"))
+    if temporal_context is not None:
+        digest.update(temporal_context.digest.encode("ascii"))
     digest.update(str(args.internal_attempt).encode("ascii"))
-    # Different chunk/KV projection strategies may round differently. A
-    # previously committed trajectory must not cross native tiling settings.
-    for value in (args.lowmem, args.query_chunk, args.head_chunk, args.ff_chunk):
+    # The native tiling configuration affects floating-point roundoff.
+    # A prior sampler snapshot cannot be reused across changed tile shapes.
+    for value in (getattr(args, "lowmem", "auto"),
+                  getattr(args, "query_chunk", 0),
+                  getattr(args, "head_chunk", 0),
+                  getattr(args, "ff_chunk", 256)):
         digest.update(str(value).encode("ascii"))
         digest.update(b"\0")
     digest.update(str(diffusers.__version__).encode("ascii"))
@@ -201,6 +211,8 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity):
             raise ValueError("Negative H3 conditioning row offset")
         initial_video = block.latents[cv:]
         initial_audio = block.audio_latents[ca:]
+        if temporal_context is not None:
+            temporal_context.bind(block, cv, ca)
         schedule = _hashlib.sha256()
         for tensor in (block.timesteps, block.audio_timesteps,
                        components.scheduler.sigmas, components.audio_scheduler.sigmas):
@@ -225,6 +237,8 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity):
                               "completedSteps": start, "totalSteps": total}),
                   flush=True)
 
+        if temporal_context is not None:
+            temporal_context.restore(block)
         with loop.progress_bar(total=total) as progress:
             if start:
                 progress.update(start)
@@ -232,6 +246,8 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity):
                 nonlocal components, block
                 components, block = loop.loop_step(
                     components, block, i=index, t=block.timesteps[index])
+                if temporal_context is not None:
+                    temporal_context.restore(block)
                 if (components.scheduler.step_index != index + 1
                         or components.audio_scheduler.step_index != index + 1):
                     raise RuntimeError("Both MiniMax H3 schedulers must commit each step")
@@ -247,11 +263,17 @@ def native_sampler_recovery(args, stage, pipeline, *, model_identity):
         loop.set_block_state(state, block)
         return components, state
 
+    handle = (temporal_transformer.register_forward_pre_hook(
+        temporal_context.before, with_kwargs=True, prepend=True)
+        if temporal_context is not None else None)
     MiniMaxH3DenoiseLoopWrapper.__call__ = run_with_checkpoints
     try:
         yield
     finally:
         MiniMaxH3DenoiseLoopWrapper.__call__ = base
+        if handle is not None:
+            handle.remove()
+            temporal_context.current_video = None
 
 
 def clear_native_sampler_stage(args, stage):

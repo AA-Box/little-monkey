@@ -29,7 +29,8 @@ export function StudioVdnPanel({
   const [last, setLast] = useState<string | null>(null);
   const [sourceGalleryId, setSourceGalleryId] = useState<string | null>(null);
   const [sourceVdnJobId, setSourceVdnJobId] = useState<string | null>(null);
-  const [continuationMode, setContinuationMode] = useState<"last_frame" | "video_reference">("last_frame");
+  const [continuationMode, setContinuationMode] = useState<"last_frame" | "video_reference" | "latent_context">("last_frame");
+  const [queueNativeTwoPass, setQueueNativeTwoPass] = useState(true);
   const [availableClips, setAvailableClips] = useState<GenerationEntry[]>([]);
   const [durableJobs, setDurableJobs] = useState<DurableVdnJob[]>([]);
   const [references, setReferences] = useState<string[]>([]);
@@ -38,15 +39,16 @@ export function StudioVdnPanel({
   const [loraPaths, setLoraPaths] = useState<string[]>([]);
   const [steps, setSteps] = useState(8);
   const [frames, setFrames] = useState(141);
+  const [segments, setSegments] = useState(1);
   const [seed, setSeed] = useState("0");
   const [fp8, setFp8] = useState(false);
   const [offload, setOffload] = useState(true);
   const [memoryMode, setMemoryMode] = useState<"auto" | "resident" | "stream_cpu" | "stream_disk">("auto");
+  // Pinned learned H3 resizer uses the published 8+3 sampling schedule.
   const [lowmem, setLowmem] = useState<"auto" | "off" | "force">("auto");
   const [queryChunk, setQueryChunk] = useState(0);
   const [headChunk, setHeadChunk] = useState(0);
   const [ffChunk, setFfChunk] = useState(256);
-  // Trained resizer uses eight preview and three refinement steps.
   const refineSteps = 3;
   const [trustRemoteCode, setTrustRemoteCode] = useState(false);
   const [licenseReason, setLicenseReason] = useState<string | null | undefined>(undefined);
@@ -155,7 +157,8 @@ export function StudioVdnPanel({
       referenceImagePaths: references,
       referenceVideoPath: referenceVideo,
       referenceAudioPath: referenceAudio,
-      loraPaths, steps, frames, seed: Number(seed) || 0,
+      loraPaths, steps, frames, segments: backend === "diffusers" ? segments : 1,
+      seed: Number(seed) || 0,
       fp8, offloadDit: offload, memoryMode, lowmem, queryChunk, headChunk, ffChunk, backend,
       nativeTwoPass: twoPass, refineSteps, refineFromJobId: null,
       repoRoot: repoRoot || null, checkpointRoot: checkpointRoot || null,
@@ -167,7 +170,7 @@ export function StudioVdnPanel({
 
   async function queueAfter(parent: DurableVdnJob) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
-        backend !== "diffusers" || !trustRemoteCode) return;
+        backend !== "diffusers" || !trustRemoteCode || (queueNativeTwoPass && steps !== 8)) return;
     setError(null);
     try {
       const jobId = crypto.randomUUID();
@@ -176,10 +179,10 @@ export function StudioVdnPanel({
         ...request,
         firstImagePath: null, lastImagePath: null,
         sourceGalleryEntryId: null, sourceVdnJobId: parent.id,
-        continuationMode: "video_reference",
+        continuationMode: "latent_context",
         referenceVideoPath: null,
         referenceAudioPath: null,
-        nativeTwoPass: false,
+        nativeTwoPass: queueNativeTwoPass,
         refineFromJobId: null,
       });
       setDurableJobs((items) => [...items, record]);
@@ -213,7 +216,8 @@ export function StudioVdnPanel({
 
   async function run(twoPass = false) {
     if (!python || !probeInfo || !prompt.trim() || licenseReason !== null ||
-        !trustRemoteCode || running) return;
+        !trustRemoteCode || running || (segments > 1 && Boolean(last)) ||
+        (twoPass && steps !== 8)) return;
     const id = crypto.randomUUID();
     job.current = id;
     setRunning(true);
@@ -353,7 +357,7 @@ export function StudioVdnPanel({
                 onChange={(event) => setFfChunk(Math.max(0, Math.min(4096, Number(event.target.value) || 0)))} />
             </label>
           </div>
-          <p>Zero means adaptive for attention. Every query still attends to all video, audio and text keys. These controls reduce activation peaks but do not bypass the model's weight-loading RAM requirements.</p>
+          <p>Zero means adaptive for attention. Every query still attends to all video, audio and text keys. These controls reduce activation peaks but do not bypass model weight-loading RAM requirements.</p>
         </div>}
         <label className="grid gap-1 text-muted">
           VDN execution backend
@@ -486,7 +490,7 @@ export function StudioVdnPanel({
           )}
         </div>
 
-        <div className="grid gap-2 sm:grid-cols-3">
+        <div className="grid gap-2 sm:grid-cols-4">
           <label className="grid gap-1 text-muted">Model evaluations
             <input type="number" min={1} max={50} value={steps}
               disabled={running || backend !== "diffusers"}
@@ -501,6 +505,16 @@ export function StudioVdnPanel({
                 <option value={value} key={value}>{(value / 24).toFixed(1)} s — {value} frames</option>
               )}
             </select>
+          </label>
+          <label className="grid gap-1 text-muted">Native continuous segments
+            <select value={backend === "diffusers" ? segments : 1}
+              disabled={running || backend !== "diffusers"}
+              className="rounded border border-border bg-background p-1 text-foreground"
+              onChange={(event) => setSegments(Number(event.target.value))}>
+              {[1, 2, 3, 4, 5, 6, 7, 8].map((count) =>
+                <option key={count} value={count}>{count} — {((frames + (count - 1) * (frames - 22)) / 24).toFixed(1)} s</option>)}
+            </select>
+            <span>22-frame native visual overlap, continuous generated stereo audio</span>
           </label>
           <label className="grid gap-1 text-muted">Seed
             <input type="number" min={0} value={seed} disabled={running}
@@ -592,7 +606,8 @@ export function StudioVdnPanel({
               if (id) setSourceGalleryId(null);
             }}>
             <option value="">No prerequisite VDN job</option>
-            {durableJobs.filter((entry) => entry.status !== "failed" && entry.status !== "cancelled")
+            {durableJobs.filter((entry) => entry.request.backend === "diffusers" &&
+                entry.status !== "failed" && entry.status !== "cancelled")
               .map((entry) => <option key={entry.id} value={entry.id}>
                 {entry.id.slice(0, 8)} · {entry.status} · {entry.request.prompt.slice(0, 30)}
               </option>)}
@@ -605,7 +620,13 @@ export function StudioVdnPanel({
             onChange={(event) => setContinuationMode(event.target.value as typeof continuationMode)}>
             <option value="last_frame">Last video frame (FL2VA)</option>
             <option value="video_reference">Reference original video motion and audio (Ref2VA)</option>
+            <option value="latent_context">Continue using saved native video + audio latents</option>
           </select>
+        </label>}
+        {backend === "diffusers" && <label className="flex items-center gap-2 text-muted">
+          <input type="checkbox" checked={queueNativeTwoPass} disabled={running}
+            onChange={(event) => setQueueNativeTwoPass(event.target.checked)} />
+          Use native learned 3D two-pass (8+3) for queued latent continuations
         </label>}
         <label className="flex items-start gap-2 text-muted">
           <input type="checkbox" checked={trustRemoteCode} disabled={running}
@@ -617,15 +638,15 @@ export function StudioVdnPanel({
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="primary"
             disabled={running || !python || !probeInfo || !prompt.trim() ||
-              licenseReason !== null || !trustRemoteCode}
+              (segments > 1 && Boolean(last)) || licenseReason !== null || !trustRemoteCode}
             onClick={() => void run()}>
             <Play size={13} /> Generate with VDN-H3
           </Button>
           <Button size="sm" variant="secondary"
-            disabled={running || backend !== "diffusers" || !python || !probeInfo || !prompt.trim() ||
+            disabled={running || backend !== "diffusers" || (segments > 1 && Boolean(last)) || !python || !probeInfo || !prompt.trim() ||
               licenseReason !== null || !trustRemoteCode || steps !== 8}
             onClick={() => void run(true)}>
-            <Play size={13} /> Native learned 3D latent two-pass
+            <Play size={13} /> Native learned 3D two-pass (8+3)
           </Button>
           {running && <Button size="sm" variant="secondary" onClick={() => void cancel()}>
             <Square size={13} /> Cancel VDN job
@@ -633,10 +654,9 @@ export function StudioVdnPanel({
           {phase && <span role="status" className="text-muted">Status: {phase}</span>}
         </div>
         {backend === "diffusers" && <p className="text-muted">
-          Learned 3D latent upscale: 8 preview steps at half resolution, verified
-          24-channel H3 model weights, then 3 calibrated refinement steps.
-          The first use downloads approximately 659 MiB of verified weights
-          from the original publisher. No interpolation fallback.
+          Verified 3D learned H3 latent upscaler, 8 preview steps and 3 calibrated
+          refinement steps. The pinned trained model downloads on first use;
+          no interpolation fallback is used in native two-pass mode.
         </p>}
         {durableJobs.length > 0 && <div className="grid gap-1">
           <strong>Persisted VDN jobs</strong>

@@ -12,6 +12,17 @@ use std::{fs, path::{Path, PathBuf}, sync::{Mutex, OnceLock}, collections::HashS
 use tauri::AppHandle;
 
 const MAX_ATTEMPTS: u32 = 3;
+
+/// A native CUDA out-of-memory condition can be transient (GPU contention)
+/// even after the worker has exhausted its progressive placement tiers.
+fn recoverable_native_oom(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    message.contains("cuda out of memory")
+        || message.contains("all native cuda placement tiers exhausted")
+        || message.contains("cublas_status_alloc_failed")
+        || message.contains("cuda error: out of memory")
+}
+
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all="snake_case")]
@@ -100,6 +111,73 @@ fn active() -> &'static Mutex<HashSet<String>> {
     static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
 }
+/// Remove only native generated scratch windows, never the published MP4,
+/// original film identity, or content-addressed AV latent tail.
+fn remove_segment_cache(app: &AppHandle, id: &str) -> Result<(), String> {
+    uuid::Uuid::parse_str(id).map_err(|_| "Invalid native recovery cache job ID")?;
+    let root = app.profile_data_dir().map_err(|e| e.to_string())?
+        .join("studio-vdn-h3").join("temporal-segments");
+    let root_meta = match fs::symlink_metadata(&root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err("Unsafe native recovery cache root".into());
+    }
+    let folder = root.join(id);
+    let folder_meta = match fs::symlink_metadata(&folder) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if folder_meta.file_type().is_symlink() || !folder_meta.is_dir() {
+        return Err("Unsafe native recovery cache directory".into());
+    }
+    fs::remove_dir_all(folder).map_err(|e| e.to_string())
+}
+
+/// Startup/lifecycle GC, never touches jobs that can be resumed or running.
+/// For orphan directories without a journal we retain seven days for manual
+/// recovery, then remove them if they are not registered in this process.
+fn prune_native_cache(app: &AppHandle, jobs: &[VdnJob]) {
+    let keep: HashSet<&str> = jobs.iter()
+        .filter(|job| matches!(job.status, VdnJobStatus::Queued
+            | VdnJobStatus::Running | VdnJobStatus::Interrupted)
+            || (matches!(job.status, VdnJobStatus::Failed)
+                && job.attempts < MAX_ATTEMPTS
+                && now_ms().saturating_sub(job.updated_at_ms) < 7 * 86_400_000))
+        .map(|job| job.id.as_str()).collect();
+    let root = match app.profile_data_dir() {
+        Ok(folder) => folder.join("studio-vdn-h3").join("temporal-segments"),
+        Err(_) => return,
+    };
+    if !fs::symlink_metadata(&root).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if uuid::Uuid::parse_str(&name).is_err() || keep.contains(name.as_str()) {
+                continue;
+            }
+            if active().lock().is_ok_and(|live| live.contains(&name)) {
+                continue;
+            }
+            let found = jobs.iter().find(|j| j.id == name);
+            let expired_orphan = found.is_none()
+                && entry.metadata().ok()
+                    .and_then(|m| m.modified().ok())
+                    .is_some_and(|when| std::time::SystemTime::now()
+                        .duration_since(when).is_ok_and(|age|
+                            age.as_secs() >= 7 * 24 * 3600));
+            if found.is_some() || expired_orphan {
+                let _ = remove_segment_cache(app, &name);
+            }
+        }
+    }
+}
+
 fn directory(app: &AppHandle) -> Result<PathBuf, String> {
     let p = app.profile_data_dir().map_err(|e| e.to_string())?
         .join("studio-v1").join("vdn-jobs");
@@ -190,6 +268,108 @@ async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
         root.join("content-v1"), 256 * 1024 * 1024
     ).map_err(|e| e.to_string())?;
     let bytes = store.read(&entry.artifact_id).map_err(|e| e.to_string())?;
+    if request.continuation_mode == "latent_context" {
+        let original_job_id = entry.video_job_id.as_deref()
+            .ok_or("AV latent continuation requires a native VDN Gallery job")?;
+        let parent = {
+            let _guard = lock().lock().map_err(|e| e.to_string())?;
+            load(&directory(app)?, original_job_id)?
+        };
+        if !matches!(parent.status, VdnJobStatus::Completed)
+            || parent.request.backend != crate::studio_vdn::VdnBackend::Diffusers
+            || parent.result_entry_id.as_deref() != Some(entry.entry_id.as_str()) {
+            return Err("AV latent source must be a completed native Diffusers Gallery job".into());
+        }
+        let source_root = root.join("studio-vdn-h3").join("temporal-contexts");
+        let root_meta = fs::symlink_metadata(&source_root)
+            .map_err(|_| "Previous video has no saved AV latent context")?;
+        if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+            return Err("Unsafe native AV latent context directory".into());
+        }
+        let saved = source_root.join(format!("{original_job_id}.safetensors"));
+        let meta = fs::symlink_metadata(&saved)
+            .map_err(|_| "Previous video predates native AV context support; regenerate it")?;
+        if !meta.is_file() || meta.file_type().is_symlink()
+            || !(128..=64 * 1024 * 1024).contains(&meta.len()) {
+            return Err("Unsafe or oversized saved native AV latent context".into());
+        }
+        // The native H3 FL2VA branch needs the original *first* picture in
+        // Qwen3-VL vision conditioning, not the most recent predecessor frame.
+        // Its per-job identity PNG has been copied along the original lineage,
+        // SHA256-bound into the Safetensors snapshot and independently checked
+        // again inside the native worker. Legacy generations must be rebuilt.
+        let identity = source_root.join(format!("{original_job_id}.identity.png"));
+        let identity_meta = fs::symlink_metadata(&identity)
+            .map_err(|_| "Original film identity is missing; regenerate the native source")?;
+        if !identity_meta.is_file() || identity_meta.file_type().is_symlink()
+            || !(64..=8 * 1024 * 1024).contains(&identity_meta.len()) {
+            return Err("Unsafe or oversized native original-picture identity".into());
+        }
+        request.resolved_temporal_identity_sha256 = Some(hash_local_file(
+            identity.to_string_lossy().as_ref())?);
+        request.resolved_temporal_identity_path =
+            Some(identity.to_string_lossy().into_owned());
+        // A later Gallery job must retain the *original* Ref2VA people/voice
+        // references when source latents were generated by transformer_ref.
+        // Walk the durable ancestry, not a user-controlled filename. Every
+        // reused local image/video/audio is rechecked against its original
+        // job's content hashes; missing/changed sources fail closed.
+        if request.reference_image_paths.is_empty()
+            && request.reference_video_path.is_none()
+            && request.reference_audio_path.is_none()
+        {
+            let mut ancestor = parent.clone();
+            let mut visited = HashSet::new();
+            for _ in 0..8 {
+                if !visited.insert(ancestor.id.clone()) {
+                    return Err("Cycle in native VDN reference ancestry".into());
+                }
+                if !ancestor.request.reference_image_paths.is_empty()
+                    || ancestor.request.reference_video_path.is_some()
+                    || ancestor.request.reference_audio_path.is_some()
+                {
+                    verify_local_inputs(&ancestor)?;
+                    request.reference_image_paths = ancestor.request.reference_image_paths.clone();
+                    request.reference_video_path = ancestor.request.reference_video_path.clone();
+                    request.reference_audio_path = ancestor.request.reference_audio_path.clone();
+                    break;
+                }
+                let next_id = if let Some(prior) = &ancestor.request.source_vdn_job_id {
+                    Some(prior.clone())
+                } else if let Some(gallery) = &ancestor.request.source_gallery_entry_id {
+                    crate::generation_commands::generation_gallery(app.clone())?
+                        .into_iter()
+                        .find(|item| &item.entry_id == gallery)
+                        .and_then(|item| item.video_job_id)
+                } else {
+                    None
+                };
+                let Some(next_id) = next_id else { break; };
+                let next = {
+                    let _guard = lock().lock().map_err(|e| e.to_string())?;
+                    load(&directory(app)?, &next_id)?
+                };
+                if !matches!(next.status, VdnJobStatus::Completed) {
+                    return Err("Native AV reference lineage contains unfinished source".into());
+                }
+                ancestor = next;
+            }
+        }
+        request.resolved_temporal_context_path = Some(saved.to_string_lossy().into_owned());
+        request.resolved_temporal_source_sha256 =
+            Some(format!("{:x}", Sha256::digest(&bytes)));
+        request.resolved_temporal_source_job_id = Some(original_job_id.into());
+        // The previous Gallery clip contains the entire published chain.
+        // A profile-owned scratch copy is handed to the native re-muxer;
+        // the pinned SHA is checked again by the worker before joining.
+        if entry.media_type != "video/mp4" {
+            return Err("Native AV continuation requires an MP4 Gallery source".into());
+        }
+        let scratch = directory(app)?.join(format!("{}.temporal-parent.mp4", job.id));
+        fs::write(&scratch, &bytes).map_err(|e| e.to_string())?;
+        request.resolved_temporal_parent_path = Some(scratch.to_string_lossy().into_owned());
+        return Ok((request, Some(scratch)));
+    }
     if request.continuation_mode == "video_reference" {
         // Retain temporal motion *and* the original soundtrack by supplying the
         // pinned clip directly to native MiniMax-H3 Ref2VA reference decoding.
@@ -198,6 +378,13 @@ async fn prepare_continuation(app: &AppHandle, job: &VdnJob)
         fs::write(&temp, &bytes).map_err(|e| e.to_string())?;
         request.reference_video_path = Some(temp.to_string_lossy().into_owned());
         return Ok((request, Some(temp)));
+    }
+    // The retained AV prefix starts 22 frames before the previous ending.
+    // An extracted *final* frame is therefore NOT the first frame of this
+    // window: injecting it as FL2VA would conflict with the fixed prefix.
+    // Use the actual latent context alone, with optional caller Ref2VA refs.
+    if request.continuation_mode == "latent_context" {
+        return Ok((request, None));
     }
     let png_base64 = crate::studio_video_jobs::extract_final_frame(
         app, &bytes, &entry.media_type
@@ -237,9 +424,19 @@ pub(crate) fn completed_with_preview(app: &AppHandle, id: &str) -> Result<bool, 
         return Err("Native VDN checkpoint directory is unsafe".into());
     }
     let preview = checkpoint_root.join(format!("{id}.safetensors"));
-    let metadata = fs::symlink_metadata(&preview).map_err(|error| error.to_string())?;
-    Ok(metadata.is_file() && !metadata.file_type().is_symlink()
-       && metadata.len() > 128 && metadata.len() <= 64 * 1024 * 1024)
+    let clips: Vec<PathBuf> = if job.request.segments > 1 {
+        (0..job.request.segments)
+            .map(|part| PathBuf::from(format!("{}.segment{part}.safetensors",
+                preview.display())))
+            .collect()
+    } else {
+        vec![preview]
+    };
+    Ok(clips.iter().all(|path| {
+        fs::symlink_metadata(path).is_ok_and(|m|
+            m.is_file() && !m.file_type().is_symlink()
+            && m.len() > 128 && m.len() <= 64 * 1024 * 1024)
+    }))
 }
 
 fn published_entry(app: &AppHandle, id: &str) -> Result<Option<String>, String> {
@@ -326,6 +523,7 @@ fn dispatch(app: AppHandle, id: String) {
             j.attempts += 1;
             Ok(())
         });
+        let mut requeue_delay = None;
         if let Ok(j) = job {
             // Gallery publication is the durable commit point. Recover a crash
             // between writing the gallery and updating this journal idempotently.
@@ -351,7 +549,7 @@ fn dispatch(app: AppHandle, id: String) {
                 Err(error) => Err(error),
                 },
             };
-            let _ = modify(&app, &id, |j| {
+            let updated = modify(&app, &id, |j| {
                 if matches!(j.status, VdnJobStatus::Cancelled) && result.is_err() {
                     return Ok(());
                 }
@@ -362,7 +560,16 @@ fn dispatch(app: AppHandle, id: String) {
                         j.error = None;
                     }
                     Err(error) => {
-                        j.status = VdnJobStatus::Failed;
+                        // Bounded autonomous recovery after every native
+                        // placement tier has OOMed; retain finished segments
+                        // and sampler checkpoints. Other failures stay failed.
+                        j.status = if j.attempts < MAX_ATTEMPTS
+                            && j.request.backend == crate::studio_vdn::VdnBackend::Diffusers
+                            && recoverable_native_oom(error) {
+                            VdnJobStatus::Queued
+                        } else {
+                            VdnJobStatus::Failed
+                        };
                         j.error = Some(error.chars().take(500).collect());
                     }
                 }
@@ -371,8 +578,27 @@ fn dispatch(app: AppHandle, id: String) {
             if result.is_ok() {
                 crate::studio_video_timeline::notify_video_published(&app);
             }
+            if let Ok(ref retry) = updated {
+                if matches!(retry.status, VdnJobStatus::Queued) {
+                    requeue_delay = Some((retry.attempts as u64).saturating_mul(10).min(30));
+                }
+            }
+            if let Ok(jobs) = list(&app) {
+                if let Some(finished) = jobs.iter().find(|row| row.id == id) {
+                    if matches!(finished.status, VdnJobStatus::Completed | VdnJobStatus::Cancelled)
+                        || (matches!(finished.status, VdnJobStatus::Failed)
+                            && finished.attempts >= MAX_ATTEMPTS) {
+                        let _ = remove_segment_cache(&app, &id);
+                    }
+                }
+            }
         }
         if let Ok(mut running) = active().lock() { running.remove(&id); }
+        if let Some(delay) = requeue_delay {
+            // Another process may release VRAM before the next tiered attempt.
+            // The persisted journal remains resumable if the app closes here.
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
         dispatch_waiting(&app);
     });
 }
@@ -447,6 +673,7 @@ pub fn generation_vdn_cancel_job(app: AppHandle, job_id: String) -> Result<VdnJo
 pub fn start_background_recovery(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let Ok(jobs) = list(&app) else { return; };
+        prune_native_cache(&app, &jobs);
         for j in jobs {
             if let Ok(Some(entry_id)) = published_entry(&app, &j.id) {
                 let _ = modify(&app, &j.id, |record| {
@@ -463,7 +690,7 @@ pub fn start_background_recovery(app: AppHandle) {
                         j.status = if j.attempts < MAX_ATTEMPTS {
                             VdnJobStatus::Queued
                         } else { VdnJobStatus::Interrupted };
-                        j.error = Some("Recovered after app exit; restarting from seed".into());
+                        j.error = Some("Recovered after app exit; resuming verified native segment/checkpoint".into());
                         Ok(())
                     }) {
                         if matches!(updated.status, VdnJobStatus::Queued) { dispatch(app.clone(), j.id); }
@@ -481,6 +708,16 @@ pub fn start_background_recovery(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_cuda_oom_retries_only_actual_memory_errors() {
+        assert!(recoverable_native_oom("CUDA out of memory, failed to allocate 3 GiB"));
+        assert!(recoverable_native_oom("All native CUDA placement tiers exhausted their memory budget"));
+        assert!(recoverable_native_oom("CUBLAS_STATUS_ALLOC_FAILED"));
+        assert!(!recoverable_native_oom("Model license denied in Europe"));
+        assert!(!recoverable_native_oom("Native video source hash mismatch"));
+        assert!(!recoverable_native_oom("No CUDA GPU"));
+        assert!(!recoverable_native_oom("Insufficient disk space"));
+    }
     #[test]
     fn journal_reloads_exact_seed_and_source_identity() {
         let root = std::env::temp_dir().join(format!("vdn-durable-{}", uuid::Uuid::new_v4()));

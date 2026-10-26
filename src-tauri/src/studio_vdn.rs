@@ -28,6 +28,11 @@ const DISK_LOADER_SOURCE: &str = include_str!("../../scripts/studio_vdn_disk_loa
 const NATIVE_SHARDS_SOURCE: &str = include_str!("../../scripts/studio_vdn_native_shards.py");
 const DECODER_SOURCE: &str = include_str!("../../scripts/studio_vdn_decoder.py");
 const STREAM_ENCODER_SOURCE: &str = include_str!("../../scripts/studio_vdn_stream_encode.py");
+const TEMPORAL_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal.py");
+const TEMPORAL_STORE_SOURCE: &str = include_str!("../../scripts/studio_vdn_temporal_store.py");
+const TEMPORAL_CHAIN_SOURCE: &str = include_str!("../../scripts/studio_vdn_chain.py");
+const TEMPORAL_SEGMENT_CACHE_SOURCE: &str = include_str!("../../scripts/studio_vdn_segment_cache.py");
+const TEMPORAL_IDENTITY_SOURCE: &str = include_str!("../../scripts/studio_vdn_identity.py");
 const FAST_WORKER: &str = include_str!("../../scripts/studio-vdn-fast-worker.py");
 const ADAPTIVE_WORKER: &str = include_str!("../../scripts/studio-vdn-freevideo-worker.py");
 
@@ -56,7 +61,7 @@ fn staged_worker_source(backend: VdnBackend) -> String {
     if backend == VdnBackend::Diffusers {
         // A self-contained, uniquely named worker script makes the sampler
         // callback part of the same Python process and works after a restart.
-        format!("{SAMPLER_SOURCE}\n{LOWMEM_SOURCE}\n{DISK_LOADER_SOURCE}\n{NATIVE_SHARDS_SOURCE}\n{DECODER_SOURCE}\n{STREAM_ENCODER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{WORKER}")
+        format!("{SAMPLER_SOURCE}\n{LOWMEM_SOURCE}\n{DISK_LOADER_SOURCE}\n{NATIVE_SHARDS_SOURCE}\n{DECODER_SOURCE}\n{STREAM_ENCODER_SOURCE}\n{LEARNED_UPSCALER_SOURCE}\n{TEMPORAL_STORE_SOURCE}\n{TEMPORAL_CHAIN_SOURCE}\n{TEMPORAL_SEGMENT_CACHE_SOURCE}\n{TEMPORAL_IDENTITY_SOURCE}\n{TEMPORAL_SOURCE}\n{WORKER}")
     } else {
         worker_source(backend).to_owned()
     }
@@ -115,6 +120,7 @@ fn default_native_memory_mode() -> String { "auto".into() }
 fn default_native_lowmem_mode() -> String { "auto".into() }
 fn default_native_ff_chunk() -> u32 { 256 }
 fn default_native_refine_steps() -> u32 { 3 }
+fn default_native_segments() -> u32 { 1 }
 fn default_continuation_mode() -> String { "last_frame".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +131,8 @@ pub struct VdnRunRequest {
     pub prompt: String,
     pub steps: u32,
     pub frames: u32,
+    #[serde(default = "default_native_segments")]
+    pub segments: u32,
     pub seed: i64,
     pub first_image_path: Option<String>,
     pub last_image_path: Option<String>,
@@ -134,6 +142,19 @@ pub struct VdnRunRequest {
     pub source_vdn_job_id: Option<String>,
     #[serde(default = "default_continuation_mode")]
     pub continuation_mode: String,
+    // Dispatch-only, never accepted from a frontend or persisted in a journal.
+    #[serde(skip)]
+    pub resolved_temporal_context_path: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_source_sha256: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_source_job_id: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_parent_path: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_identity_path: Option<String>,
+    #[serde(skip)]
+    pub resolved_temporal_identity_sha256: Option<String>,
     #[serde(default)]
     pub reference_image_paths: Vec<String>,
     #[serde(default)]
@@ -242,13 +263,22 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         || (request.frames - 5) % 17 != 0 {
         return Err("VDN requires 1-50 inference steps and 17n+5 frames in 120..360".into());
     }
+    if !(1..=8).contains(&request.segments) {
+        return Err("Native VDN supports 1..8 temporal segments".into());
+    }
+    if request.segments != 1 && request.backend != VdnBackend::Diffusers {
+        return Err("Native temporal continuity requires the Little Monkey Diffusers backend".into());
+    }
+    if request.segments > 1 && request.last_image_path.is_some() {
+        return Err("Multi-segment native continuation cannot use a fixed terminal keyframe".into());
+    }
     if !matches!(request.backend, VdnBackend::Diffusers | VdnBackend::FreeVideoAdaptive) && request.steps != 8 {
         return Err("Optimized OpenVDN 8-step checkpoint must use exactly eight model evaluations".into());
     }
     if !matches!(request.memory_mode.as_str(), "auto" | "resident" | "stream_cpu" | "stream_disk") {
         return Err("Invalid Little Monkey native memory policy".into());
     }
-    if !matches!(request.continuation_mode.as_str(), "last_frame" | "video_reference") {
+    if !matches!(request.continuation_mode.as_str(), "last_frame" | "video_reference" | "latent_context") {
         return Err("Unsupported native continuation mode".into());
     }
     if let Some(source_id) = &request.source_vdn_job_id {
@@ -259,6 +289,19 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
         }
         if request.first_image_path.is_some() {
             return Err("VDN predecessor supplies its own first frame".into());
+        }
+    }
+    if request.continuation_mode == "latent_context" {
+        if request.backend != VdnBackend::Diffusers {
+            return Err("AV latent continuation requires native Diffusers".into());
+        }
+        if request.source_gallery_entry_id.is_none()
+            && request.source_vdn_job_id.is_none()
+            && request.resolved_temporal_context_path.is_none() {
+            return Err("AV latent continuation must resolve a pinned Gallery source".into());
+        }
+        if request.last_image_path.is_some() {
+            return Err("Native AV latent continuation cannot mix a fixed final-frame anchor".into());
         }
     }
     if request.continuation_mode == "video_reference" {
@@ -275,6 +318,11 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
             return Err("Cannot mix pending video continuation with another video/keyframe".into());
         }
     }
+    if !matches!(request.lowmem.as_str(), "auto" | "off" | "force")
+        || request.query_chunk > 8192 || request.head_chunk > 128
+        || request.ff_chunk > 4096 {
+        return Err("Invalid native H3 low-memory tiling options".into());
+    }
     if request.native_two_pass && (request.steps != 8 || request.refine_steps != 3) {
         return Err("Trained H3 latent upscaler requires exactly 8 preview + 3 refinement steps".into());
     }
@@ -290,11 +338,6 @@ fn validate_request(request: &VdnRunRequest) -> Result<(PathBuf, Option<PathBuf>
     if let Some(prior) = &request.refine_from_job_id {
         uuid::Uuid::parse_str(prior).map_err(|_| "Invalid native preview job ID")?;
         if prior == &request.job_id { return Err("Cannot refine from own job ID".into()); }
-    }
-    if !matches!(request.lowmem.as_str(), "auto" | "off" | "force")
-        || request.query_chunk > 8192 || request.head_chunk > 128
-        || request.ff_chunk > 4096 {
-        return Err("Invalid native H3 low-memory tiling options".into());
     }
     if request.seed < 0 {
         return Err("VDN seed must be nonnegative".into());
@@ -402,6 +445,29 @@ fn read_last_phase(log: &Path) -> Option<(String, String)> {
     })
 }
 
+/// Accept only a final completed event from our own sandboxed worker. The
+/// worker validates decoded frame totals before it reports a composed chain.
+fn completed_frame_count(log: &Path) -> Result<u32, String> {
+    let data = std::fs::read(log).map_err(|e| e.to_string())?;
+    if data.len() as u64 > MAX_LOG_BYTES {
+        return Err("Native VDN worker completion log exceeds safe bound".into());
+    }
+    let lines = String::from_utf8(data).map_err(|e| e.to_string())?;
+    for line in lines.lines().rev() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if value.get("phase").and_then(|v| v.as_str()) == Some("completed") {
+                let count = value.get("frames").and_then(|v| v.as_u64())
+                    .ok_or("Native VDN completion report has no frame count")?;
+                if !(120..=10000).contains(&count) {
+                    return Err("Native VDN frame count is out of safe bounds".into());
+                }
+                return Ok(count as u32);
+            }
+        }
+    }
+    Err("Native VDN worker finished without a verified frame count".into())
+}
+
 fn brief_error(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let compact = text.lines().rev().find(|line| line.contains("reason"))
@@ -484,6 +550,49 @@ pub async fn generation_vdn_run(
         .stderr(Stdio::from(stderr))
         .kill_on_drop(true);
     if request.backend == VdnBackend::Diffusers {
+        process.arg("--segments").arg(request.segments.to_string());
+        process.arg("--job-id").arg(&request.job_id);
+        let continuation_root = directory.join("temporal-contexts");
+        std::fs::create_dir_all(&continuation_root).map_err(|e| e.to_string())?;
+        let meta = std::fs::symlink_metadata(&continuation_root).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("Unsafe native temporal context directory".into());
+        }
+        process.arg("--temporal-context-out")
+            .arg(continuation_root.join(format!("{}.safetensors", request.job_id)));
+        process.arg("--temporal-identity-out")
+            .arg(continuation_root.join(format!("{}.identity.png", request.job_id)));
+        if let Some(source) = &request.resolved_temporal_identity_path {
+            let digest = request.resolved_temporal_identity_sha256.as_ref()
+                .ok_or("Original first-frame image has no pinned identity hash")?;
+            process.arg("--temporal-identity-in").arg(source)
+                .arg("--temporal-source-identity-sha256").arg(digest);
+        }
+        let segment_home = directory.join("temporal-segments");
+        std::fs::create_dir_all(&segment_home).map_err(|e| e.to_string())?;
+        let root_meta = std::fs::symlink_metadata(&segment_home).map_err(|e| e.to_string())?;
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+            return Err("Unsafe native completed-segment cache root".into());
+        }
+        let segment_job = segment_home.join(&request.job_id);
+        std::fs::create_dir_all(&segment_job).map_err(|e| e.to_string())?;
+        let meta = std::fs::symlink_metadata(&segment_job).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("Unsafe native segment cache job directory".into());
+        }
+        process.arg("--temporal-segment-root").arg(segment_job);
+        if let Some(parent_path) = &request.resolved_temporal_parent_path {
+            process.arg("--temporal-parent").arg(parent_path);
+        }
+        if let Some(source) = &request.resolved_temporal_context_path {
+            let digest = request.resolved_temporal_source_sha256.as_ref()
+                .ok_or("Unpinned native temporal source SHA-256")?;
+            let source_job = request.resolved_temporal_source_job_id.as_ref()
+                .ok_or("Unpinned native temporal source job")?;
+            process.arg("--temporal-context-in").arg(source)
+                .arg("--temporal-source-video-sha256").arg(digest)
+                .arg("--temporal-source-job-id").arg(source_job);
+        }
         process.arg("--memory-mode").arg(&request.memory_mode);
         process.arg("--lowmem").arg(&request.lowmem);
         process.arg("--query-chunk").arg(request.query_chunk.to_string());
@@ -514,7 +623,7 @@ pub async fn generation_vdn_run(
             let cache_meta = std::fs::symlink_metadata(&upscaler_cache)
                 .map_err(|e| e.to_string())?;
             if cache_meta.file_type().is_symlink() || !cache_meta.is_dir() {
-                return Err("Unsafe H3 learned upscaler checkpoint cache".into());
+                return Err("Unsafe H3 trained upscaler checkpoint cache".into());
             }
             process.arg("--upscaler-cache-dir").arg(upscaler_cache);
             if let Some(prior) = &request.refine_from_job_id {
@@ -607,7 +716,12 @@ pub async fn generation_vdn_run(
                             VdnBackend::FreeVideoAdaptive => "vdn-h3-freevideo-adaptive",
                         },
                         &request.prompt, request.steps, request.seed,
-                        request.frames, first.is_some() || !request.reference_image_paths.is_empty()
+                        if request.backend == VdnBackend::Diffusers {
+                            completed_frame_count(&stdout_path)?
+                        } else {
+                            request.frames
+                        },
+                        first.is_some() || !request.reference_image_paths.is_empty()
                             || request.reference_video_path.is_some(), &bytes
                     )
                 }
@@ -737,9 +851,7 @@ mod tests {
         assert!(WORKER.contains("apply_group_offloading"));
         assert!(SAMPLER_SOURCE.contains("native_sampler_recovery"));
         assert!(staged_worker_source(VdnBackend::Diffusers).contains("NativeStepStore"));
-        assert!(staged_worker_source(VdnBackend::Diffusers).contains("native_learned_upscale"));
-        assert!(LEARNED_UPSCALER_SOURCE.contains("make_h3_resizer"));
-        assert!(!LEARNED_UPSCALER_SOURCE.contains("import freevideo"));
+        assert!(staged_worker_source(VdnBackend::Diffusers).contains("NativeTemporalPrefix"));
         assert!(!WORKER.contains("import comfyui"));
     }
 
@@ -796,12 +908,19 @@ mod tests {
             prompt: "sample".into(),
             steps: 8,
             frames: 345,
+            segments: 1,
             seed: 0,
             first_image_path: None,
             last_image_path: None,
             source_gallery_entry_id: None,
             source_vdn_job_id: None,
             continuation_mode: "last_frame".into(),
+            resolved_temporal_context_path: None,
+            resolved_temporal_source_sha256: None,
+            resolved_temporal_source_job_id: None,
+            resolved_temporal_parent_path: None,
+            resolved_temporal_identity_path: None,
+            resolved_temporal_identity_sha256: None,
             reference_image_paths: vec![],
             reference_video_path: None,
             lora_paths: vec![],

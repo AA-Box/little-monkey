@@ -53,6 +53,14 @@ if "low_ram_disk_budget" not in globals():
         assert_disk_mapped_components,
     )
 
+
+if "render_temporal_video" not in globals():
+    from studio_vdn_temporal import render_temporal_video, temporal_frame_plan, capture_context
+if "save_context" not in globals():
+    from studio_vdn_temporal_store import save_context, preview_fallback
+if "save_first_identity" not in globals():
+    from studio_vdn_identity import save_first_identity, identity_digest
+
 MODEL_REPOSITORY = "OpenVDN/vdn-minimax-h3"
 # Ref2VA is a distinct original H3 checkpoint partition, not VDN hybrid LoRA.
 REF_MODEL_REPOSITORY = "MiniMaxAI/MiniMax-H3"
@@ -73,6 +81,17 @@ def parse_args(argv=None):
     parser.add_argument("--lora", action="append", default=[])
     parser.add_argument("--steps", type=int, default=8)
     parser.add_argument("--frames", type=int, default=141)
+    parser.add_argument("--segments", type=int, default=1)
+    parser.add_argument("--job-id", default="")
+    parser.add_argument("--temporal-context-out", default="")
+    parser.add_argument("--temporal-context-in", default="")
+    parser.add_argument("--temporal-parent", default="")
+    parser.add_argument("--temporal-identity-in", default="")
+    parser.add_argument("--temporal-identity-out", default="")
+    parser.add_argument("--temporal-source-identity-sha256", default="")
+    parser.add_argument("--temporal-segment-root", default="")
+    parser.add_argument("--temporal-source-video-sha256", default="")
+    parser.add_argument("--temporal-source-job-id", default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--offload-dit", action="store_true")
@@ -151,6 +170,56 @@ def parse_args(argv=None):
         parser.error("Step count must be from 1 to 50")
     if not 120 <= args.frames <= 360 or (args.frames - 5) % 17:
         parser.error("Frame count must be a supported 17n+5 value (120..360)")
+    try:
+        temporal_frame_plan(args.frames, args.segments)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.segments > 1 and args.two_pass and (not args.checkpoint or not Path(args.checkpoint).is_absolute()):
+        parser.error("Native two-pass continuity needs a checkpoint root")
+    if args.segments > 1 and args.last:
+        parser.error("A fixed last-frame keyframe is unsupported in multi-segment native continuity")
+    if args.temporal_identity_out and not Path(args.temporal_identity_out).is_absolute():
+        parser.error("Native first-frame identity output must be app-owned and absolute")
+    if args.temporal_identity_in:
+        if not args.temporal_context_in or not Path(args.temporal_identity_in).is_absolute():
+            parser.error("Native identity can only come from pinned video continuation")
+        if len(args.temporal_source_identity_sha256) != 64 or any(
+                c not in "0123456789abcdef" for c in args.temporal_source_identity_sha256):
+            parser.error("Native source identity requires an authenticated SHA256")
+    elif args.temporal_source_identity_sha256:
+        parser.error("Unpaired original video identity fingerprint")
+    if args.temporal_context_out:
+        import uuid
+        if not Path(args.temporal_context_out).is_absolute():
+            parser.error("Native temporal output must be app-owned and absolute")
+        try:
+            if str(uuid.UUID(args.job_id)) != args.job_id:
+                parser.error("Native temporal output requires a canonical job UUID")
+        except ValueError:
+            parser.error("Native temporal output requires a canonical job UUID")
+    if args.temporal_context_in:
+        import uuid
+        if (not Path(args.temporal_context_in).is_absolute() or
+                len(args.temporal_source_video_sha256) != 64 or
+                any(ch not in "0123456789abcdef" for ch in args.temporal_source_video_sha256)):
+            parser.error("Native continuation requires a pinned snapshot and video hash")
+        try:
+            if str(uuid.UUID(args.temporal_source_job_id)) != args.temporal_source_job_id:
+                parser.error("Invalid native source job ID")
+        except ValueError:
+            parser.error("Invalid native source job ID")
+    elif args.temporal_source_video_sha256 or args.temporal_source_job_id:
+        parser.error("Unexpected temporal source metadata without a snapshot")
+    if bool(args.temporal_parent) != bool(args.temporal_context_in):
+        parser.error("Native saved-context continuation requires the pinned parent MP4")
+    if args.temporal_parent:
+        parent = Path(args.temporal_parent)
+        if not parent.is_absolute() or parent.is_symlink() or not parent.is_file():
+            parser.error("Missing/unsafe Gallery parent MP4 for native chain")
+    if args.temporal_segment_root:
+        root = Path(args.temporal_segment_root)
+        if not root.is_absolute() or root.is_symlink():
+            parser.error("Native completed-segment cache must use a safe absolute path")
     if args.step_checkpoint_root and not Path(args.step_checkpoint_root).is_absolute():
         parser.error("Native step checkpoint location must be absolute and app-owned")
     if args.refine_from and not args.two_pass:
@@ -330,6 +399,7 @@ def run(args):
           flush=True)
     original = [str(Path(__file__).resolve()), "--prompt", args.prompt,
                 "--output", args.output, "--frames", str(args.frames),
+                "--segments", str(args.segments), "--job-id", args.job_id,
                 "--steps", str(args.steps), "--seed", str(args.seed),
                 "--device", args.device,
                 "--lowmem", args.lowmem, "--weight-loader", args.weight_loader,
@@ -342,6 +412,16 @@ def run(args):
                         ("--checkpoint", args.checkpoint),
                         ("--step-checkpoint-root", args.step_checkpoint_root),
                         ("--refine-from", args.refine_from),
+                        ("--temporal-context-out", args.temporal_context_out),
+                        ("--temporal-context-in", args.temporal_context_in),
+                        ("--temporal-parent", args.temporal_parent),
+                        ("--temporal-identity-in", args.temporal_identity_in),
+                        ("--temporal-identity-out", args.temporal_identity_out),
+                        ("--temporal-source-identity-sha256", args.temporal_source_identity_sha256),
+                        ("--temporal-segment-root", args.temporal_segment_root),
+                        ("--upscaler-cache-dir", args.upscaler_cache_dir),
+                        ("--temporal-source-video-sha256", args.temporal_source_video_sha256),
+                        ("--temporal-source-job-id", args.temporal_source_job_id),
                         ("--upscaler-cache-dir", args.upscaler_cache_dir)):
         if value:
             original.extend([flag, value])
@@ -408,13 +488,17 @@ for _sig in (signal.SIGTERM, signal.SIGINT):
 def checkpoint_identity(args):
     """Content-address the original request, never scratch-file job paths."""
     digest = hashlib.sha256()
-    for value in (args.prompt, args.frames, args.seed, args.steps):
+    for value in (args.prompt, args.frames, args.segments, args.seed, args.steps,
+                  args.temporal_source_video_sha256, args.temporal_source_job_id,
+                  args.temporal_source_identity_sha256):
         digest.update(str(value).encode("utf-8"))
         digest.update(b"\\0")
     media = [
         ("first", args.first), ("last", args.last),
         ("reference_video", args.reference_video),
         ("reference_audio", args.reference_audio),
+        ("temporal_source", args.temporal_context_in),
+        ("first_film_frame", args.temporal_identity_in),
         *[("ref", path) for path in args.refs],
         *[("lora", path) for path in args.lora],
     ]
@@ -572,6 +656,8 @@ def native_two_pass(pipe, args, torch, device, keyframes, references, *, latent_
               flush=True)
 
     validate_preview_layout(tuple(latents.shape), tuple(audio_latents.shape))
+    preview_video_cpu = latents.detach().float().cpu().contiguous().clone()
+    preview_audio_cpu = audio_latents.detach().float().cpu().contiguous().clone()
     latents = latents.to(device=device, dtype=torch.float32)
     audio_latents = audio_latents.to(device=device, dtype=torch.float32)
     if latents.shape[2] != (args.frames - 5) // 17 * 5 + 2:
@@ -600,14 +686,15 @@ def native_two_pass(pipe, args, torch, device, keyframes, references, *, latent_
     with native_h3_refine_schedule(pipe, torch):
         with native_sampler_recovery(args, "refine", pipe, model_identity=(
                 REF_MODEL_REPOSITORY if references else MODEL_REPOSITORY)):
-            return pipe(
+            result = pipe(
             prompt=args.prompt, num_frames=args.frames, height=768, width=1344,
             num_inference_steps=4,
             generator=torch.Generator(device).manual_seed(args.seed + 2),
             latents=upscaled, audio_latents=audio_latents,
-            output=["latents", "audio_latents"] if latent_output else ["videos", "audio", "sampling_rate"],
+            output=["latents", "audio_latents"] if latent_output else ["videos", "audio", "sampling_rate", "latents", "audio_latents"],
             **({"references": references} if references else keyframes),
             )
+    return result, preview_video_cpu, preview_audio_cpu
 
 
 def _run_once(args):
@@ -643,6 +730,12 @@ def _run_once(args):
         if args.last:
             keyframes["last_image"] = load_image(args.last)
 
+    if args.temporal_identity_in:
+        if identity_digest(args.temporal_identity_in) != args.temporal_source_identity_sha256:
+            raise RuntimeError("First picture of film changed after source pinning")
+        if not references:
+            from diffusers.utils import load_image
+            keyframes["image"] = load_image(args.temporal_identity_in)
     mode = "ref2va" if references else "fl2va" if keyframes else "t2va"
     # Native Ref2VA conditioning requires transformer_ref weights from the
     # original MiniMax H3 release; OpenVDN's hybrid checkpoint is t2va/fl2va.
@@ -655,7 +748,16 @@ def _run_once(args):
                       "hybridVDN": not references}), flush=True)
     pipe = ModularPipeline.from_pretrained(checkpoint, workflow=mode)
     denoiser_partition = "transformer_ref" if references else "transformer"
-    native_direct = args.disk_offload and args.weight_loader == "native_original"
+    # The original-shard streaming encoder returns only latents, whereas
+    # rolling temporal continuity also needs bounded decoded AV windows and
+    # their protected high/low tails. Use verified Accelerate-dispatched
+    # disk layers for those jobs; keep original-shard encoding for standalone.
+    rolling = args.segments > 1 or bool(args.temporal_context_in)
+    native_direct = (args.disk_offload and args.weight_loader == "native_original"
+                     and not rolling)
+    if rolling and args.disk_offload and args.weight_loader == "native_original":
+        print(json.dumps({"phase": "native_temporal_disk_dispatch",
+                          "loader": "accelerate_verified_shards"}), flush=True)
     if args.disk_offload and args.fp8 and not native_direct:
         # The native disk-dispatch path requires exact pre-sharded SafeTensors
         # representations, not a silent unvalidated FP8 conversion.
@@ -803,8 +905,26 @@ def _run_once(args):
 
     print(json.dumps({"phase": "sampling", "steps": args.steps,
                       "frames": args.frames}), flush=True)
+    if args.segments > 1 or args.temporal_context_in:
+        report = render_temporal_video(
+            pipe, args, torch, device, keyframes, references, checkpoint,
+            denoiser, encode_video, native_sampler_recovery, clear_native_sampler_stage,
+            checkpoint_identity(args))
+        try:
+            verification = verify_h3_mp4(
+                args.output, expected_frames=report["videos"],
+                expected_fps=FPS, require_audio=True)
+            print(json.dumps({"phase": "native_media_verified", **verification}), flush=True)
+        except Exception:
+            Path(args.output).unlink(missing_ok=True)
+            raise
+        print(json.dumps({"phase": "completed", "path": args.output,
+                          "frames": report["videos"], "fps": FPS,
+                          "audioSamples": report["audioSamples"],
+                          "nativeTemporal": True}), flush=True)
+        return
     if args.two_pass:
-        sample = native_two_pass(pipe, args, torch, device, keyframes, references,
+        sample, preview_video, preview_audio = native_two_pass(pipe, args, torch, device, keyframes, references,
                                  latent_output=native_direct)
     else:
         with native_sampler_recovery(args, "single", pipe, model_identity=checkpoint):
@@ -812,9 +932,10 @@ def _run_once(args):
             prompt=args.prompt, num_frames=args.frames,
             num_inference_steps=args.steps + 1,
             generator=torch.Generator(device).manual_seed(args.seed),
-            output=["latents", "audio_latents"] if native_direct else ["videos", "audio", "sampling_rate"],
+            output=["latents", "audio_latents"] if native_direct else ["videos", "audio", "sampling_rate", "latents", "audio_latents"],
             **({"references": references} if references else keyframes),
             )
+    output = Path(args.output)
     print(json.dumps({"phase": "encoding", "mode":
                       "native_incremental_video" if native_direct else "pipeline_frames"}), flush=True)
     if native_direct:
@@ -848,6 +969,19 @@ def _run_once(args):
         raise
     print(json.dumps({"phase": "native_media_verified", **media_result}),
           flush=True)
+    identity_sha = ""
+    if args.temporal_identity_out:
+        identity_sha = save_first_identity(
+            args.temporal_identity_out, first_video=output,
+            inherited=args.temporal_identity_in or None,
+            expected_sha=args.temporal_source_identity_sha256 or None)
+    if args.temporal_context_out:
+        captured = capture_context(sample["latents"], sample["audio_latents"], 0, args.frames)
+        low = (capture_context(preview_video, preview_audio, 0, args.frames)
+               if args.two_pass else preview_fallback(captured))
+        save_context(args.temporal_context_out, captured, low,
+                     output, checkpoint, args.job_id, args.frames,
+                     identity_sha256=identity_sha)
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
     host_peak = None
     if os.path.isfile("/proc/self/status"):
