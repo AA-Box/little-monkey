@@ -62,6 +62,28 @@ class CrashSafeSegments(unittest.TestCase):
             store.discard_segment(root, 0)
             self.assertFalse((root / "part-0.safetensors").exists())
 
+    def test_low_disk_bypasses_redundant_cache_without_failing_generation(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        store = load("studio_vdn_segment_cache")
+        origins = load("studio_vdn_temporal_store")
+        with tempfile.TemporaryDirectory() as base:
+            root = Path(base) / "cache"
+            high = {"video": torch.ones((1, 24, 7, 48, 84)),
+                    "audio": torch.ones((2, 32, 37)), "frame_origin": 102,
+                    "audio_origin": origins.audio_origin(102)}
+            low = origins.preview_fallback(high)
+            with patch("shutil.disk_usage", return_value=SimpleNamespace(free=1024)):
+                persisted = store.save_segment(
+                    root, 0, np.ones((102, 32, 32, 3), dtype=np.uint8),
+                    np.zeros((2, 136000), dtype=np.float32), high, low,
+                    model="h3", request_hash="hash", predecessor_hash="none",
+                    total_frames=124)
+            self.assertFalse(persisted)
+            self.assertFalse((root / "part-0.safetensors").exists())
+            self.assertFalse((root / "part-0.rgb").exists())
+            self.assertFalse((root / "part-0.pcm").exists())
+
     def test_aborted_or_partial_record_never_appears_committed(self):
         store = load("studio_vdn_segment_cache")
         with tempfile.TemporaryDirectory() as base:
