@@ -530,6 +530,19 @@ pub async fn generation_vdn_run(
         }
         process.arg("--temporal-context-out")
             .arg(continuation_root.join(format!("{}.safetensors", request.job_id)));
+        let segment_home = directory.join("temporal-segments");
+        std::fs::create_dir_all(&segment_home).map_err(|e| e.to_string())?;
+        let root_meta = std::fs::symlink_metadata(&segment_home).map_err(|e| e.to_string())?;
+        if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+            return Err("Unsafe native completed-segment cache root".into());
+        }
+        let segment_job = segment_home.join(&request.job_id);
+        std::fs::create_dir_all(&segment_job).map_err(|e| e.to_string())?;
+        let meta = std::fs::symlink_metadata(&segment_job).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("Unsafe native segment cache job directory".into());
+        }
+        process.arg("--temporal-segment-root").arg(segment_job);
         if let Some(parent_path) = &request.resolved_temporal_parent_path {
             process.arg("--temporal-parent").arg(parent_path);
         }
