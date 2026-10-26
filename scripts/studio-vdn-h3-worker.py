@@ -65,6 +65,9 @@ def parse_args(argv=None):
     parser.add_argument("--temporal-context-out", default="")
     parser.add_argument("--temporal-context-in", default="")
     parser.add_argument("--temporal-parent", default="")
+    parser.add_argument("--temporal-identity-in", default="")
+    parser.add_argument("--temporal-identity-out", default="")
+    parser.add_argument("--temporal-source-identity-sha256", default="")
     parser.add_argument("--temporal-segment-root", default="")
     parser.add_argument("--temporal-source-video-sha256", default="")
     parser.add_argument("--temporal-source-job-id", default="")
@@ -147,6 +150,16 @@ def parse_args(argv=None):
         parser.error("Native two-pass continuity needs a checkpoint root")
     if args.segments > 1 and args.last:
         parser.error("A fixed last-frame keyframe is unsupported in multi-segment native continuity")
+    if args.temporal_identity_out and not Path(args.temporal_identity_out).is_absolute():
+        parser.error("Native first-frame identity output must be app-owned and absolute")
+    if args.temporal_identity_in:
+        if not args.temporal_context_in or not Path(args.temporal_identity_in).is_absolute():
+            parser.error("Native identity can only come from pinned video continuation")
+        if len(args.temporal_source_identity_sha256) != 64 or any(
+                c not in "0123456789abcdef" for c in args.temporal_source_identity_sha256):
+            parser.error("Native source identity requires an authenticated SHA256")
+    elif args.temporal_source_identity_sha256:
+        parser.error("Unpaired original video identity fingerprint")
     if args.temporal_context_out:
         import uuid
         if not Path(args.temporal_context_out).is_absolute():
@@ -358,6 +371,9 @@ def run(args):
                         ("--temporal-context-out", args.temporal_context_out),
                         ("--temporal-context-in", args.temporal_context_in),
                         ("--temporal-parent", args.temporal_parent),
+                        ("--temporal-identity-in", args.temporal_identity_in),
+                        ("--temporal-identity-out", args.temporal_identity_out),
+                        ("--temporal-source-identity-sha256", args.temporal_source_identity_sha256),
                         ("--temporal-segment-root", args.temporal_segment_root),
                         ("--upscaler-cache-dir", args.upscaler_cache_dir),
                         ("--temporal-source-video-sha256", args.temporal_source_video_sha256),
@@ -408,7 +424,8 @@ def checkpoint_identity(args):
     """Content-address the original request, never scratch-file job paths."""
     digest = hashlib.sha256()
     for value in (args.prompt, args.frames, args.segments, args.seed, args.steps,
-                  args.temporal_source_video_sha256, args.temporal_source_job_id):
+                  args.temporal_source_video_sha256, args.temporal_source_job_id,
+                  args.temporal_source_identity_sha256):
         digest.update(str(value).encode("utf-8"))
         digest.update(b"\\0")
     media = [
@@ -416,6 +433,7 @@ def checkpoint_identity(args):
         ("reference_video", args.reference_video),
         ("reference_audio", args.reference_audio),
         ("temporal_source", args.temporal_context_in),
+        ("first_film_frame", args.temporal_identity_in),
         *[("ref", path) for path in args.refs],
         *[("lora", path) for path in args.lora],
     ]
@@ -636,6 +654,15 @@ def _run_once(args):
         if args.last:
             keyframes["last_image"] = load_image(args.last)
 
+    # The original first frame participates in Qwen3-VL FL2VA image-token
+    # conditioning on EVERY continuation, while the clean native latent prefix
+    # protects the true 22-frame predecessor overlap from being rewritten.
+    if args.temporal_identity_in:
+        if identity_digest(args.temporal_identity_in) != args.temporal_source_identity_sha256:
+            raise RuntimeError("First picture of film changed after source pinning")
+        if not references:
+            from diffusers.utils import load_image
+            keyframes["image"] = load_image(args.temporal_identity_in)
     mode = "ref2va" if references else "fl2va" if keyframes else "t2va"
     # Native Ref2VA conditioning requires transformer_ref weights from the
     # original MiniMax H3 release; OpenVDN's hybrid checkpoint is t2va/fl2va.
@@ -776,12 +803,19 @@ def _run_once(args):
     if not temporary.is_file() or temporary.stat().st_size < 32:
         raise RuntimeError("OpenVDN produced no video bytes")
     os.replace(temporary, output)
+    identity_sha = ""
+    if args.temporal_identity_out:
+        identity_sha = save_first_identity(
+            args.temporal_identity_out, first_video=output,
+            inherited=args.temporal_identity_in or None,
+            expected_sha=args.temporal_source_identity_sha256 or None)
     if args.temporal_context_out:
         captured = capture_context(sample["latents"], sample["audio_latents"], 0, args.frames)
         low = (capture_context(preview_video, preview_audio, 0, args.frames)
                if args.two_pass else preview_fallback(captured))
         save_context(args.temporal_context_out, captured, low,
-                     output, checkpoint, args.job_id, args.frames)
+                     output, checkpoint, args.job_id, args.frames,
+                     identity_sha256=identity_sha)
     clear_native_sampler_stage(args, "refine" if args.two_pass else "single")
     print(json.dumps({"phase": "completed", "path": str(output),
                       "frames": len(videos[0]), "fps": FPS}), flush=True)
