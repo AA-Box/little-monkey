@@ -147,8 +147,8 @@ class NativeOriginalShardHooks:
         if fp8 and component in ("vae", "audio_vae"):
             raise ValueError("FP8 VAE weights are unsupported: video/audio fidelity risk")
         if fp8:
-            if self.device.type != "cuda" or torch.cuda.get_device_capability(self.device)[0] < 9:
-                raise ValueError("FP8 original-shard stream requires NVIDIA Hopper or later")
+            if self.device.type != "cuda" or tuple(torch.cuda.get_device_capability(self.device)) < (8, 9):
+                raise ValueError("FP8 original-shard stream requires NVIDIA Ada SM89 or later")
             try:
                 from torchao.quantization import Float8WeightOnlyConfig, Float8Tensor
             except ImportError as exc:
