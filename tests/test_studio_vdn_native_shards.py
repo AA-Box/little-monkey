@@ -205,6 +205,37 @@ model(torch.ones(2, 8))
                 resumed, fresh_store, device="cpu", component="restarted")
             torch.testing.assert_close(resumed(inputs), expected)
 
+    def test_component_kind_selects_qwen_shard_index_at_repository_root(self):
+        import json
+        torch.manual_seed(101)
+        ref = nn.Linear(8, 8)
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            filename = root / "model.safetensors"
+            save_file({key: value.contiguous() for key, value
+                       in ref.state_dict().items()}, str(filename))
+            index = root / "model.safetensors.index.json"
+            index.write_text(json.dumps({"weight_map": {
+                key: "model.safetensors" for key in ref.state_dict()}}))
+            requested = []
+            def fetch(repo, filename, subfolder, revision):
+                requested.append(filename)
+                return str(root / filename)
+            store = native.OriginalShardStore.from_hub(
+                "org/repo", "", component="text_encoder", fetch=fetch)
+            self.assertEqual(requested[0], "model.safetensors.index.json")
+            self.assertEqual(store.tensor("weight").shape, ref.weight.shape)
+
+    def test_meta_model_exposes_real_execution_device_without_allocating(self):
+        with torch.device("meta"):
+            model = nn.Linear(8, 8)
+        native.report_native_execution_device(model, "cuda:0")
+        self.assertEqual(model.device, torch.device("cuda:0"))
+        self.assertTrue(all(p.is_meta for p in model.parameters()))
+        self.assertIs(native.report_native_execution_device(model, "cuda:0"), model)
+        with self.assertRaisesRegex(ValueError, "CUDA"):
+            native.report_native_execution_device(nn.Linear(3, 3), "cpu")
+
     def test_shard_map_rejects_traversal_and_missing_weights(self):
         with self.assertRaises(ValueError):
             native.validate_weight_map({"weight_map": {"weight": "../x.safetensors"}})
