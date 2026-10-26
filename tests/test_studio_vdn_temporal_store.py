@@ -129,7 +129,15 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 return result
 
         original = temporal.NativeTemporalPrefix
+        old_join = getattr(temporal, "join_native_chain", None)
         temporal.NativeTemporalPrefix = FakePrefix
+        def fake_join(parent, child, target, *, parent_frames, child_frames, expected_parent_sha256):
+            self.assertEqual(hashlib.sha256(Path(parent).read_bytes()).hexdigest(), expected_parent_sha256)
+            self.assertEqual(parent_frames, 226)
+            self.assertEqual(child_frames, 102)
+            Path(target).write_bytes(Path(child).read_bytes())
+            return {"frames": parent_frames + child_frames, "audioSamples": temporal.emitted_audio_samples(parent_frames + child_frames)}
+        temporal.join_native_chain = fake_join
         try:
             with tempfile.TemporaryDirectory() as temp:
                 base = Path(temp)
@@ -141,6 +149,7 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                         two_pass=True, checkpoint=str(base / (job_id + ".preview")),
                         refine_from=refine_from, step_checkpoint_root=str(base / "step"),
                         temporal_context_in=source_path,
+                        temporal_parent=str(base / (source_id + ".mp4")) if source_id else "",
                         temporal_context_out=str(base / (job_id + ".safetensors")),
                         temporal_source_video_sha256=source_sha,
                         temporal_source_job_id=source_id, job_id=job_id,
@@ -175,15 +184,19 @@ class RealTensorAndWindowContracts(unittest.TestCase):
                 child = str(uuid.uuid4())
                 next_args, next_report = run(
                     child, args.temporal_context_out, digest, parent, segments=1)
-                self.assertEqual(next_report["videos"], 124 - 22)
+                self.assertEqual(next_report["videos"], 226 + 124 - 22)
                 self.assertEqual(next_report["audioSamples"],
-                                 temporal.emitted_audio_samples(124 - 22))
+                                 temporal.emitted_audio_samples(226 + 124 - 22))
                 out_sha = hashlib.sha256(Path(next_args.output).read_bytes()).hexdigest()
                 inherited = store.load_context(next_args.temporal_context_out, out_sha,
                                                 "vdn-h3", child)
                 self.assertEqual(inherited["total_frames"], 226 + 102)
         finally:
             temporal.NativeTemporalPrefix = original
+            if old_join is None:
+                del temporal.join_native_chain
+            else:
+                temporal.join_native_chain = old_join
 
 
 if __name__ == "__main__":
